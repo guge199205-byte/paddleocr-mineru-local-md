@@ -7,9 +7,15 @@
     <link rel="stylesheet" href="/static/style.css">
     <!-- PDF.js -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <!-- PDF-lib for splitting large PDFs into OCR batches -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
     <!-- Marked for Markdown preview -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/9.1.2/marked.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/dompurify/3.1.6/purify.min.js"></script>
+    <!-- KaTeX for LaTeX/math rendering in OCR Markdown -->
+    <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
+    <script defer src="/static/vendor/katex/katex.min.js"></script>
+    <script defer src="/static/vendor/katex/contrib/auto-render.min.js"></script>
     <!-- Highlight.js for code blocks -->
     <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">
     <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
@@ -185,6 +191,6 @@
         </div>
     </template>
 
-    <script src="/static/app.js?v=2"></script>
+    <script src="/static/app.js?v=7"></script>
 </body>
 </html>

@@ -1,7 +1,6 @@
 import os
 import base64
 import httpx
-import docker
 import subprocess
 import tempfile
 import shutil
@@ -9,28 +8,13 @@ import io
 import json
 from PIL import Image
 from typing import List, Optional, Union
-from pathlib import Path
-from pypdf import PdfReader, PdfWriter
 from fastapi import FastAPI, HTTPException, File, UploadFile, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 app = FastAPI()
-
-# Docker Client
-try:
-    docker_client = docker.from_env()
-except Exception as e:
-    print(f"Warning: Could not connect to Docker daemon: {e}")
-    docker_client = None
-
-# Service Groups
-SERVICE_GROUPS = {
-    "ocr": ["paddleocr-vlm-server", "paddleocr-vl-api"],
-    "rerank": ["reranker-server", "rerank-api"]
-}
 
 app.add_middleware(
     CORSMiddleware,
@@ -40,232 +24,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Target the Docker Compose Pipeline Service (Standard Port 8081 mapped to 8080)
 PADDLE_SERVICE_URL = os.getenv("PADDLE_SERVICE_URL", "http://localhost:8081/layout-parsing")
-
-# Create directory for OCR images
-OCR_IMAGES_DIR = Path("static/ocr_images")
-OCR_IMAGES_DIR.mkdir(exist_ok=True)
+PADDLEOCR_VL_MODEL_NAME = os.getenv("PADDLEOCR_VL_MODEL_NAME", "PaddleOCR-VL-1.6-0.9B")
+PADDLE_REQUEST_TIMEOUT = float(os.getenv("PADDLE_REQUEST_TIMEOUT", "3600"))
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Reranker 服务地址 (Docker 内部网络可以使用服务名 reranker-server)
-RERANKER_SERVICE_URL = os.getenv("RERANKER_SERVICE_URL", "http://reranker-server:8000/v1/score")
-RERANKER_MODEL_NAME = os.getenv("RERANKER_MODEL_NAME", "Qwen/Qwen3-Reranker-0.6B")
-
-# Qwen3-Reranker Prompt 模板
-RERANK_PREFIX = '<|im_start|>system\nJudge whether the Document meets the requirements based on the Query and the Instruct provided. Note that the answer can only be "yes" or "no".<|im_end|>\n<|im_start|>user\n'
-RERANK_SUFFIX = "<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
-RERANK_INSTRUCTION = "Given a web search query, retrieve relevant passages that answer the query"
-
-class RerankRequest(BaseModel):
-    query: str
-    documents: List[str]
-    top_k: Optional[int] = None
-
-@app.post("/api/rerank")
-async def proxy_rerank(request: RerankRequest):
-    """
-    Rerank documents using Qwen3-Reranker model.
-    Automatically handles prompt formatting.
-    """
-    try:
-        # 1. 构造带指令的输入
-        text_1_list = []
-        text_2_list = []
-        
-        for doc in request.documents:
-            # 格式化 Query 和 Document
-            query_part = f"{RERANK_PREFIX}<Instruct>: {RERANK_INSTRUCTION}\n<Query>: {request.query}\n"
-            doc_part = f"<Document>: {doc}{RERANK_SUFFIX}"
-            
-            text_1_list.append(query_part)
-            text_2_list.append(doc_part)
-            
-        # 2. 构造 vLLM Request Payload
-        payload = {
-            "model": RERANKER_MODEL_NAME,
-            "text_1": text_1_list,
-            "text_2": text_2_list
-        }
-        
-        # 3. 发送请求给 Reranker 服务
-        # 使用 httpx 异步调用
-        print(f"Sending request to Reranker Service at {RERANKER_SERVICE_URL}...")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(RERANKER_SERVICE_URL, json=payload)
-            
-            if resp.status_code != 200:
-                print(f"Reranker Error: {resp.text}")
-                raise HTTPException(status_code=resp.status_code, detail=f"Reranker service error: {resp.text}")
-                
-            result = resp.json()
-            
-        scores_data = result.get('data', [])
-        
-        # 4. 解析结果并排序
-        reranked_results = []
-        for item in scores_data:
-            idx = item.get('index')
-            score = item.get('score')
-            if idx is not None and idx < len(request.documents):
-                reranked_results.append({
-                    "index": idx,
-                    "score": score,
-                    "document": request.documents[idx]
-                })
-        
-        # Sort by score descending
-        reranked_results.sort(key=lambda x: x["score"], reverse=True)
-        
-        # If top_k is specified, slice the results
-        if request.top_k:
-            reranked_results = reranked_results[:request.top_k]
-            
-        return {"results": reranked_results}
-        
-    except Exception as e:
-        print(f"Error in rerank proxy: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/")
 async def read_root():
     return FileResponse("static/index.html")
 
+
 @app.get("/api/models")
 async def get_models():
-    """Mock response for frontend compatibility"""
-    return {"data": [{"id": "PaddleOCR-VL-1.5-0.9B"}]}
+    """Return the active OCR model for frontend display."""
+    return {"data": [{"id": PADDLEOCR_VL_MODEL_NAME}]}
 
-@app.get("/api/services/status")
-async def get_services_status():
-    """Get the running status of OCR and Rerank services"""
-    if not docker_client:
-        raise HTTPException(status_code=500, detail="Docker client not initialized")
-    
-    status = {}
-    for group_name, container_names in SERVICE_GROUPS.items():
-        group_status = "stopped"
-        running_count = 0
-        for name in container_names:
-            try:
-                container = docker_client.containers.get(name)
-                if container.status == "running":
-                    running_count += 1
-            except docker.errors.NotFound:
-                continue
-        
-        if running_count == len(container_names):
-            group_status = "running"
-        elif running_count > 0:
-            group_status = "partial"
-            
-        status[group_name] = group_status
-    return status
-
-@app.post("/api/services/{group}/{action}")
-async def manage_service(group: str, action: str):
-    """Start or Stop a service group (ocr or rerank)"""
-    if not docker_client:
-        raise HTTPException(status_code=500, detail="Docker client not initialized")
-    
-    if group not in SERVICE_GROUPS:
-        raise HTTPException(status_code=400, detail=f"Invalid service group: {group}")
-    
-    if action not in ["start", "stop", "restart"]:
-        raise HTTPException(status_code=400, detail=f"Invalid action: {action}")
-    
-    container_names = SERVICE_GROUPS[group]
-    results = []
-    
-    # Reverse stop order to respect dependencies if needed, 
-    # but for simple start/stop it's fine.
-    target_names = container_names if action != "stop" else reversed(container_names)
-    
-    for name in target_names:
-        try:
-            container = docker_client.containers.get(name)
-            if action == "start":
-                container.start()
-            elif action == "stop":
-                container.stop()
-            elif action == "restart":
-                container.restart()
-            results.append({"name": name, "status": "success"})
-        except docker.errors.NotFound:
-            results.append({"name": name, "status": "not_found"})
-        except Exception as e:
-            results.append({"name": name, "status": "error", "message": str(e)})
-            
-    return {"group": group, "action": action, "results": results}
 
 @app.post("/api/convert/to-pdf")
 async def convert_to_pdf(file: UploadFile = File(...)):
-    """Convert PPT/PPTX to PDF using LibreOffice"""
+    """Convert PPT/PPTX/DOC/DOCX to PDF using LibreOffice."""
     print(f"Received conversion request for: {file.filename}")
-    
-    # Check if soffice is available
+
     if not shutil.which("soffice"):
-        raise HTTPException(status_code=500, detail="LibreOffice (soffice) not found on server. Please install it to support PPT/PPTX conversion.")
-    
-    # Validate file extension
+        raise HTTPException(
+            status_code=500,
+            detail="LibreOffice (soffice) not found on server. Please install it to support Office conversion.",
+        )
+
     ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in ['.ppt', '.pptx', '.doc', '.docx']:
+    if ext not in [".ppt", ".pptx", ".doc", ".docx"]:
         raise HTTPException(status_code=400, detail="Only .ppt, .pptx, .doc, and .docx files are supported.")
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = os.path.join(temp_dir, file.filename)
-            
-            # Save uploaded file
+
             with open(input_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
-            
-            # Run conversion
-            # soffice --headless --convert-to pdf --outdir <outdir> <input>
+
             cmd = [
                 "soffice",
                 "--headless",
-                "--convert-to", "pdf",
-                "--outdir", temp_dir,
-                input_path
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temp_dir,
+                input_path,
             ]
-            
+
             print(f"Running conversion command: {' '.join(cmd)}")
-            # On Windows, soffice might need full path or shell=True, but in Docker (Linux) it should be in PATH
-            # Use subprocess.run
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-            
+
             if result.returncode != 0:
                 print(f"Conversion failed: {result.stderr}")
-                # Sometimes soffice returns non-zero but works? No, usually strict.
                 raise HTTPException(status_code=500, detail=f"Conversion failed: {result.stderr}")
-            
-            # Find the output PDF
+
             pdfs = [f for f in os.listdir(temp_dir) if f.lower().endswith(".pdf")]
-            
             if not pdfs:
                 raise HTTPException(status_code=500, detail="PDF file not generated")
-                
+
             pdf_path = os.path.join(temp_dir, pdfs[0])
             print(f"Conversion successful, sending back: {pdf_path}")
-            
+
             with open(pdf_path, "rb") as f:
                 pdf_content = f.read()
-                
+
             return Response(content=pdf_content, media_type="application/pdf")
-            
+
     except subprocess.TimeoutExpired:
         raise HTTPException(status_code=500, detail="File conversion timed out")
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Error during conversion: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
+
 class OCRRequest(BaseModel):
-    image: Optional[str] = None # Base64 string
-    fileType: Optional[int] = None # 0 for PDF, 1 for Image. If None, auto-detect
+    image: Optional[str] = None
+    fileType: Optional[int] = None
     useLayoutDetection: bool = True
     useDocUnwarping: bool = False
     useDocOrientationClassify: bool = False
@@ -273,8 +112,7 @@ class OCRRequest(BaseModel):
     useSealRecognition: bool = True
     formatBlockContent: bool = False
     showFormulaNumber: bool = True
-    markdownIgnoreLabels: List[str] = []
-    # Advanced parameters
+    markdownIgnoreLabels: List[str] = Field(default_factory=list)
     layoutThreshold: Optional[float] = None
     layoutNms: Optional[bool] = None
     layoutUnclipRatio: Optional[float] = None
@@ -286,7 +124,9 @@ class OCRRequest(BaseModel):
     maxPixels: Optional[int] = None
     visualize: Optional[bool] = None
 
+
 RawOCRInput = Union[bytes, str]
+
 
 def parse_bool(value, default: bool = False) -> bool:
     if value is None:
@@ -295,20 +135,24 @@ def parse_bool(value, default: bool = False) -> bool:
         return value
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
+
 def parse_optional_float(value) -> Optional[float]:
     if value in (None, ""):
         return None
     return float(value)
+
 
 def parse_optional_int(value) -> Optional[int]:
     if value in (None, ""):
         return None
     return int(value)
 
+
 def parse_optional_string(value) -> Optional[str]:
     if value in (None, ""):
         return None
     return str(value)
+
 
 def parse_markdown_ignore_labels(value) -> List[str]:
     if value in (None, ""):
@@ -326,13 +170,14 @@ def parse_markdown_ignore_labels(value) -> List[str]:
         pass
     return [text]
 
+
 async def parse_ocr_input(request: Request) -> tuple[OCRRequest, RawOCRInput]:
     content_type = request.headers.get("content-type", "")
     if "multipart/form-data" in content_type:
         form = await request.form()
         upload = form.get("file")
         if not upload or not hasattr(upload, "read"):
-            raise HTTPException(status_code=400, detail="缺少文件字段 file")
+            raise HTTPException(status_code=400, detail="Missing multipart field: file")
 
         file_bytes = await upload.read()
         ocr_request = OCRRequest(
@@ -361,8 +206,9 @@ async def parse_ocr_input(request: Request) -> tuple[OCRRequest, RawOCRInput]:
     payload = await request.json()
     ocr_request = OCRRequest(**payload)
     if not ocr_request.image:
-        raise HTTPException(status_code=400, detail="缺少 image 字段")
+        raise HTTPException(status_code=400, detail="Missing JSON field: image")
     return ocr_request, ocr_request.image
+
 
 def normalize_raw_input_to_base64(raw_input: RawOCRInput) -> str:
     if isinstance(raw_input, bytes):
@@ -371,15 +217,73 @@ def normalize_raw_input_to_base64(raw_input: RawOCRInput) -> str:
         return raw_input.split("base64,")[1]
     return raw_input
 
+
 def raw_input_to_bytes(raw_input: RawOCRInput) -> bytes:
     if isinstance(raw_input, bytes):
         return raw_input
     normalized = raw_input.split("base64,")[1] if "base64," in raw_input else raw_input
     return base64.b64decode(normalized)
 
+
+def build_pipeline_payload(request: OCRRequest, base64_data: str, file_type: int) -> dict:
+    payload = {
+        "file": base64_data,
+        "fileType": file_type,
+        "useLayoutDetection": request.useLayoutDetection,
+        "useDocUnwarping": request.useDocUnwarping,
+        "useDocOrientationClassify": request.useDocOrientationClassify,
+        "useChartRecognition": request.useChartRecognition,
+        "useSealRecognition": request.useSealRecognition,
+        "formatBlockContent": request.formatBlockContent,
+        "showFormulaNumber": request.showFormulaNumber,
+        "prettifyMarkdown": True,
+    }
+    optional_params = [
+        "markdownIgnoreLabels",
+        "layoutThreshold",
+        "layoutNms",
+        "layoutUnclipRatio",
+        "layoutMergeBboxesMode",
+        "repetitionPenalty",
+        "temperature",
+        "topP",
+        "minPixels",
+        "maxPixels",
+        "visualize",
+    ]
+    for param in optional_params:
+        val = getattr(request, param)
+        if val is not None:
+            payload[param] = val
+    return payload
+
+
+def parse_pipeline_response(data: dict, image_prefix: str = "") -> dict:
+    if "result" not in data or "layoutParsingResults" not in data["result"]:
+        print(f"Unexpected Format: {data}")
+        raise HTTPException(status_code=500, detail="Unexpected response format from Pipeline")
+
+    results = data["result"]["layoutParsingResults"]
+    full_markdown = ""
+    all_images = {}
+
+    for res in results:
+        if "markdown" in res and "text" in res["markdown"]:
+            md_text = res["markdown"]["text"]
+            md_images = res["markdown"].get("images", {})
+            if md_images:
+                for img_path, img_base64 in md_images.items():
+                    key = f"{image_prefix}_{img_path}" if image_prefix else img_path
+                    all_images[key] = img_base64
+            full_markdown += md_text + "\n\n"
+
+    return {"markdown": full_markdown, "images": all_images}
+
+
 async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
     base64_data = normalize_raw_input_to_base64(raw_input)
     file_type = ocr_request.fileType
+
     if file_type is None:
         if isinstance(raw_input, bytes):
             if raw_input.startswith(b"%PDF-"):
@@ -413,11 +317,12 @@ async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> di
     payload = build_pipeline_payload(ocr_request, base64_data, file_type)
 
     print(f"Sending request to Pipeline Service at {PADDLE_SERVICE_URL}...")
-    async with httpx.AsyncClient(timeout=None) as client:
+    timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+    async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
             PADDLE_SERVICE_URL,
             json=payload,
-            headers={"Content-Type": "application/json"}
+            headers={"Content-Type": "application/json"},
         )
 
         if resp.status_code != 200:
@@ -426,115 +331,26 @@ async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> di
                 print(f"Validation Error Details: {resp.json()}")
             raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
 
-        data = resp.json()
-        return parse_pipeline_response(data)
+        return parse_pipeline_response(resp.json())
 
-def build_pipeline_payload(request: OCRRequest, base64_data: str, file_type: int) -> dict:
-    payload = {
-        "file": base64_data,
-        "fileType": file_type,
-        "useLayoutDetection": request.useLayoutDetection,
-        "useDocUnwarping": request.useDocUnwarping,
-        "useDocOrientationClassify": request.useDocOrientationClassify,
-        "useChartRecognition": request.useChartRecognition,
-        "useSealRecognition": request.useSealRecognition,
-        "formatBlockContent": request.formatBlockContent,
-        "showFormulaNumber": request.showFormulaNumber,
-        "prettifyMarkdown": True
-    }
-    optional_params = [
-        "markdownIgnoreLabels", "layoutThreshold", "layoutNms",
-        "layoutUnclipRatio", "layoutMergeBboxesMode", "repetitionPenalty",
-        "temperature", "topP", "minPixels", "maxPixels", "visualize"
-    ]
-    for param in optional_params:
-        val = getattr(request, param)
-        if val is not None:
-            payload[param] = val
-    return payload
 
-def parse_pipeline_response(data: dict, image_prefix: str = "") -> dict:
-    if "result" not in data or "layoutParsingResults" not in data["result"]:
-        print(f"Unexpected Format: {data}")
-        raise HTTPException(status_code=500, detail="Unexpected response format from Pipeline")
-    results = data["result"]["layoutParsingResults"]
-    full_markdown = ""
-    all_images = {}
-    for res in results:
-        if "markdown" in res and "text" in res["markdown"]:
-            md_text = res["markdown"]["text"]
-            md_images = res["markdown"].get("images", {})
-            if md_images:
-                for img_path, img_base64 in md_images.items():
-                    if image_prefix:
-                        key = f"{image_prefix}_{img_path}"
-                    else:
-                        key = img_path
-                    all_images[key] = img_base64
-            full_markdown += md_text + "\n\n"
-    return {"markdown": full_markdown, "images": all_images}
-
-@app.post("/api/paddleocr-vl-1.5")
+@app.post("/api/paddleocr-vl-1.6")
 async def proxy_ocr(request: Request):
-    """Proxy request to PaddleOCR-VL Pipeline Service"""
+    """Proxy request to PaddleOCR-VL Pipeline Service."""
     try:
         ocr_request, raw_image = await parse_ocr_input(request)
         base64_data = normalize_raw_input_to_base64(raw_image)
         print(f"Received OCR Request. Image size: {len(base64_data)} bytes")
         return await run_ocr_request(ocr_request, raw_image)
-            
+    except HTTPException:
+        raise
     except Exception as e:
         print(f"Proxy Error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/paddleocr-vl-1.5/pagewise")
-async def proxy_ocr_pagewise(request: Request):
-    try:
-        ocr_request, raw_image = await parse_ocr_input(request)
-        base64_data = normalize_raw_input_to_base64(raw_image)
-        print(f"Received Pagewise OCR Request. Image size: {len(base64_data)} bytes")
-        file_type = ocr_request.fileType
-        if file_type is None:
-            if isinstance(raw_image, bytes):
-                file_type = 0 if raw_image.startswith(b"%PDF-") else 1
-            else:
-                file_type = 0 if base64_data.startswith("JVBERi0") else 1
-        if file_type != 0:
-            return await run_ocr_request(ocr_request, raw_image)
-        pdf_bytes = raw_input_to_bytes(raw_image)
-        reader = PdfReader(io.BytesIO(pdf_bytes))
-        total_pages = len(reader.pages)
-        if total_pages <= 0:
-            raise HTTPException(status_code=400, detail="PDF 无有效页面")
-        print(f"Pagewise OCR start, total pages: {total_pages}")
-        merged_markdown = ""
-        merged_images = {}
-        async with httpx.AsyncClient(timeout=None) as client:
-            for index, page in enumerate(reader.pages):
-                writer = PdfWriter()
-                writer.add_page(page)
-                page_buffer = io.BytesIO()
-                writer.write(page_buffer)
-                page_base64 = base64.b64encode(page_buffer.getvalue()).decode("utf-8")
-                payload = build_pipeline_payload(ocr_request, page_base64, 0)
-                resp = await client.post(
-                    PADDLE_SERVICE_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"}
-                )
-                if resp.status_code != 200:
-                    print(f"Pagewise service error page {index+1}: {resp.text}")
-                    raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
-                page_result = parse_pipeline_response(resp.json(), image_prefix=f"p{index+1}")
-                merged_markdown += page_result["markdown"]
-                if page_result["images"]:
-                    merged_images.update(page_result["images"])
-        return {"markdown": merged_markdown, "images": merged_images}
-    except Exception as e:
-        print(f"Pagewise Proxy Error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
+
     print(f"Starting server... Target Pipeline: {PADDLE_SERVICE_URL}")
     uvicorn.run(app, host="0.0.0.0", port=8000)

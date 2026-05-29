@@ -1,6 +1,7 @@
 // Configuration
 const API_BASE = '/api';
-let availableModel = 'PaddleOCR-VL-1.5-0.9B'; // Default model name for UI
+let availableModel = 'PaddleOCR-VL-1.6-0.9B'; // Default model name for UI
+const PDF_BATCH_SIZE = 200;
 
 // State
 let processQueue = [];
@@ -143,6 +144,9 @@ async function processImage(file) {
                 file: file,
                 type: 'image',
                 dataUrl: e.target.result,
+                payloadDataUrl: e.target.result,
+                fileType: 1,
+                pageCount: 1,
                 name: file.name,
                 status: 'pending'
             });
@@ -228,28 +232,70 @@ async function processOfficeFile(file) {
 
 async function processPDF(file, fileName) {
     const arrayBuffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument(arrayBuffer).promise;
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+    const totalPages = pdf.numPages;
+    const sourcePdf = totalPages > PDF_BATCH_SIZE
+        ? await PDFLib.PDFDocument.load(arrayBuffer.slice(0))
+        : null;
     
-    for (let i = 1; i <= pdf.numPages; i++) {
-        const page = await pdf.getPage(i);
-        const viewport = page.getViewport({ scale: 2.0 }); // Scale up for better OCR
-        const canvas = document.createElement('canvas');
-        const context = canvas.getContext('2d');
-        canvas.height = viewport.height;
-        canvas.width = viewport.width;
-
-        await page.render({ canvasContext: context, viewport: viewport }).promise;
+    for (let startPage = 1; startPage <= totalPages; startPage += PDF_BATCH_SIZE) {
+        const endPage = Math.min(startPage + PDF_BATCH_SIZE - 1, totalPages);
+        const pageCount = endPage - startPage + 1;
+        const thumbnail = await renderPDFPageThumbnail(pdf, startPage);
+        const payloadDataUrl = totalPages <= PDF_BATCH_SIZE
+            ? arrayBufferToDataUrl(arrayBuffer, 'application/pdf')
+            : await createPDFBatchDataUrl(sourcePdf, startPage, endPage);
         
         addToQueue({
             id: Math.random().toString(36).substr(2, 9),
             file: file,
-            type: 'pdf_page',
-            dataUrl: canvas.toDataURL('image/jpeg', 0.9),
-            name: `${fileName || file.name} (第 ${i} 页)`,
-            pageNum: i,
+            type: 'pdf_batch',
+            dataUrl: thumbnail,
+            payloadDataUrl,
+            fileType: 0,
+            pageCount,
+            startPage,
+            endPage,
+            name: `${fileName || file.name} (第 ${startPage}-${endPage} 页 / 共 ${totalPages} 页)`,
             status: 'pending'
         });
     }
+}
+
+async function renderPDFPageThumbnail(pdf, pageNumber) {
+    const page = await pdf.getPage(pageNumber);
+    const viewport = page.getViewport({ scale: 0.6 });
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d');
+    canvas.height = viewport.height;
+    canvas.width = viewport.width;
+    await page.render({ canvasContext: context, viewport }).promise;
+    return canvas.toDataURL('image/jpeg', 0.75);
+}
+
+async function createPDFBatchDataUrl(sourcePdf, startPage, endPage) {
+    const batchPdf = await PDFLib.PDFDocument.create();
+    const pageIndices = [];
+    for (let i = startPage - 1; i <= endPage - 1; i++) {
+        pageIndices.push(i);
+    }
+    const copiedPages = await batchPdf.copyPages(sourcePdf, pageIndices);
+    copiedPages.forEach((page) => batchPdf.addPage(page));
+    const bytes = await batchPdf.save();
+    return uint8ArrayToDataUrl(bytes, 'application/pdf');
+}
+
+function arrayBufferToDataUrl(buffer, mimeType) {
+    return uint8ArrayToDataUrl(new Uint8Array(buffer), mimeType);
+}
+
+function uint8ArrayToDataUrl(bytes, mimeType) {
+    let binary = '';
+    const chunkSize = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+    }
+    return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
 function addToQueue(item) {
@@ -281,7 +327,11 @@ function renderQueueItem(item) {
 }
 
 function updateQueueProgress() {
-    progressText.textContent = `已完成 ${processedResults.length} / 剩余 ${processQueue.length}`;
+    const totalPages = processQueue.reduce((sum, item) => sum + (item.pageCount || 1), 0);
+    const completedPages = processedResults.reduce((sum, item) => sum + (item.pageCount || 1), 0);
+    progressText.textContent = totalPages > 0
+        ? `已完成 ${completedPages} / ${totalPages} 页`
+        : '0/0';
 }
 
 async function processNextInQueue() {
@@ -313,7 +363,7 @@ async function processNextInQueue() {
     }
 
     try {
-        const data = await callVLLM(item.dataUrl);
+        const data = await callVLLM(item);
         
         // Success
         item.status = 'completed';
@@ -368,7 +418,7 @@ async function processNextInQueue() {
     }
 }
 
-async function callVLLM(base64Image) {
+async function callVLLM(item) {
     // Collect ignore labels
     const ignoreLabels = [];
     if (ignoreHeaderSwitch.checked) ignoreLabels.push('header', 'header_image');
@@ -376,7 +426,8 @@ async function callVLLM(base64Image) {
     if (ignoreNumberSwitch.checked) ignoreLabels.push('number');
 
     const payload = {
-        image: base64Image,
+        image: item.payloadDataUrl || item.dataUrl,
+        fileType: item.fileType,
         useLayoutDetection: true,
         useChartRecognition: chartRecognitionSwitch.checked,
         useDocUnwarping: docUnwarpingSwitch.checked,
@@ -387,7 +438,7 @@ async function callVLLM(base64Image) {
         markdownIgnoreLabels: ignoreLabels
     };
 
-    const response = await fetch(`${API_BASE}/paddleocr-vl-1.5`, {
+    const response = await fetch(`${API_BASE}/paddleocr-vl-1.6`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -415,8 +466,8 @@ function renderResult(item) {
     card.querySelector('.page-number').textContent = item.name;
     card.querySelector('.image-preview img').src = item.dataUrl;
     
-    // Replace image paths in markdown with data URLs from item.images
-    let markdown = item.markdown || '(无内容)';
+    // Replace escaped OCR text and image paths before rendering.
+    let markdown = normalizeOCRMarkdown(item.markdown || '(无内容)');
     if (item.images) {
         Object.entries(item.images).forEach(([path, base64]) => {
             // Replace the path in markdown with data URL
@@ -428,12 +479,14 @@ function renderResult(item) {
     // Render markdown using marked.js
     const mdHtml = marked.parse(markdown);
     const safeHtml = window.DOMPurify ? DOMPurify.sanitize(mdHtml) : mdHtml;
-    card.querySelector('.markdown-preview').innerHTML = safeHtml;
+    const markdownPreview = card.querySelector('.markdown-preview');
+    markdownPreview.innerHTML = safeHtml;
+    renderMathWhenReady(markdownPreview);
     
     // Setup copy button
     const copyBtn = card.querySelector('.copy-btn');
     copyBtn.addEventListener('click', () => {
-        navigator.clipboard.writeText(item.markdown).then(() => {
+        navigator.clipboard.writeText(normalizeOCRMarkdown(item.markdown || '')).then(() => {
             copyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" fill="none" stroke-width="2"><polyline points="20 6 9 17 4 12"></polyline></svg>';
             setTimeout(() => {
                 copyBtn.innerHTML = '<svg viewBox="0 0 24 24" width="16" height="16" stroke="currentColor" fill="none" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path></svg>';
@@ -443,6 +496,34 @@ function renderResult(item) {
     
     resultsContainer.appendChild(card);
     updateQueueProgress();
+}
+
+function normalizeOCRMarkdown(markdown) {
+    return String(markdown)
+        .replace(/\\r\\n/g, '\n')
+        .replace(/\\n/g, '\n')
+        .replace(/\\t/g, '\t');
+}
+
+function renderMathWhenReady(container, retries = 20) {
+    if (!window.renderMathInElement) {
+        if (retries > 0) {
+            setTimeout(() => renderMathWhenReady(container, retries - 1), 150);
+        }
+        return;
+    }
+
+    renderMathInElement(container, {
+        delimiters: [
+            { left: '$$', right: '$$', display: true },
+            { left: '\\[', right: '\\]', display: true },
+            { left: '\\(', right: '\\)', display: false },
+            { left: '$', right: '$', display: false }
+        ],
+        ignoredTags: ['script', 'noscript', 'style', 'textarea'],
+        throwOnError: false,
+        strict: false
+    });
 }
 
 function clearQueue() {
@@ -471,19 +552,20 @@ async function downloadAllMarkdown() {
         return;
     }
     
-    const totalPages = processedResults.length;
+    const totalPages = processedResults.reduce((sum, item) => sum + (item.pageCount || 1), 0);
     let combinedMarkdown = '';
     let allImages = {}; // Store all unique images
     
     processedResults.forEach((item, idx) => {
-        let markdown = item.markdown;
+        let markdown = normalizeOCRMarkdown(item.markdown || '');
         
         // Collect images and use relative paths
         if (item.images) {
             Object.entries(item.images).forEach(([path, base64]) => {
                 const filename = path.split('/').pop();
-                allImages[filename] = base64;
-                markdown = markdown.split(path).join(`ocr_images/${filename}`);
+                const safeFilename = `${item.id}_${filename}`;
+                allImages[safeFilename] = base64;
+                markdown = markdown.split(path).join(`ocr_images/${safeFilename}`);
             });
         }
         

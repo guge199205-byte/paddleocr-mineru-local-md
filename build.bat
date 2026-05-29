@@ -1,38 +1,37 @@
 @echo off
-REM PandOCR Docker 构建脚本 (Windows)
+REM Build PandOCR Docker images (Windows)
 
-echo 🚀 开始构建 PandOCR Docker 镜像...
+echo Building PandOCR Docker images...
 
-REM 检查 Docker 是否运行
 docker info >nul 2>&1
 if errorlevel 1 (
-    echo ❌ Docker 未运行，请先启动 Docker Desktop
+    echo Docker is not running. Please start Docker Desktop first.
     pause
     exit /b 1
 )
 
-REM 检查环境变量文件
 if not exist "env.txt" (
-    echo ⚠️  env.txt 不存在，创建默认配置...
+    echo env.txt does not exist. Creating RTX 50 / Blackwell defaults...
     (
-        echo API_IMAGE_TAG_SUFFIX=latest-offline
+        echo API_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
         echo VLM_BACKEND=vllm
-        echo VLM_IMAGE_TAG_SUFFIX=latest-offline
+        echo VLM_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
+        echo PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B
+        echo PADDLE_REQUEST_TIMEOUT=3600
     ) > env.txt
 )
 
-echo 📦 拉取 PaddleOCR-VL 基础镜像...
+echo Pulling PaddleOCR-VL images...
 docker compose --env-file env.txt pull
 
-echo 🔨 构建前端服务镜像...
+echo Building pandocr-web...
 docker compose --env-file env.txt build pandocr-web
 
-echo ✅ 构建完成！
+echo Build complete.
 echo.
-echo 📋 下一步操作：
-echo   启动服务: docker compose --env-file env.txt up -d
-echo   查看日志: docker compose logs -f
-echo   停止服务: docker compose down
+echo Next:
+echo   docker compose --env-file env.txt up -d
+echo   docker compose --env-file env.txt logs -f
+echo   docker compose --env-file env.txt down
 echo.
 pause
-

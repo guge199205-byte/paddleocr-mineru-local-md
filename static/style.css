@@ -687,6 +687,31 @@ body {
     font-family: var(--font-family);
 }
 
+.markdown-preview table {
+    display: block;
+    width: max-content;
+    max-width: 100%;
+    overflow-x: auto;
+    border-collapse: collapse;
+}
+
+.markdown-preview th,
+.markdown-preview td {
+    padding: 4px 6px;
+    vertical-align: middle;
+    white-space: normal;
+}
+
+.markdown-preview .katex-display {
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 4px 0;
+}
+
+.markdown-preview .katex {
+    font-size: 1em;
+}
+
 /* Footer */
 footer {
     text-align: center;
