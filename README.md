@@ -36,7 +36,15 @@ Browser
 
 ## 快速启动
 
-RTX 50 / Blackwell 显卡使用 `env.txt`，其中镜像标签为 `latest-nvidia-gpu-sm120-offline`。
+先根据显卡型号选择环境文件：
+
+| 显卡 | 推荐环境文件 | 镜像标签 |
+| --- | --- | --- |
+| RTX 30 系列 | `env.docker` | `latest-nvidia-gpu-offline` |
+| RTX 40 系列 | `env.docker` | `latest-nvidia-gpu-offline` |
+| RTX 50 系列 / Blackwell | `env.txt` | `latest-nvidia-gpu-sm120-offline` |
+
+下面命令以 RTX 50 系列的 `env.txt` 为例；RTX 30/40 系列用户把命令里的 `env.txt` 换成 `env.docker` 即可。
 
 ```powershell
 docker compose --env-file env.txt pull
@@ -67,7 +75,7 @@ PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B
 PADDLE_REQUEST_TIMEOUT=3600
 ```
 
-非 Blackwell NVIDIA GPU 可以参考 `env.docker`，把镜像标签改为 `latest-nvidia-gpu-offline`。
+RTX 30/40 系列等非 Blackwell NVIDIA GPU 使用 `env.docker`，其中两个镜像标签都是 `latest-nvidia-gpu-offline`。
 
 ## 主要接口
 

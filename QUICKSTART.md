@@ -7,7 +7,15 @@ docker --version
 nvidia-smi
 ```
 
-当前机器如果是 RTX 50 / Blackwell，直接使用 `env.txt`。其他 NVIDIA GPU 可以改用 `env.docker` 或把 `env.txt` 里的两个镜像标签改为 `latest-nvidia-gpu-offline`。
+根据 `nvidia-smi` 看到的显卡型号选择环境文件：
+
+| 显卡 | 使用的环境文件 | 说明 |
+| --- | --- | --- |
+| RTX 30 系列 | `env.docker` | 使用普通 NVIDIA GPU 离线镜像 |
+| RTX 40 系列 | `env.docker` | 使用普通 NVIDIA GPU 离线镜像 |
+| RTX 50 系列 / Blackwell | `env.txt` | 使用 SM120 / Blackwell 专用离线镜像 |
+
+下面命令以 RTX 50 系列的 `env.txt` 为例。RTX 30/40 系列用户请把命令里的 `env.txt` 换成 `env.docker`。
 
 ## 2. 拉取并构建
 

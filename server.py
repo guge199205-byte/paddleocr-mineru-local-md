@@ -172,7 +172,7 @@ class OCRRequest(BaseModel):
     useDocOrientationClassify: bool = False
     useChartRecognition: bool = False
     useSealRecognition: bool = True
-    formatBlockContent: bool = False
+    formatBlockContent: bool = True
     showFormulaNumber: bool = True
     markdownIgnoreLabels: List[str] = Field(default_factory=list)
     layoutThreshold: Optional[float] = None
@@ -249,7 +249,7 @@ async def parse_ocr_input(request: Request) -> tuple[OCRRequest, RawOCRInput]:
             useDocOrientationClassify=parse_bool(form.get("useDocOrientationClassify"), False),
             useChartRecognition=parse_bool(form.get("useChartRecognition"), False),
             useSealRecognition=parse_bool(form.get("useSealRecognition"), True),
-            formatBlockContent=parse_bool(form.get("formatBlockContent"), False),
+            formatBlockContent=parse_bool(form.get("formatBlockContent"), True),
             showFormulaNumber=parse_bool(form.get("showFormulaNumber"), True),
             markdownIgnoreLabels=parse_markdown_ignore_labels(form.get("markdownIgnoreLabels")),
             layoutThreshold=parse_optional_float(form.get("layoutThreshold")),

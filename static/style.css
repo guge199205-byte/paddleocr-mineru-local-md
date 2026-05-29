@@ -572,17 +572,14 @@ svg {
 .result-viewer {
     min-height: 0;
     flex: 1;
-    overflow: auto;
     background: #fff;
     border-radius: 0 0 8px 8px;
     border-top: 0;
 }
 
 .source-viewer {
-    display: flex;
-    align-items: flex-start;
-    justify-content: center;
-    padding: 16px;
+    overflow: auto;
+    padding: 18px 24px;
 }
 
 .drop-zone {
@@ -627,7 +624,23 @@ svg {
 
 .pdf-page-wrap {
     width: max-content;
+    max-width: 100%;
     min-width: 0;
+    margin: 0 auto;
+}
+
+.pdf-canvas-box {
+    width: max-content;
+    max-width: 100%;
+    position: relative;
+}
+
+.pdf-document-flow {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 18px;
 }
 
 .pdf-page-wrap canvas,
@@ -641,7 +654,59 @@ svg {
 .source-image {
     max-width: 100%;
     height: auto;
+    margin: 0 auto;
     border-radius: 6px;
+}
+
+.pdf-page-wrap canvas {
+    max-width: 100%;
+    height: auto;
+}
+
+.pdf-highlight-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: auto;
+    overflow: visible;
+}
+
+.source-highlight-box {
+    position: absolute;
+    border: 1.5px solid #315bff;
+    background: rgba(49, 91, 255, 0.18);
+    box-shadow: 0 0 0 1px rgba(49, 91, 255, 0.16);
+    pointer-events: none;
+}
+
+.source-link-hotspot {
+    position: absolute;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: crosshair;
+    pointer-events: auto;
+}
+
+.source-link-hotspot:focus-visible {
+    outline: 2px solid rgba(49, 91, 255, 0.7);
+    outline-offset: 1px;
+}
+
+.source-highlight-label {
+    position: absolute;
+    top: -23px;
+    left: -1.5px;
+    min-width: 34px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 7px;
+    color: #fff;
+    background: #315bff;
+    font-size: 12px;
+    line-height: 1;
+    white-space: nowrap;
 }
 
 .pdf-controls {
@@ -699,6 +764,7 @@ svg {
 }
 
 .result-viewer {
+    overflow: hidden;
     padding: 0;
 }
 
@@ -739,6 +805,55 @@ svg {
 
 .markdown-preview p {
     margin: .7em 0;
+}
+
+.layout-linked-block {
+    position: relative;
+    cursor: default;
+    transition: background .12s ease, box-shadow .12s ease;
+}
+
+.official-layout-block {
+    display: block;
+    margin: .75em 0;
+}
+
+.official-layout-block > :first-child {
+    margin-top: 0;
+}
+
+.official-layout-block > :last-child {
+    margin-bottom: 0;
+}
+
+.layout-block-placeholder {
+    min-height: 32px;
+    color: var(--muted);
+}
+
+.layout-linked-block-active {
+    background: rgba(49, 91, 255, 0.04);
+    box-shadow: 0 0 0 1.5px #315bff;
+}
+
+.layout-linked-block-active::before {
+    content: attr(data-layout-label);
+    position: absolute;
+    top: -23px;
+    left: 0;
+    z-index: 1;
+    min-width: 34px;
+    height: 22px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0 7px;
+    color: #fff;
+    background: #315bff;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: 1;
+    white-space: nowrap;
 }
 
 .markdown-preview .figure-title {

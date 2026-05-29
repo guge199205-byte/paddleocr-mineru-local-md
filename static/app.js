@@ -1,8 +1,5 @@
 const API_BASE = '/api';
 const PDF_BATCH_SIZE = 1;
-const DB_NAME = 'pandocr-workbench';
-const DB_VERSION = 1;
-const TASK_STORE = 'tasks';
 
 let availableModel = 'PaddleOCR-VL-1.6-0.9B';
 let tasks = [];
@@ -13,13 +10,13 @@ let isProcessing = false;
 let currentPdf = null;
 let currentPage = 1;
 let currentZoom = 1.15;
+let sourceRenderToken = 0;
 
 const els = {
     sidebar: document.getElementById('sidebar'),
     sidebarToggle: document.getElementById('sidebar-toggle'),
     fileInput: document.getElementById('file-input'),
     browseBtn: document.getElementById('browse-btn'),
-    topUploadBtn: document.getElementById('top-upload-btn'),
     newTaskBtn: document.getElementById('new-task-btn'),
     dropZone: document.getElementById('drop-zone'),
     taskList: document.getElementById('task-list'),
@@ -47,7 +44,6 @@ const els = {
     docUnwarpingSwitch: document.getElementById('doc-unwarping-switch'),
     docOrientationSwitch: document.getElementById('doc-orientation-switch'),
     sealRecognitionSwitch: document.getElementById('seal-recognition-switch'),
-    formatContentSwitch: document.getElementById('format-content-switch'),
     formulaNumberSwitch: document.getElementById('formula-number-switch'),
     ignoreHeaderSwitch: document.getElementById('ignore-header-switch'),
     ignoreFooterSwitch: document.getElementById('ignore-footer-switch'),
@@ -67,8 +63,8 @@ document.addEventListener('DOMContentLoaded', async () => {
 });
 
 function setupEventListeners() {
-    [els.browseBtn, els.topUploadBtn, els.newTaskBtn].forEach((button) => {
-        button.addEventListener('click', () => els.fileInput.click());
+    [els.browseBtn, els.newTaskBtn].forEach((button) => {
+        button?.addEventListener('click', () => els.fileInput.click());
     });
 
     els.fileInput.addEventListener('change', async (event) => {
@@ -107,6 +103,7 @@ function setupEventListeners() {
     els.nextPageBtn.addEventListener('click', () => changePdfPage(1));
     els.zoomInBtn.addEventListener('click', () => changeZoom(0.15));
     els.zoomOutBtn.addEventListener('click', () => changeZoom(-0.15));
+    els.sourceViewer.addEventListener('scroll', updateCurrentPageFromScroll);
 
     document.querySelectorAll('.task-tab').forEach((button) => {
         button.addEventListener('click', () => {
@@ -143,20 +140,8 @@ async function checkBackendConnection() {
     }
 }
 
-function openDb() {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-        request.onupgradeneeded = () => {
-            request.result.createObjectStore(TASK_STORE, { keyPath: 'id' });
-        };
-        request.onsuccess = () => resolve(request.result);
-        request.onerror = () => reject(request.error);
-    });
-}
-
 async function saveTask(task) {
     await saveTaskToServer(task);
-    await saveTaskToIndexedDb(task);
 }
 
 async function saveTaskToServer(task) {
@@ -170,46 +155,9 @@ async function saveTaskToServer(task) {
     }
 }
 
-async function saveTaskToIndexedDb(task) {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-        const tx = db.transaction(TASK_STORE, 'readwrite');
-        tx.objectStore(TASK_STORE).put(task);
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-    });
-    db.close();
-}
-
 async function loadTasks() {
-    const [serverTasks, browserTasks] = await Promise.all([
-        loadServerTasks(),
-        loadIndexedDbTasks()
-    ]);
-    const merged = new Map();
-
-    for (const task of browserTasks) {
-        merged.set(task.id, task);
-    }
-    for (const task of serverTasks) {
-        const existing = merged.get(task.id);
-        if (!existing || (task.updatedAt || 0) >= (existing.updatedAt || 0)) {
-            merged.set(task.id, task);
-        }
-    }
-
-    tasks = Array.from(merged.values()).map(reconcileTaskStatus).sort((a, b) => b.updatedAt - a.updatedAt);
-
-    for (const task of tasks) {
-        const serverTask = serverTasks.find((item) => item.id === task.id);
-        if (!serverTask || serverTask.status !== task.status) {
-            try {
-                await saveTaskToServer(task);
-            } catch (error) {
-                console.warn('迁移浏览器历史到本地目录失败：', error);
-            }
-        }
-    }
+    const localTasks = await loadServerTasks();
+    tasks = dedupeTasks(localTasks.map(reconcileTaskStatus));
 }
 
 function reconcileTaskStatus(task) {
@@ -222,6 +170,24 @@ function reconcileTaskStatus(task) {
     return task;
 }
 
+function dedupeTasks(taskItems) {
+    const byFingerprint = new Map();
+    taskItems.forEach((task) => {
+        const fingerprint = [
+            task.name,
+            task.originalName || '',
+            task.sourceKind || '',
+            task.size || 0,
+            task.pageCount || 0
+        ].join('|');
+        const existing = byFingerprint.get(fingerprint);
+        if (!existing || (task.updatedAt || 0) > (existing.updatedAt || 0)) {
+            byFingerprint.set(fingerprint, task);
+        }
+    });
+    return Array.from(byFingerprint.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
+}
+
 async function loadServerTasks() {
     try {
         const response = await fetch(`${API_BASE}/tasks`);
@@ -229,53 +195,23 @@ async function loadServerTasks() {
         const data = await response.json();
         return data.tasks || [];
     } catch (error) {
-        console.warn('读取本地任务目录失败，回退到浏览器历史：', error);
+        console.warn('读取本地任务目录失败', error);
         return [];
     }
 }
 
-async function loadIndexedDbTasks() {
-    const db = await openDb();
-    const browserTasks = await new Promise((resolve, reject) => {
-        const tx = db.transaction(TASK_STORE, 'readonly');
-        const request = tx.objectStore(TASK_STORE).getAll();
-        request.onsuccess = () => resolve(request.result || []);
-        request.onerror = () => reject(request.error);
-    });
-    db.close();
-    return browserTasks;
-}
-
 async function deleteAllTasks() {
-    await fetch(`${API_BASE}/tasks`, { method: 'DELETE' });
-    await deleteAllIndexedDbTasks();
-}
-
-async function deleteAllIndexedDbTasks() {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-        const tx = db.transaction(TASK_STORE, 'readwrite');
-        tx.objectStore(TASK_STORE).clear();
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-    });
-    db.close();
+    const response = await fetch(`${API_BASE}/tasks`, { method: 'DELETE' });
+    if (!response.ok) {
+        throw new Error(`清空本地任务失败：${await response.text()}`);
+    }
 }
 
 async function deleteTaskById(taskId) {
-    await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
-    await deleteIndexedDbTaskById(taskId);
-}
-
-async function deleteIndexedDbTaskById(taskId) {
-    const db = await openDb();
-    await new Promise((resolve, reject) => {
-        const tx = db.transaction(TASK_STORE, 'readwrite');
-        tx.objectStore(TASK_STORE).delete(taskId);
-        tx.oncomplete = resolve;
-        tx.onerror = () => reject(tx.error);
-    });
-    db.close();
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+    if (!response.ok) {
+        throw new Error(`删除本地任务失败：${await response.text()}`);
+    }
 }
 
 async function handleFiles(files) {
@@ -286,7 +222,8 @@ async function handleFiles(files) {
         tasks.unshift(task);
         await saveTask(task);
         renderTaskList();
-        selectTask(task.id);
+        await selectTask(task.id);
+        await processTask(task, { confirmCompleted: false });
     }
 }
 
@@ -453,10 +390,16 @@ async function deleteTask(taskId) {
         alert('当前文件正在解析中，完成后再删除。');
         return;
     }
-    if (!confirm(`确定要删除“${task.name}”吗？当前操作不可回撤。`)) return;
+    if (!confirm('确定要删除“' + task.name + '”吗？当前操作不可回撤。')) return;
 
     const wasActive = activeTaskId === taskId;
-    await deleteTaskById(taskId);
+    try {
+        await deleteTaskById(taskId);
+    } catch (error) {
+        console.error(error);
+        alert(error.message || '删除失败，请稍后重试。');
+        return;
+    }
     tasks = tasks.filter((item) => item.id !== taskId);
 
     if (!wasActive) {
@@ -490,9 +433,11 @@ function getActiveTask() {
 }
 
 async function renderSource(task) {
+    const renderToken = ++sourceRenderToken;
     currentPdf = null;
     els.pdfControls.classList.add('hidden');
     els.sourceViewer.innerHTML = '';
+    els.sourceViewer.scrollTop = 0;
 
     if (task.sourceKind === 'image') {
         const img = document.createElement('img');
@@ -505,30 +450,49 @@ async function renderSource(task) {
     currentPage = Math.min(Math.max(currentPage, 1), task.pageCount || 1);
     els.pdfControls.classList.remove('hidden');
     const bytes = dataUrlToUint8Array(task.sourceDataUrl);
-    currentPdf = await pdfjsLib.getDocument({ data: bytes }).promise;
-    await renderCurrentPdfPage();
+    const pdf = await pdfjsLib.getDocument({ data: bytes }).promise;
+    if (renderToken !== sourceRenderToken) return;
+    currentPdf = pdf;
+    await renderPdfDocument(renderToken);
 }
 
-async function renderCurrentPdfPage() {
+async function renderPdfDocument(renderToken = sourceRenderToken) {
+    if (renderToken !== sourceRenderToken) return;
     if (!currentPdf) return;
     currentPage = Math.min(Math.max(currentPage, 1), currentPdf.numPages);
-    els.pageIndicator.textContent = `${currentPage} / ${currentPdf.numPages}`;
-    els.prevPageBtn.disabled = currentPage <= 1;
-    els.nextPageBtn.disabled = currentPage >= currentPdf.numPages;
-
-    const page = await currentPdf.getPage(currentPage);
-    const viewport = page.getViewport({ scale: currentZoom });
-    const canvas = document.createElement('canvas');
-    const context = canvas.getContext('2d');
-    canvas.width = viewport.width;
-    canvas.height = viewport.height;
-    await page.render({ canvasContext: context, viewport }).promise;
-
+    updatePdfControls();
     els.sourceViewer.innerHTML = '';
-    const wrap = document.createElement('div');
-    wrap.className = 'pdf-page-wrap';
-    wrap.appendChild(canvas);
-    els.sourceViewer.appendChild(wrap);
+    const flow = document.createElement('div');
+    flow.className = 'pdf-document-flow';
+    els.sourceViewer.appendChild(flow);
+
+    for (let pageNumber = 1; pageNumber <= currentPdf.numPages; pageNumber += 1) {
+        if (renderToken !== sourceRenderToken) return;
+
+        const page = await currentPdf.getPage(pageNumber);
+        const viewport = page.getViewport({ scale: currentZoom });
+        const canvas = document.createElement('canvas');
+        const context = canvas.getContext('2d');
+        canvas.width = viewport.width;
+        canvas.height = viewport.height;
+
+        const wrap = document.createElement('div');
+        wrap.className = 'pdf-page-wrap';
+        wrap.dataset.page = String(pageNumber);
+        const canvasBox = document.createElement('div');
+        canvasBox.className = 'pdf-canvas-box';
+        canvasBox.appendChild(canvas);
+        const highlightLayer = document.createElement('div');
+        highlightLayer.className = 'pdf-highlight-layer';
+        canvasBox.appendChild(highlightLayer);
+        wrap.appendChild(canvasBox);
+        flow.appendChild(wrap);
+
+        await page.render({ canvasContext: context, viewport }).promise;
+    }
+
+    scrollPdfPageIntoView(currentPage, 'auto');
+    updateCurrentPageFromScroll();
 }
 
 function renderResultPane(task) {
@@ -544,15 +508,22 @@ function renderResultPane(task) {
     if (activeResultView === 'json') {
         els.markdownView.classList.add('hidden');
         els.jsonView.classList.remove('hidden');
-        els.jsonView.textContent = JSON.stringify(toDisplayJson(task), null, 2);
+        els.jsonView.textContent = JSON.stringify(toOfficialJson(task), null, 2);
         return;
     }
 
     els.jsonView.classList.add('hidden');
     els.markdownView.classList.remove('hidden');
 
+    if (renderOfficialLayoutResult(task)) {
+        renderMathWhenReady(els.markdownView);
+        return;
+    }
+
     const markdown = prepareMarkdownForRender(task.markdown || '');
     if (!markdown) {
+        clearSourceHighlight();
+        clearSourceHotspots();
         els.markdownView.innerHTML = `<div class="empty-result">${emptyResultText(task)}</div>`;
         return;
     }
@@ -563,19 +534,23 @@ function renderResultPane(task) {
     });
     const html = renderMarkdownHtml(renderMarkdown);
     els.markdownView.innerHTML = html;
+    linkMarkdownToSourceBlocks(task);
     renderMathWhenReady(els.markdownView);
 }
 
 async function processActiveTask() {
     const task = getActiveTask();
+    await processTask(task, { confirmCompleted: true });
+}
+
+async function processTask(task, { confirmCompleted = true } = {}) {
     if (!task || isProcessing) return;
-    if (task.status === 'completed' && !confirm('这个任务已经解析完成，要重新解析吗？')) return;
+    if (confirmCompleted && task.status === 'completed' && !confirm('这个任务已经解析完成，要重新解析吗？')) return;
 
     task.status = 'processing';
     task.markdown = '';
     task.images = {};
     task.ocrResults = [];
-    task.rawResponses = [];
     task.batches.forEach((batch) => {
         batch.status = 'pending';
         batch.markdown = '';
@@ -623,9 +598,11 @@ async function processActiveTask() {
 
 async function callVLLM(batch) {
     const ignoreLabels = [];
+    if (els.ignoreNumberSwitch.checked) ignoreLabels.push('number');
+    ignoreLabels.push('footnote');
     if (els.ignoreHeaderSwitch.checked) ignoreLabels.push('header', 'header_image');
     if (els.ignoreFooterSwitch.checked) ignoreLabels.push('footer', 'footer_image');
-    if (els.ignoreNumberSwitch.checked) ignoreLabels.push('number');
+    ignoreLabels.push('aside_text');
 
     const payload = {
         image: batch.payloadDataUrl,
@@ -635,7 +612,7 @@ async function callVLLM(batch) {
         useDocUnwarping: els.docUnwarpingSwitch.checked,
         useDocOrientationClassify: els.docOrientationSwitch.checked,
         useSealRecognition: els.sealRecognitionSwitch.checked,
-        formatBlockContent: els.formatContentSwitch.checked,
+        formatBlockContent: true,
         showFormulaNumber: els.formulaNumberSwitch.checked,
         markdownIgnoreLabels: ignoreLabels
     };
@@ -653,12 +630,17 @@ async function callVLLM(batch) {
 
 function updateActionState(task) {
     const hasResult = Boolean(task?.markdown) || Boolean(task?.ocrResults?.length);
-    els.startBtn.disabled = !task || isProcessing;
+    els.startBtn.disabled = !task || isProcessing || task.status === 'processing';
     els.copyBtn.disabled = !task?.markdown;
     els.downloadBtn.disabled = !hasResult;
+    const startLabel = task?.status === 'completed'
+        ? '重新解析'
+        : task?.status === 'error'
+            ? '重试解析'
+            : '开始解析';
     els.startBtn.innerHTML = task?.status === 'processing'
         ? '<span class="spinner"></span>解析中'
-        : '<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>开始解析';
+        : `<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>${startLabel}`;
 }
 
 async function copyActiveMarkdown() {
@@ -674,7 +656,7 @@ async function downloadActiveTask() {
     if (!task?.markdown && !task?.ocrResults?.length) return;
 
     if (activeResultView === 'json') {
-        const json = JSON.stringify(toDisplayJson(task), null, 2);
+        const json = JSON.stringify(toOfficialJson(task), null, 2);
         downloadBlob(new Blob([json], { type: 'application/json' }), safeDownloadName(task.name, 'json'));
         return;
     }
@@ -701,7 +683,13 @@ async function downloadActiveTask() {
 
 async function clearHistory() {
     if (!confirm('确认清空所有本地任务历史吗？')) return;
-    await deleteAllTasks();
+    try {
+        await deleteAllTasks();
+    } catch (error) {
+        console.error(error);
+        alert(error.message || '清空失败，请稍后重试。');
+        return;
+    }
     tasks = [];
     activeTaskId = null;
     resetWorkbench();
@@ -709,6 +697,7 @@ async function clearHistory() {
 
 function resetWorkbench() {
     renderTaskList();
+    sourceRenderToken += 1;
     currentPdf = null;
     els.sourceTitle.textContent = '等待上传文件';
     els.sourceMeta.textContent = 'PDF、图片、Office 文档';
@@ -722,13 +711,57 @@ function resetWorkbench() {
 }
 
 function changePdfPage(delta) {
-    currentPage += delta;
-    renderCurrentPdfPage();
+    if (!currentPdf) return;
+    currentPage = Math.min(Math.max(currentPage + delta, 1), currentPdf.numPages);
+    scrollPdfPageIntoView(currentPage, 'smooth');
+    updatePdfControls();
 }
 
-function changeZoom(delta) {
+async function changeZoom(delta) {
+    if (!currentPdf) return;
     currentZoom = Math.min(2.2, Math.max(0.55, currentZoom + delta));
-    renderCurrentPdfPage();
+    await renderPdfDocument(++sourceRenderToken);
+    const task = getActiveTask();
+    if (task && activeResultView === 'markdown') {
+        renderResultPane(task);
+    }
+}
+
+function scrollPdfPageIntoView(pageNumber, behavior = 'smooth') {
+    const page = els.sourceViewer.querySelector(`.pdf-page-wrap[data-page="${pageNumber}"]`);
+    if (!page) return;
+    const top = page.offsetTop - els.sourceViewer.offsetTop - 12;
+    els.sourceViewer.scrollTo({ top: Math.max(top, 0), behavior });
+}
+
+function updateCurrentPageFromScroll() {
+    if (!currentPdf) return;
+    const pages = Array.from(els.sourceViewer.querySelectorAll('.pdf-page-wrap'));
+    if (!pages.length) return;
+
+    const viewerTop = els.sourceViewer.getBoundingClientRect().top;
+    let nearestPage = currentPage;
+    let nearestDistance = Infinity;
+
+    pages.forEach((page) => {
+        const distance = Math.abs(page.getBoundingClientRect().top - viewerTop - 16);
+        if (distance < nearestDistance) {
+            nearestDistance = distance;
+            nearestPage = Number(page.dataset.page);
+        }
+    });
+
+    if (nearestPage !== currentPage) {
+        currentPage = nearestPage;
+        updatePdfControls();
+    }
+}
+
+function updatePdfControls() {
+    if (!currentPdf) return;
+    els.pageIndicator.textContent = `${currentPage} / ${currentPdf.numPages}`;
+    els.prevPageBtn.disabled = currentPage <= 1;
+    els.nextPageBtn.disabled = currentPage >= currentPdf.numPages;
 }
 
 async function renderPDFPageDataUrl(pdf, pageNumber, scale) {
@@ -820,6 +853,414 @@ function renderMathWhenReady(container, retries = 20) {
     });
 }
 
+function renderOfficialLayoutResult(task) {
+    const blocks = collectOfficialRenderBlocks(task);
+    if (!blocks.length) return false;
+
+    clearSourceHighlight();
+    clearSourceHotspots();
+    els.markdownView.innerHTML = '';
+
+    blocks.forEach((block) => {
+        const element = document.createElement('section');
+        element.className = 'layout-linked-block official-layout-block';
+        element.dataset.layoutLabel = layoutLabelText(block.label);
+        element.dataset.page = String(block.page);
+        element.dataset.blockIndex = String(block.blockIndex);
+
+        const content = rewriteBlockImageSources(block.content || fallbackBlockContent(block), block.pageResult, task);
+        element.innerHTML = renderMarkdownHtml(content);
+        els.markdownView.appendChild(element);
+
+        addSourceHotspot(block, element);
+        bindLinkedBlockEvents(element, block);
+    });
+
+    return true;
+}
+
+function collectOfficialRenderBlocks(task) {
+    const blocks = [];
+    if (!Array.isArray(task?.ocrResults)) return blocks;
+
+    task.ocrResults.forEach((pageResult, pageIndex) => {
+        const pruned = pageResult?.prunedResult || pageResult;
+        const pageWidth = Number(pruned?.width);
+        const pageHeight = Number(pruned?.height);
+        const parsingBlocks = Array.isArray(pruned?.parsing_res_list) ? pruned.parsing_res_list : [];
+
+        parsingBlocks.forEach((sourceBlock, blockIndex) => {
+            const bbox = sourceBlock.block_bbox || sourceBlock.coordinate || sourceBlock.bbox;
+            const label = sourceBlock.block_label || sourceBlock.label || '';
+            const content = sourceBlock.block_content ?? sourceBlock.text ?? sourceBlock.content ?? '';
+            if (!Array.isArray(bbox) || bbox.length < 4 || !pageWidth || !pageHeight) return;
+            if (isIgnoredLayoutLabel(label)) return;
+            if (!String(content || '').trim() && !isVisualLayoutLabel(label)) return;
+
+            blocks.push({
+                page: pageIndex + 1,
+                blockIndex,
+                label,
+                bbox,
+                pageWidth,
+                pageHeight,
+                content: String(content || ''),
+                pageResult,
+                sourceBlock
+            });
+        });
+    });
+
+    return blocks;
+}
+
+function isIgnoredLayoutLabel(label) {
+    const normalized = String(label || '').toLowerCase();
+    const ignored = new Set(['footnote', 'aside_text']);
+    if (els.ignoreNumberSwitch.checked) ignored.add('number');
+    if (els.ignoreHeaderSwitch.checked) {
+        ignored.add('header');
+        ignored.add('header_image');
+    }
+    if (els.ignoreFooterSwitch.checked) {
+        ignored.add('footer');
+        ignored.add('footer_image');
+    }
+    return ignored.has(normalized);
+}
+
+function isVisualLayoutLabel(label) {
+    return ['image', 'chart', 'table', 'algorithm'].includes(String(label || '').toLowerCase());
+}
+
+function fallbackBlockContent(block) {
+    const label = layoutLabelText(block.label);
+    return label ? `<div class="layout-block-placeholder">${escapeHtml(label)}</div>` : '';
+}
+
+function rewriteBlockImageSources(content, pageResult, task) {
+    let output = normalizeOCRMarkdown(String(content || ''));
+    const imageMaps = [
+        pageResult?.markdown?.images,
+        pageResult?.prunedResult?.markdown?.images,
+        task?.images
+    ];
+
+    imageMaps.forEach((images) => {
+        if (!images || typeof images !== 'object') return;
+        Object.entries(images).forEach(([path, value]) => {
+            if (!path || value == null) return;
+            output = output.split(path).join(imageValueToSrc(value));
+        });
+    });
+
+    return output;
+}
+
+function imageValueToSrc(value) {
+    const text = String(value || '');
+    if (/^(https?:|data:|blob:)/i.test(text)) return text;
+    return `data:image/jpeg;base64,${text}`;
+}
+
+function bindLinkedBlockEvents(element, block) {
+    const preview = () => activateLinkedBlock(element, block);
+    const locate = () => activateLinkedBlock(element, block, { scrollSource: true });
+    const deactivate = () => deactivateLinkedBlocks();
+    element.addEventListener('mouseenter', preview);
+    element.addEventListener('mouseover', preview);
+    element.addEventListener('pointerenter', preview);
+    element.addEventListener('focusin', preview);
+    element.addEventListener('click', locate);
+    element.addEventListener('mouseleave', deactivate);
+    element.addEventListener('pointerleave', deactivate);
+    element.addEventListener('focusout', deactivate);
+}
+
+function linkMarkdownToSourceBlocks(task) {
+    clearSourceHighlight();
+    clearSourceHotspots();
+    if (!task?.ocrResults?.length) return;
+
+    const blocks = collectLayoutBlocks(task);
+    if (!blocks.length) return;
+
+    const elements = collectMarkdownBlockElements(els.markdownView);
+    let cursor = 0;
+
+    elements.forEach((element) => {
+        const isImageBlock = isMarkdownImageBlock(element);
+        const text = normalizeMatchText(element.innerText || element.textContent || '');
+        if (!isImageBlock && text.length < 2) return;
+
+        const match = isImageBlock
+            ? findNextLayoutBlockByLabel(blocks, cursor, ['image', 'chart', 'table'])
+            : isAlgorithmText(element.innerText || element.textContent || '')
+                ? findNextLayoutBlockByLabel(blocks, cursor, ['algorithm'])
+            : isFigureTitleText(element.innerText || element.textContent || '')
+                ? findNextLayoutBlockByLabel(blocks, cursor, ['figure_title'])
+            : findBestLayoutBlock(text, blocks, cursor);
+        if (!match) return;
+
+        cursor = match.index;
+        element.classList.add('layout-linked-block');
+        element.dataset.layoutLabel = layoutLabelText(match.block.label);
+        addSourceHotspot(match.block, element);
+        const preview = () => activateLinkedBlock(element, match.block);
+        const locate = () => activateLinkedBlock(element, match.block, { scrollSource: true });
+        const deactivate = () => deactivateLinkedBlocks();
+        element.addEventListener('mouseenter', preview);
+        element.addEventListener('mouseover', preview);
+        element.addEventListener('pointerenter', preview);
+        element.addEventListener('focusin', preview);
+        element.addEventListener('click', locate);
+        element.addEventListener('mouseleave', deactivate);
+        element.addEventListener('pointerleave', deactivate);
+        element.addEventListener('focusout', deactivate);
+    });
+}
+
+function collectLayoutBlocks(task) {
+    const blocks = [];
+    task.ocrResults.forEach((pageResult, pageIndex) => {
+        const pruned = pageResult?.prunedResult || pageResult;
+        const pageWidth = Number(pruned?.width);
+        const pageHeight = Number(pruned?.height);
+        const parsingBlocks = Array.isArray(pruned?.parsing_res_list) ? pruned.parsing_res_list : [];
+
+        parsingBlocks.forEach((block, blockIndex) => {
+            const bbox = block.block_bbox || block.coordinate || block.bbox;
+            const content = block.block_content || block.text || block.content || '';
+            const label = block.block_label || block.label || '';
+            if (!Array.isArray(bbox) || bbox.length < 4 || !pageWidth || !pageHeight) return;
+            if (!content && !['image', 'chart', 'table'].includes(label)) return;
+            blocks.push({
+                page: pageIndex + 1,
+                order: Number(block.block_order ?? blockIndex),
+                label,
+                bbox,
+                pageWidth,
+                pageHeight,
+                text: normalizeMatchText(content || label)
+            });
+        });
+    });
+    return blocks.sort((a, b) => (a.page - b.page) || (a.order - b.order));
+}
+
+function collectMarkdownBlockElements(container) {
+    const selector = 'h1,h2,h3,h4,h5,h6,p,li,table,pre,blockquote,div,img';
+    const seen = new Set();
+    const elements = [];
+
+    Array.from(container.querySelectorAll(selector)).forEach((element) => {
+        if (element.closest('.empty-result')) return false;
+        if (element.parentElement?.closest('li,table,pre,blockquote')) return false;
+        if (element.tagName === 'DIV' && !isMarkdownImageBlock(element) && !isFigureTitleText(element.innerText || element.textContent || '')) {
+            return false;
+        }
+
+        const imageHost = element.tagName === 'IMG' ? element.closest('p,div') || element : element;
+        const target = ['P', 'DIV'].includes(imageHost.tagName) && imageHost.querySelector('img') ? imageHost : element;
+        if (seen.has(target)) return false;
+
+        const hasText = Boolean((target.innerText || target.textContent || '').trim());
+        const hasImage = isMarkdownImageBlock(target);
+        if (!hasText && !hasImage) return false;
+
+        seen.add(target);
+        elements.push(target);
+        return true;
+    });
+
+    return elements;
+}
+
+function isMarkdownImageBlock(element) {
+    return element?.tagName === 'IMG' || Boolean(element?.querySelector?.('img'));
+}
+
+function isFigureTitleText(value) {
+    return /^Figure\s+\d+\s*[:：]/i.test(String(value || '').trim());
+}
+
+function isAlgorithmText(value) {
+    return /^Algorithm\s+\d+\s*[:：]/i.test(String(value || '').trim());
+}
+
+function findBestLayoutBlock(text, blocks, cursor) {
+    let best = null;
+    const start = Math.max(0, cursor - 1);
+    const end = Math.min(blocks.length, cursor + 18);
+
+    for (let index = start; index < end; index += 1) {
+        const score = matchScore(text, blocks[index].text);
+        if (score < 0.55) continue;
+        if (!best || score > best.score) best = { index, block: blocks[index], score };
+        if (score >= 0.92) break;
+    }
+
+    return best;
+}
+
+function findNextLayoutBlockByLabel(blocks, cursor, labels) {
+    const wanted = new Set(labels);
+    const start = Math.max(0, cursor - 1);
+    for (let index = start; index < blocks.length; index += 1) {
+        if (wanted.has(String(blocks[index].label || '').toLowerCase())) {
+            return { index, block: blocks[index], score: 1 };
+        }
+    }
+    return null;
+}
+
+function matchScore(elementText, blockText) {
+    if (!elementText || !blockText) return 0;
+    if (elementText === blockText) return 1;
+    if (blockText.includes(elementText)) return Math.min(0.98, elementText.length / Math.max(blockText.length, 1) + 0.62);
+    if (elementText.includes(blockText)) return Math.min(0.96, blockText.length / Math.max(elementText.length, 1) + 0.55);
+
+    const words = elementText.split(' ').filter((word) => word.length > 2);
+    if (!words.length) return 0;
+    const hitCount = words.filter((word) => blockText.includes(word)).length;
+    return hitCount / words.length;
+}
+
+function normalizeMatchText(value) {
+    return String(value)
+        .replace(/\$+/g, ' ')
+        .replace(/\\[a-zA-Z]+/g, ' ')
+        .replace(/[{}^_`~|()[\]<>#*_.,:;'"!?，。；：！？、]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLowerCase();
+}
+
+function showSourceHighlight(block) {
+    clearSourceHighlight();
+    const pageWrap = els.sourceViewer.querySelector(`.pdf-page-wrap[data-page="${block.page}"]`);
+    const canvas = pageWrap?.querySelector('canvas');
+    const layer = pageWrap?.querySelector('.pdf-highlight-layer');
+    if (!pageWrap || !canvas || !layer) return;
+
+    const box = document.createElement('div');
+    box.className = 'source-highlight-box';
+    positionSourceOverlayBox(box, block, canvas);
+    const label = document.createElement('span');
+    label.className = 'source-highlight-label';
+    label.textContent = layoutLabelText(block.label);
+    box.appendChild(label);
+    layer.appendChild(box);
+
+}
+
+function clearSourceHighlight() {
+    els.sourceViewer.querySelectorAll('.source-highlight-box').forEach((box) => box.remove());
+}
+
+function addSourceHotspot(block, markdownElement) {
+    const pageWrap = els.sourceViewer.querySelector(`.pdf-page-wrap[data-page="${block.page}"]`);
+    const canvas = pageWrap?.querySelector('canvas');
+    const layer = pageWrap?.querySelector('.pdf-highlight-layer');
+    if (!pageWrap || !canvas || !layer) return;
+
+    const hotspot = document.createElement('button');
+    hotspot.type = 'button';
+    hotspot.className = 'source-link-hotspot';
+    hotspot.setAttribute('aria-label', layoutLabelText(block.label));
+    positionSourceOverlayBox(hotspot, block, canvas);
+
+    const preview = () => activateLinkedBlock(markdownElement, block);
+    const locate = () => activateLinkedBlock(markdownElement, block, { scrollMarkdown: true });
+    const deactivate = () => deactivateLinkedBlocks();
+    hotspot.addEventListener('mouseenter', preview);
+    hotspot.addEventListener('mouseover', preview);
+    hotspot.addEventListener('pointerenter', preview);
+    hotspot.addEventListener('focusin', preview);
+    hotspot.addEventListener('click', locate);
+    hotspot.addEventListener('mouseleave', deactivate);
+    hotspot.addEventListener('pointerleave', deactivate);
+    hotspot.addEventListener('focusout', deactivate);
+
+    layer.appendChild(hotspot);
+}
+
+function positionSourceOverlayBox(element, block, canvas) {
+    const [x1, y1, x2, y2] = block.bbox.map(Number);
+    const canvasWidth = canvas.clientWidth || canvas.width;
+    const canvasHeight = canvas.clientHeight || canvas.height;
+    element.style.left = `${(x1 / block.pageWidth) * canvasWidth}px`;
+    element.style.top = `${(y1 / block.pageHeight) * canvasHeight}px`;
+    element.style.width = `${((x2 - x1) / block.pageWidth) * canvasWidth}px`;
+    element.style.height = `${((y2 - y1) / block.pageHeight) * canvasHeight}px`;
+}
+
+function activateLinkedBlock(markdownElement, block, { scrollMarkdown = false, scrollSource = false } = {}) {
+    deactivateLinkedBlocks();
+    markdownElement.classList.add('layout-linked-block-active');
+    showSourceHighlight(block);
+    if (scrollMarkdown && !isElementMostlyVisible(markdownElement, els.markdownView)) {
+        scrollElementIntoContainer(markdownElement, els.markdownView, 'smooth');
+    }
+    if (scrollSource) {
+        const pageWrap = els.sourceViewer.querySelector(`.pdf-page-wrap[data-page="${block.page}"]`);
+        if (pageWrap && !isElementMostlyVisible(pageWrap, els.sourceViewer)) {
+            scrollPdfPageIntoView(block.page, 'smooth');
+        }
+    }
+}
+
+function deactivateLinkedBlocks() {
+    els.markdownView.querySelectorAll('.layout-linked-block-active').forEach((element) => {
+        element.classList.remove('layout-linked-block-active');
+    });
+    clearSourceHighlight();
+}
+
+function clearSourceHotspots() {
+    els.sourceViewer.querySelectorAll('.source-link-hotspot').forEach((hotspot) => hotspot.remove());
+}
+
+function isElementMostlyVisible(element, container) {
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    return elementRect.top >= containerRect.top - 20 && elementRect.top <= containerRect.bottom - 80;
+}
+
+function scrollElementIntoContainer(element, container, behavior = 'smooth') {
+    const elementRect = element.getBoundingClientRect();
+    const containerRect = container.getBoundingClientRect();
+    const offset = elementRect.top - containerRect.top;
+    const centeredTop = container.scrollTop + offset - (container.clientHeight / 2) + (elementRect.height / 2);
+    container.scrollTo({ top: Math.max(centeredTop, 0), behavior });
+}
+
+function layoutLabelText(label) {
+    const normalized = String(label || '').trim().toLowerCase();
+    const labels = {
+        abstract: '摘要',
+        doc_title: '标题',
+        title: '标题',
+        paragraph_title: '段落标题',
+        text: '文本',
+        image: '图片',
+        figure_title: '图表标题',
+        table: '表格',
+        formula: '公式',
+        display_formula: '行间公式',
+        formula_number: '公式编号',
+        footer: '页脚',
+        header: '页眉',
+        number: '页码',
+        reference: '参考文献',
+        reference_content: '参考文献',
+        footnote: '脚注',
+        algorithm: '算法',
+        chart: '图表'
+    };
+    return labels[normalized] || normalized || '版面块';
+}
+
 function prepareBatchResult(result, batchId) {
     let markdown = normalizeOCRMarkdown(result.markdown || '');
     const images = {};
@@ -850,31 +1291,12 @@ function normalizeOCRJsonResults(result) {
     }];
 }
 
-function toDisplayJson(task) {
+function toOfficialJson(task) {
     if (Array.isArray(task.ocrResults) && task.ocrResults.length > 0) {
         return task.ocrResults;
     }
 
-    return {
-        id: task.id,
-        name: task.name,
-        status: task.status,
-        sourceKind: task.sourceKind,
-        pageCount: task.pageCount,
-        size: task.size,
-        createdAt: new Date(task.createdAt).toISOString(),
-        updatedAt: new Date(task.updatedAt).toISOString(),
-        batches: task.batches.map((batch) => ({
-            id: batch.id,
-            label: batch.label,
-            status: batch.status,
-            pageCount: batch.pageCount
-        })),
-        markdown: normalizeOCRMarkdown(task.markdown || ''),
-        images: Object.keys(task.images || {}),
-        layoutParsingResults: task.rawResponses || [],
-        error: task.error || null
-    };
+    return [];
 }
 
 function readAsDataUrl(file) {
