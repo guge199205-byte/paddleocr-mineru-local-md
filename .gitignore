@@ -53,6 +53,7 @@ PaddleOCR-VL_Online_Demo/assets/*
 tmp/
 temp/
 *.tmp
+tests/*.png
 
 # OS
 Thumbs.db

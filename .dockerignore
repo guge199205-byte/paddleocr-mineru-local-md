@@ -40,8 +40,10 @@ Thumbs.db
 
 # Project specific
 PaddleOCR-VL_Online_Demo/
+data/
 model_cache/
 model_cache_ocr/
+ollama_storage/
 ocr_results_*.md
 ocr_results_*.zip
 *.log

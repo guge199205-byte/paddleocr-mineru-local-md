@@ -67,7 +67,7 @@ const els = {
 };
 
 document.addEventListener('DOMContentLoaded', async () => {
-    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+    pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/vendor/pdfjs/pdf.worker.min.js';
     initPdfBatchSizeSetting();
     setupEventListeners();
     await checkBackendConnection();
@@ -178,6 +178,9 @@ async function loadTasks() {
 }
 
 function reconcileTaskStatus(task) {
+    if (!isTaskDetailLoaded(task)) {
+        return task;
+    }
     const batches = Array.isArray(task.batches) ? task.batches : [];
     const allBatchesCompleted = batches.length > 0 && batches.every((batch) => batch.status === 'completed');
     const hasAllOcrResults = Array.isArray(task.ocrResults) && task.ocrResults.length >= batches.length;
@@ -215,6 +218,44 @@ async function loadServerTasks() {
         console.warn('读取本地任务目录失败', error);
         return [];
     }
+}
+
+async function loadTaskFromServer(taskId) {
+    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+    if (!response.ok) {
+        throw new Error(`读取本地任务失败：${await response.text()}`);
+    }
+    return reconcileTaskStatus(await response.json());
+}
+
+function isTaskDetailLoaded(task) {
+    return Boolean(task?.sourceDataUrl && Array.isArray(task?.batches));
+}
+
+function replaceTask(task) {
+    const index = tasks.findIndex((item) => item.id === task.id);
+    if (index === -1) {
+        tasks.unshift(task);
+        return task;
+    }
+    tasks[index] = { ...tasks[index], ...task, detailLoaded: true };
+    return tasks[index];
+}
+
+async function ensureTaskLoaded(taskId) {
+    let task = tasks.find((item) => item.id === taskId);
+    if (!task) return null;
+    if (isTaskDetailLoaded(task)) return task;
+
+    els.sourceTitle.textContent = task.name || '正在加载任务';
+    els.sourceMeta.textContent = '正在加载本地任务详情...';
+    els.resultTitle.textContent = '正在加载';
+    els.markdownView.innerHTML = '<div class="empty-result">正在加载任务详情...</div>';
+    els.jsonView.textContent = '';
+    updateActionState(null);
+
+    task = await loadTaskFromServer(taskId);
+    return replaceTask(task);
 }
 
 async function deleteAllTasks() {
@@ -454,7 +495,19 @@ async function deleteTask(taskId) {
 async function selectTask(taskId) {
     activeTaskId = taskId;
     renderTaskList();
-    const task = getActiveTask();
+    let task;
+    try {
+        task = await ensureTaskLoaded(taskId);
+    } catch (error) {
+        console.error(error);
+        els.sourceTitle.textContent = '任务加载失败';
+        els.sourceMeta.textContent = '';
+        els.resultTitle.textContent = '加载失败';
+        els.markdownView.textContent = error.message || '任务详情加载失败';
+        updateActionState(null);
+        return;
+    }
+    if (activeTaskId !== taskId) return;
     if (!task) return;
     els.sourceTitle.textContent = task.name;
     els.sourceMeta.textContent = `${sourceLabel(task)} · ${formatSize(task.size)} · ${task.pageCount || 1} 页`;
@@ -610,7 +663,7 @@ function renderResultPane(task, { deferJson = false } = {}) {
     if (!markdown) {
         clearSourceHighlight();
         clearSourceHotspots();
-        els.markdownView.innerHTML = `<div class="empty-result">${emptyResultText(task)}</div>`;
+        els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(emptyResultText(task))}</div>`;
         renderedMarkdownKey = markdownKey;
         warmJsonResultCache(task);
         return;
@@ -807,7 +860,7 @@ async function callVLLM(batch) {
 
 function updateActionState(task) {
     const hasResult = Boolean(task?.markdown) || Boolean(task?.ocrResults?.length);
-    els.startBtn.disabled = !task || isProcessing || task.status === 'processing';
+    els.startBtn.disabled = !task || !isTaskDetailLoaded(task) || isProcessing || task.status === 'processing';
     els.copyBtn.disabled = !task?.markdown;
     els.downloadBtn.disabled = !hasResult;
     const startLabel = task?.status === 'completed'
@@ -1543,7 +1596,7 @@ function taskIcon(task) {
 }
 
 function statusText(task) {
-    const donePages = task.batches?.filter((batch) => batch.status === 'completed').reduce((sum, batch) => sum + batch.pageCount, 0) || 0;
+    const donePages = task.batches?.filter((batch) => batch.status === 'completed').reduce((sum, batch) => sum + batch.pageCount, 0) || task.completedPages || 0;
     if (task.status === 'completed') return '完成';
     if (task.status === 'processing') return `${donePages}/${task.pageCount || 1}`;
     if (task.status === 'error') return '失败';

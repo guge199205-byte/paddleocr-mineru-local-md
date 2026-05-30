@@ -7,31 +7,64 @@ import shutil
 import io
 import json
 import re
+import logging
 from pathlib import Path
 from PIL import Image
 from typing import List, Optional, Union
 from fastapi import FastAPI, HTTPException, File, UploadFile, Request
+from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+logger = logging.getLogger("pandocr")
+logging.basicConfig(level=os.getenv("PANDOCR_LOG_LEVEL", "INFO"))
+
+
+def parse_csv_env(name: str, default: str) -> list[str]:
+    value = os.getenv(name, default)
+    return [item.strip() for item in value.split(",") if item.strip()]
+
 
 PADDLE_SERVICE_URL = os.getenv("PADDLE_SERVICE_URL", "http://localhost:8081/layout-parsing")
 PADDLEOCR_VL_MODEL_NAME = os.getenv("PADDLEOCR_VL_MODEL_NAME", "PaddleOCR-VL-1.6-0.9B")
 PADDLE_REQUEST_TIMEOUT = float(os.getenv("PADDLE_REQUEST_TIMEOUT", "3600"))
 TASK_DATA_DIR = Path(os.getenv("PANDOCR_TASK_DATA_DIR", "data/tasks")).resolve()
+MAX_REQUEST_BYTES = int(float(os.getenv("PANDOCR_MAX_UPLOAD_MB", "512")) * 1024 * 1024)
+CORS_ORIGINS = parse_csv_env(
+    "PANDOCR_CORS_ORIGINS",
+    "http://localhost:8000,http://127.0.0.1:8000",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=CORS_ORIGINS,
+    allow_credentials="*" not in CORS_ORIGINS,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+
+@app.middleware("http")
+async def reject_oversized_requests(request: Request, call_next):
+    if request.method in {"POST", "PUT", "PATCH"} and MAX_REQUEST_BYTES > 0:
+        content_length = request.headers.get("content-length")
+        if content_length:
+            try:
+                if int(content_length) > MAX_REQUEST_BYTES:
+                    max_mb = MAX_REQUEST_BYTES / 1024 / 1024
+                    return JSONResponse(
+                        status_code=413,
+                        content={"detail": f"Request body is too large. Max upload size is {max_mb:.0f} MB."},
+                    )
+            except ValueError:
+                pass
+    return await call_next(request)
 
 
 @app.get("/")
@@ -55,59 +88,123 @@ def task_file_path(task_id: str) -> Path:
     return TASK_DATA_DIR / safe_task_id(task_id) / "task.json"
 
 
-@app.get("/api/tasks")
-async def list_tasks():
-    """List locally persisted document parsing tasks."""
+def task_summary(task: dict) -> dict:
+    batches = task.get("batches") if isinstance(task.get("batches"), list) else []
+    completed_pages = sum(
+        int(batch.get("pageCount") or 0)
+        for batch in batches
+        if isinstance(batch, dict) and batch.get("status") == "completed"
+    )
+    return {
+        "id": task.get("id"),
+        "name": task.get("name"),
+        "originalName": task.get("originalName"),
+        "sourceKind": task.get("sourceKind"),
+        "mimeType": task.get("mimeType"),
+        "size": task.get("size"),
+        "createdAt": task.get("createdAt"),
+        "updatedAt": task.get("updatedAt"),
+        "status": task.get("status"),
+        "pageCount": task.get("pageCount"),
+        "pdfBatchSize": task.get("pdfBatchSize"),
+        "error": task.get("error"),
+        "completedPages": completed_pages,
+        "batchCount": len(batches),
+        "hasMarkdown": bool(task.get("markdown")),
+        "hasOcrResults": bool(task.get("ocrResults")),
+        "detailLoaded": False,
+    }
+
+
+def read_task_file(path: Path) -> dict:
+    with path.open("r", encoding="utf-8") as f:
+        task = json.load(f)
+    if not isinstance(task, dict):
+        raise ValueError("Task file must contain a JSON object")
+    return task
+
+
+def write_task_file(path: Path, task: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(".json.tmp")
+    with temp_path.open("w", encoding="utf-8") as f:
+        json.dump(task, f, ensure_ascii=False)
+    temp_path.replace(path)
+
+
+def list_task_summaries() -> list[dict]:
     TASK_DATA_DIR.mkdir(parents=True, exist_ok=True)
     tasks = []
     for path in TASK_DATA_DIR.glob("*/task.json"):
         try:
-            with path.open("r", encoding="utf-8") as f:
-                tasks.append(json.load(f))
-        except (OSError, json.JSONDecodeError) as err:
-            print(f"Skipping invalid task file {path}: {err}")
-    tasks.sort(key=lambda item: item.get("updatedAt", 0), reverse=True)
+            tasks.append(task_summary(read_task_file(path)))
+        except (OSError, ValueError, json.JSONDecodeError) as err:
+            logger.warning("Skipping invalid task file %s: %s", path, err)
+    tasks.sort(key=lambda item: item.get("updatedAt") or 0, reverse=True)
+    return tasks
+
+
+def remove_path(path: Path) -> None:
+    if path.exists():
+        shutil.rmtree(path)
+
+
+@app.get("/api/tasks")
+async def list_tasks():
+    """List locally persisted document parsing task summaries."""
+    tasks = await run_in_threadpool(list_task_summaries)
     return {"tasks": tasks}
+
+
+@app.get("/api/tasks/{task_id}")
+async def get_task(task_id: str):
+    """Return one full locally persisted task."""
+    path = task_file_path(task_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Task not found")
+    try:
+        task = await run_in_threadpool(read_task_file, path)
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        logger.warning("Failed to read task file %s: %s", path, err)
+        raise HTTPException(status_code=500, detail="Failed to read task")
+    task["detailLoaded"] = True
+    return task
 
 
 @app.put("/api/tasks/{task_id}")
 async def save_task(task_id: str, request: Request):
     """Persist one task to the local project data directory."""
     task = await request.json()
+    if not isinstance(task, dict):
+        raise HTTPException(status_code=400, detail="Task payload must be a JSON object")
     if task.get("id") != task_id:
         raise HTTPException(status_code=400, detail="Task id mismatch")
 
     path = task_file_path(task_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(".json.tmp")
-    with temp_path.open("w", encoding="utf-8") as f:
-        json.dump(task, f, ensure_ascii=False)
-    temp_path.replace(path)
-    return {"ok": True}
+    await run_in_threadpool(write_task_file, path, task)
+    return {"ok": True, "task": task_summary(task)}
 
 
 @app.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: str):
     """Delete one locally persisted task."""
     path = task_file_path(task_id)
-    if path.parent.exists():
-        shutil.rmtree(path.parent)
+    await run_in_threadpool(remove_path, path.parent)
     return {"ok": True}
 
 
 @app.delete("/api/tasks")
 async def clear_tasks():
     """Delete all locally persisted tasks."""
-    if TASK_DATA_DIR.exists():
-        shutil.rmtree(TASK_DATA_DIR)
-    TASK_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    await run_in_threadpool(remove_path, TASK_DATA_DIR)
+    await run_in_threadpool(TASK_DATA_DIR.mkdir, parents=True, exist_ok=True)
     return {"ok": True}
 
 
 @app.post("/api/convert/to-pdf")
 async def convert_to_pdf(file: UploadFile = File(...)):
     """Convert PPT/PPTX/DOC/DOCX to PDF using LibreOffice."""
-    print(f"Received conversion request for: {file.filename}")
+    logger.info("Received conversion request for: %s", file.filename)
 
     if not shutil.which("soffice"):
         raise HTTPException(
@@ -115,16 +212,17 @@ async def convert_to_pdf(file: UploadFile = File(...)):
             detail="LibreOffice (soffice) not found on server. Please install it to support Office conversion.",
         )
 
-    ext = os.path.splitext(file.filename)[1].lower()
+    filename = Path(file.filename or "upload").name
+    ext = os.path.splitext(filename)[1].lower()
     if ext not in [".ppt", ".pptx", ".doc", ".docx"]:
         raise HTTPException(status_code=400, detail="Only .ppt, .pptx, .doc, and .docx files are supported.")
 
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
-            input_path = os.path.join(temp_dir, file.filename)
+            input_path = os.path.join(temp_dir, filename)
 
             with open(input_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
+                await run_in_threadpool(shutil.copyfileobj, file.file, buffer)
 
             cmd = [
                 "soffice",
@@ -136,11 +234,17 @@ async def convert_to_pdf(file: UploadFile = File(...)):
                 input_path,
             ]
 
-            print(f"Running conversion command: {' '.join(cmd)}")
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            logger.info("Running conversion command: %s", " ".join(cmd))
+            result = await run_in_threadpool(
+                subprocess.run,
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
 
             if result.returncode != 0:
-                print(f"Conversion failed: {result.stderr}")
+                logger.warning("Conversion failed: %s", result.stderr)
                 raise HTTPException(status_code=500, detail=f"Conversion failed: {result.stderr}")
 
             pdfs = [f for f in os.listdir(temp_dir) if f.lower().endswith(".pdf")]
@@ -148,10 +252,10 @@ async def convert_to_pdf(file: UploadFile = File(...)):
                 raise HTTPException(status_code=500, detail="PDF file not generated")
 
             pdf_path = os.path.join(temp_dir, pdfs[0])
-            print(f"Conversion successful, sending back: {pdf_path}")
+            logger.info("Conversion successful, sending back: %s", pdf_path)
 
             with open(pdf_path, "rb") as f:
-                pdf_content = f.read()
+                pdf_content = await run_in_threadpool(f.read)
 
             return Response(content=pdf_content, media_type="application/pdf")
 
@@ -160,7 +264,7 @@ async def convert_to_pdf(file: UploadFile = File(...)):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Error during conversion: {str(e)}")
+        logger.exception("Error during conversion")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -284,7 +388,10 @@ def raw_input_to_bytes(raw_input: RawOCRInput) -> bytes:
     if isinstance(raw_input, bytes):
         return raw_input
     normalized = raw_input.split("base64,")[1] if "base64," in raw_input else raw_input
-    return base64.b64decode(normalized)
+    try:
+        return base64.b64decode(normalized, validate=True)
+    except Exception as err:
+        raise HTTPException(status_code=400, detail="Invalid base64 input") from err
 
 
 def build_pipeline_payload(request: OCRRequest, base64_data: str, file_type: int) -> dict:
@@ -322,7 +429,7 @@ def build_pipeline_payload(request: OCRRequest, base64_data: str, file_type: int
 
 def parse_pipeline_response(data: dict, image_prefix: str = "") -> dict:
     if "result" not in data or "layoutParsingResults" not in data["result"]:
-        print(f"Unexpected Format: {data}")
+        logger.warning("Unexpected pipeline response format: %s", data)
         raise HTTPException(status_code=500, detail="Unexpected response format from Pipeline")
 
     results = data["result"]["layoutParsingResults"]
@@ -354,35 +461,35 @@ async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> di
         if isinstance(raw_input, bytes):
             if raw_input.startswith(b"%PDF-"):
                 file_type = 0
-                print("Auto-detected PDF input")
+                logger.info("Auto-detected PDF input")
             else:
                 file_type = 1
-                print("Auto-detected Image input")
+                logger.info("Auto-detected Image input")
         elif base64_data.startswith("JVBERi0"):
             file_type = 0
-            print("Auto-detected PDF input")
+            logger.info("Auto-detected PDF input")
         else:
             file_type = 1
-            print("Auto-detected Image input")
+            logger.info("Auto-detected Image input")
 
     if file_type == 1:
         try:
             img_bytes = raw_input_to_bytes(raw_input)
             img = Image.open(io.BytesIO(img_bytes))
             if img.format == "GIF":
-                print("GIF detected, converting to static JPEG for OCR...")
+                logger.info("GIF detected, converting to static JPEG for OCR")
                 img.seek(0)
                 rgb_img = img.convert("RGB")
                 buffer = io.BytesIO()
                 rgb_img.save(buffer, format="JPEG", quality=95)
                 base64_data = base64.b64encode(buffer.getvalue()).decode("utf-8")
-                print("GIF conversion successful")
+                logger.info("GIF conversion successful")
         except Exception as gif_err:
-            print(f"GIF conversion skipped: {gif_err}")
+            logger.info("GIF conversion skipped: %s", gif_err)
 
     payload = build_pipeline_payload(ocr_request, base64_data, file_type)
 
-    print(f"Sending request to Pipeline Service at {PADDLE_SERVICE_URL}...")
+    logger.info("Sending request to Pipeline Service at %s", PADDLE_SERVICE_URL)
     timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
     async with httpx.AsyncClient(timeout=timeout) as client:
         resp = await client.post(
@@ -392,9 +499,9 @@ async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> di
         )
 
         if resp.status_code != 200:
-            print(f"Service Error (HTTP {resp.status_code}): {resp.text}")
+            logger.warning("Service Error (HTTP %s): %s", resp.status_code, resp.text)
             if resp.status_code == 422:
-                print(f"Validation Error Details: {resp.json()}")
+                logger.warning("Validation Error Details: %s", resp.json())
             raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
 
         return parse_pipeline_response(resp.json())
@@ -406,17 +513,20 @@ async def proxy_ocr(request: Request):
     try:
         ocr_request, raw_image = await parse_ocr_input(request)
         base64_data = normalize_raw_input_to_base64(raw_image)
-        print(f"Received OCR Request. Image size: {len(base64_data)} bytes")
+        if MAX_REQUEST_BYTES > 0 and len(base64_data) > int(MAX_REQUEST_BYTES * 4 / 3) + 1024:
+            max_mb = MAX_REQUEST_BYTES / 1024 / 1024
+            raise HTTPException(status_code=413, detail=f"OCR input is too large. Max upload size is {max_mb:.0f} MB.")
+        logger.info("Received OCR Request. Base64 input size: %s bytes", len(base64_data))
         return await run_ocr_request(ocr_request, raw_image)
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Proxy Error: {e}")
+        logger.exception("Proxy Error")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    print(f"Starting server... Target Pipeline: {PADDLE_SERVICE_URL}")
+    logger.info("Starting server. Target Pipeline: %s", PADDLE_SERVICE_URL)
     uvicorn.run(app, host="0.0.0.0", port=8000)
