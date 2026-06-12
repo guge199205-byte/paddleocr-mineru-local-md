@@ -23,6 +23,7 @@ if [ ! -f "env.txt" ]; then
 API_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
 VLM_BACKEND=vllm
 VLM_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
+PANDOCR_GPU_DEVICE_ID=0
 PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B
 PADDLE_REQUEST_TIMEOUT=3600
 EOF

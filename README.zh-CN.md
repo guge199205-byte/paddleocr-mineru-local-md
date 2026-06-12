@@ -44,6 +44,24 @@ NVIDIA Compose 只保留 3 个服务：
 
 ### 版本一：NVIDIA Docker
 
+Windows + NVIDIA 用户推荐直接使用一键部署脚本：
+
+```powershell
+.\windows-one-click.bat
+```
+
+它会自动检查 Docker、识别 NVIDIA GPU、选择 `env.txt` 或 `env.docker`、拉取官方 PaddleOCR-VL 镜像、构建 `pandocr-web`、清理旧容器、启动服务并等待健康检查。失败时会自动打印 `paddleocr-vlm-server`、`paddleocr-vl-api` 和 `pandocr-web` 的关键日志。
+
+常用一键部署参数：
+
+```powershell
+.\windows-one-click.bat -DryRun
+.\windows-one-click.bat -GpuId 1
+.\windows-one-click.bat -EnvFile env.docker
+```
+
+也可以继续使用手动部署流程：
+
 先根据显卡型号选择环境文件：
 
 | 显卡 | 推荐环境文件 | 镜像标签 |
@@ -231,6 +249,7 @@ PANDOCR_PORT=18000 make mac-up
 ├── requirements-macos.txt
 ├── requirements-macos-mlx.txt
 ├── macos-one-click.command
+├── windows-one-click.bat
 ├── Dockerfile
 ├── docker-compose.yml
 ├── data/                  # 本地任务数据目录，默认不提交
@@ -238,7 +257,8 @@ PANDOCR_PORT=18000 make mac-up
 ├── env.docker
 ├── pipeline_config_vllm.yaml
 ├── pipeline_config_macos_mlx.template.yaml
-├── scripts/               # macOS 本地部署脚本
+├── scripts/               # 部署辅助脚本
+│   ├── windows-one-click.ps1
 ├── static/
 │   ├── index.html
 │   ├── app.js

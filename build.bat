@@ -16,6 +16,7 @@ if not exist "env.txt" (
         echo API_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
         echo VLM_BACKEND=vllm
         echo VLM_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
+        echo PANDOCR_GPU_DEVICE_ID=0
         echo PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B
         echo PADDLE_REQUEST_TIMEOUT=3600
     ) > env.txt

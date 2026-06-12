@@ -39,7 +39,31 @@ make mac-test-mlx
 
 NVIDIA 用户继续使用下面的 Docker 流程。
 
-## 1. 检查环境
+## Windows NVIDIA 一键部署（推荐）
+
+在 Windows + NVIDIA Docker 环境下，推荐直接运行：
+
+```powershell
+.\windows-one-click.bat
+```
+
+脚本会自动检查 Docker、识别 NVIDIA GPU、选择 `env.txt` 或 `env.docker`、拉取官方镜像、构建 `pandocr-web`、清理旧容器、启动服务并等待健康检查。失败时会自动打印 `paddleocr-vlm-server`、`paddleocr-vl-api` 和 `pandocr-web` 的关键日志。
+
+只做预检、不启动服务：
+
+```powershell
+.\windows-one-click.bat -DryRun
+```
+
+多卡机器指定 GPU：
+
+```powershell
+.\windows-one-click.bat -GpuId 1
+```
+
+## 手动 Docker 流程
+
+### 1. 检查环境
 
 ```powershell
 docker --version
@@ -56,7 +80,7 @@ nvidia-smi
 
 下面命令以 RTX 50 系列的 `env.txt` 为例。RTX 30/40 系列用户请把命令里的 `env.txt` 换成 `env.docker`。
 
-## 2. 拉取并构建
+### 2. 拉取并构建
 
 ```powershell
 docker compose --env-file env.txt pull paddleocr-vlm-server paddleocr-vl-api
@@ -65,7 +89,7 @@ docker compose --env-file env.txt build pandocr-web
 
 `pandocr-web` 只构建 Web 服务，不包含 Paddle/PaddleX；PaddleOCR-VL 由官方 `paddleocr-vl-api` 和 `paddleocr-vlm-server` 镜像提供。
 
-## 3. 启动服务
+### 3. 启动服务
 
 ```powershell
 docker compose --env-file env.txt up -d
@@ -73,7 +97,7 @@ docker compose --env-file env.txt up -d
 
 首次启动 VLM 服务会加载模型，可能需要几分钟。
 
-## 4. 验证
+### 4. 验证
 
 ```powershell
 docker compose --env-file env.txt ps
@@ -89,7 +113,7 @@ curl http://localhost:8081/health
 
 `/api/models` 应返回 `PaddleOCR-VL-1.6-0.9B`。
 
-## 5. 使用
+### 5. 使用
 
 打开 http://localhost:8000。
 

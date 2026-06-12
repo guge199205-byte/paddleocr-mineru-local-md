@@ -44,6 +44,24 @@ This project supports two deployment paths. Do not mix them:
 
 ### Option 1: NVIDIA Docker
 
+For Windows NVIDIA users, the recommended path is the one-click script:
+
+```powershell
+.\windows-one-click.bat
+```
+
+It checks Docker, detects the NVIDIA GPU, selects `env.txt` or `env.docker`, pulls the official PaddleOCR-VL images, builds `pandocr-web`, clears old containers, starts the stack, waits for health checks, and prints key logs on failure.
+
+Useful one-click options:
+
+```powershell
+.\windows-one-click.bat -DryRun
+.\windows-one-click.bat -GpuId 1
+.\windows-one-click.bat -EnvFile env.docker
+```
+
+Manual deployment is still available:
+
 Choose the environment file based on your GPU model:
 
 | GPU | Recommended env file | Image tag |
@@ -231,6 +249,7 @@ Complex PDFs, table/formula-heavy pages, large images, and native mode will be n
 |-- requirements-macos.txt
 |-- requirements-macos-mlx.txt
 |-- macos-one-click.command
+|-- windows-one-click.bat
 |-- Dockerfile
 |-- docker-compose.yml
 |-- data/                  # Local task data directory, not committed by default
@@ -238,7 +257,8 @@ Complex PDFs, table/formula-heavy pages, large images, and native mode will be n
 |-- env.docker
 |-- pipeline_config_vllm.yaml
 |-- pipeline_config_macos_mlx.template.yaml
-|-- scripts/               # macOS local deployment scripts
+|-- scripts/               # Deployment helper scripts
+|   |-- windows-one-click.ps1
 |-- static/
 |   |-- index.html
 |   |-- app.js

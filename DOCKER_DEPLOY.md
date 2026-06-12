@@ -44,6 +44,14 @@ latest-nvidia-gpu-offline
 
 ## 启动
 
+Windows + NVIDIA 用户推荐直接运行一键部署脚本：
+
+```powershell
+.\windows-one-click.bat
+```
+
+脚本会自动选择环境文件、清理旧容器、启动服务并等待健康检查。手动部署命令如下：
+
 ```powershell
 docker compose --env-file env.txt pull paddleocr-vlm-server paddleocr-vl-api
 docker compose --env-file env.txt build pandocr-web
