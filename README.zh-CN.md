@@ -1,6 +1,6 @@
 # PaddleOCR Local - PaddleOCR-VL & PP-OCRv6 WebUI
 
-**语言 / Language**: [English](README.md) | 简体中文
+**语言 / Language**: 简体中文 | [English](README.en.md)
 
 PaddleOCR Local 是一个面向 PaddleOCR-VL 和 PP-OCRv6 的轻量 Web 前端。前端负责文件上传、队列、预览、模型切换和下载，后端 FastAPI 做静态文件服务、Office 转 PDF 和请求代理；OCR 推理由独立 PaddleOCR 服务完成，NVIDIA 路线使用官方 Docker 服务，macOS Apple Silicon 路线使用本地 PaddleX/MLX 服务。
 
@@ -27,8 +27,6 @@ NVIDIA Compose 保留 4 个服务：
 - `paddleocr-vlm-server`
 
 单 GPU Docker 部署默认只热加载一个模型。`pandocr-web` 常驻运行，并通过 Docker socket 按需启停模型容器：选择 `PaddleOCR-VL 1.6` 会启动 `paddleocr-vlm-server` + `paddleocr-vl-api` 并停止 `paddleocr-ocr-api`；选择 `PP-OCRv6` 会反向切换。顶部 UI 会实时轮询显示模型就绪、启动中、待启动或失败状态。
-
-项目不再包含 rerank/reranker 服务，也不再在 Web 容器里安装 Paddle/PaddleX。
 
 ## 功能
 

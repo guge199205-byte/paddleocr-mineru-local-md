@@ -1,6 +1,6 @@
 ﻿# 快速开始
 
-完整部署说明统一维护在 `README.zh-CN.md` 的“部署方式”章节；那里分为 NVIDIA Docker 版本和 macOS Apple Silicon 版本。
+完整部署说明统一维护在默认中文 `README.md` 的“部署方式”章节；那里分为 NVIDIA Docker 版本和 macOS Apple Silicon 版本。
 
 ## macOS Apple Silicon
 
@@ -87,7 +87,7 @@ docker compose --env-file env.txt pull paddleocr-vlm-server paddleocr-vl-api
 docker compose --env-file env.txt build paddleocr-ocr-api pandocr-web
 ```
 
-`pandocr-web` 只构建 Web 服务，不包含 Paddle/PaddleX；PaddleOCR-VL 由官方 `paddleocr-vl-api` 和 `paddleocr-vlm-server` 镜像提供，PP-OCRv6 由本地派生镜像 `paddleocr-ocr-api` 提供。
+`pandocr-web` 提供 WebUI、FastAPI 代理和 Office 转 PDF 能力；PaddleOCR-VL 由官方 `paddleocr-vl-api` 和 `paddleocr-vlm-server` 镜像提供，PP-OCRv6 由本地 `paddleocr-ocr-api` 镜像提供。
 
 ### 3. 启动服务
 
