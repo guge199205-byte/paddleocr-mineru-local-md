@@ -215,6 +215,9 @@ function New-RuntimeEnvFile {
     $lines = Ensure-EnvLine -Lines $lines -Key "PANDOCR_MODEL_CONTROL" -Value "docker"
     $lines = Ensure-EnvLine -Lines $lines -Key "PANDOCR_ACTIVE_MODEL_ON_START" -Value "paddleocr-vl-1.6"
     $lines = Ensure-EnvLine -Lines $lines -Key "PANDOCR_MODEL_SWITCH_TIMEOUT" -Value "1200"
+    $lines = Ensure-EnvLine -Lines $lines -Key "PANDOCR_MAX_UPLOAD_MB" -Value "512"
+    $lines = Ensure-EnvLine -Lines $lines -Key "PANDOCR_API_TOKEN" -Value ""
+    $lines = Ensure-EnvLine -Lines $lines -Key "PANDOCR_ENABLE_API_DOCS" -Value "0"
     $script:ActiveModel = Get-EnvLineValue -Lines $lines -Key "PANDOCR_ACTIVE_MODEL_ON_START" -DefaultValue "paddleocr-vl-1.6"
     Set-Content -Path $runtimeEnv -Value $lines -Encoding ASCII
 

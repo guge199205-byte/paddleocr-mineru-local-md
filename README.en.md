@@ -118,9 +118,13 @@ PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
 PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
 PANDOCR_MAX_UPLOAD_MB=512
+PANDOCR_API_TOKEN=
+PANDOCR_ENABLE_API_DOCS=0
 ```
 
 RTX 30/40 series and other non-Blackwell NVIDIA GPUs should use `env.docker`, where both image tags are `latest-nvidia-gpu-offline`.
+
+Leave `PANDOCR_API_TOKEN` empty for local single-user use. If you expose the WebUI through a reverse proxy, LAN, or shared environment, set a long random token. The frontend prompts for the token after an API 401 and stores it in browser local storage. `/docs` and `/redoc` are only enabled when `PANDOCR_ENABLE_API_DOCS=1`; the WebUI OpenAPI JSON is always available at `/api/openapi.json`.
 
 Useful commands:
 
@@ -250,12 +254,13 @@ Complex PDFs, table/formula-heavy pages, large images, and native mode will be n
 - `POST /api/model-runtime/switch`: Starts the selected model containers and stops the inactive model containers when Docker model control is enabled.
 - `GET /api/tasks`: Reads the local persistent task summary list without returning large source files or OCR results.
 - `GET /api/tasks/{task_id}`: Reads the full details of one task.
-- `PUT /api/tasks/{task_id}`: Saves one task to `data/tasks/`.
+- `PUT /api/tasks/{task_id}`: Saves one task to `data/tasks/`; `task.json` stores lightweight metadata, while Markdown, OCR JSON, images, and batch Markdown are split into `result.json`, with summaries in `summary.json`.
 - `DELETE /api/tasks/{task_id}`: Deletes one local task.
-- `DELETE /api/tasks`: Clears local task history.
+- `DELETE /api/tasks`: Clears local task history by deleting only valid task id directories, avoiding files outside the task store.
 - `POST /api/convert/to-pdf`: Converts PPT/PPTX/DOC/DOCX to PDF.
 - `POST /api/paddleocr-vl-1.6`: Proxies OCR requests to the PaddleOCR-VL layout-parsing service.
 - `POST /api/pp-ocrv6`: Proxies OCR requests to the PP-OCRv6 service and returns page images, recognized text lines, boxes, scores, and raw JSON.
+- `GET /api/openapi.json`: OpenAPI JSON for this WebUI backend. `paddle-layout-openapi.json` in the repo documents the upstream Paddle layout-parsing service.
 
 ## Project Structure
 
@@ -284,6 +289,8 @@ Complex PDFs, table/formula-heavy pages, large images, and native mode will be n
 |   |-- style.css
 |   `-- vendor/katex/
 |-- QUICKSTART.md
+|-- webui-openapi.json
+|-- paddle-layout-openapi.json
 |-- DOCKER_DEPLOY.md
 `-- PROJECT_SUMMARY.md
 ```

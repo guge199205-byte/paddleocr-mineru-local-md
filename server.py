@@ -10,6 +10,9 @@ import json
 import re
 import logging
 import time
+import secrets
+from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from typing import List, Optional, Union
@@ -19,8 +22,6 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-
-app = FastAPI()
 
 logger = logging.getLogger("pandocr")
 logging.basicConfig(level=os.getenv("PANDOCR_LOG_LEVEL", "INFO"))
@@ -36,6 +37,7 @@ PADDLEOCR_VL_MODEL_NAME = os.getenv("PADDLEOCR_VL_MODEL_NAME", "PaddleOCR-VL-1.6
 PADDLE_OCR_SERVICE_URL = os.getenv("PADDLE_OCR_SERVICE_URL", "http://localhost:8082/ocr")
 PPOCR_V6_MODEL_NAME = os.getenv("PPOCR_V6_MODEL_NAME", "PP-OCRv6_medium")
 PADDLE_REQUEST_TIMEOUT = float(os.getenv("PADDLE_REQUEST_TIMEOUT", "3600"))
+PROJECT_ROOT = Path(__file__).resolve().parent
 TASK_DATA_DIR = Path(os.getenv("PANDOCR_TASK_DATA_DIR", "data/tasks")).resolve()
 MAX_REQUEST_BYTES = int(float(os.getenv("PANDOCR_MAX_UPLOAD_MB", "512")) * 1024 * 1024)
 PANDOCR_HOST = os.getenv("PANDOCR_HOST", "0.0.0.0")
@@ -44,6 +46,12 @@ MODEL_CONTROL_MODE = os.getenv("PANDOCR_MODEL_CONTROL", "docker").strip().lower(
 MODEL_RUNTIME_STARTUP = os.getenv("PANDOCR_ACTIVE_MODEL_ON_START", "paddleocr-vl-1.6").strip()
 DOCKER_SOCKET_PATH = os.getenv("PANDOCR_DOCKER_SOCKET", "/var/run/docker.sock")
 MODEL_SWITCH_TIMEOUT = float(os.getenv("PANDOCR_MODEL_SWITCH_TIMEOUT", "1200"))
+API_TOKEN = os.getenv("PANDOCR_API_TOKEN", "").strip()
+ENABLE_API_DOCS = os.getenv("PANDOCR_ENABLE_API_DOCS", "0").strip().lower() in {"1", "true", "yes", "on"}
+TASK_STORE_MARKER = ".pandocr-task-store"
+TASK_RESULT_FILE = "result.json"
+TASK_SUMMARY_FILE = "summary.json"
+UPLOAD_CHUNK_SIZE = 1024 * 1024
 CORS_ORIGINS = parse_csv_env(
     "PANDOCR_CORS_ORIGINS",
     "http://localhost:8000,http://127.0.0.1:8000",
@@ -74,6 +82,7 @@ model_runtime_operation = {
     "updatedAt": None,
 }
 model_runtime_task: asyncio.Task | None = None
+ocr_active_count = 0
 
 
 class ModelSwitchRequest(BaseModel):
@@ -291,10 +300,30 @@ def schedule_model_runtime_activation(model_id: str) -> None:
         raise HTTPException(status_code=400, detail="Unknown model id")
     if not model_control_available():
         raise HTTPException(status_code=503, detail="Docker model control is not available")
+    if ocr_active_count > 0:
+        raise HTTPException(status_code=409, detail="OCR is running. Wait for the active task before switching models.")
     if model_runtime_task and not model_runtime_task.done():
         model_runtime_task.cancel()
     set_model_runtime_operation("switching", f"Switching to {model_id}", model_id)
     model_runtime_task = asyncio.create_task(activate_model_runtime(model_id))
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    ensure_task_data_dir()
+    if model_control_available():
+        schedule_model_runtime_activation(DEFAULT_RUNTIME_MODEL_ID)
+    yield
+
+
+app = FastAPI(
+    title="PaddleOCR Local WebUI",
+    version="0.2.0",
+    docs_url="/docs" if ENABLE_API_DOCS else None,
+    redoc_url="/redoc" if ENABLE_API_DOCS else None,
+    openapi_url="/api/openapi.json",
+    lifespan=lifespan,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -307,14 +336,11 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
-@app.on_event("startup")
-async def autostart_default_model_runtime():
-    if model_control_available():
-        schedule_model_runtime_activation(DEFAULT_RUNTIME_MODEL_ID)
-
-
 @app.middleware("http")
-async def reject_oversized_requests(request: Request, call_next):
+async def enforce_request_security(request: Request, call_next):
+    if API_TOKEN and request.url.path.startswith("/api/") and not request_is_authenticated(request):
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
+
     if request.method in {"POST", "PUT", "PATCH"} and MAX_REQUEST_BYTES > 0:
         content_length = request.headers.get("content-length")
         if content_length:
@@ -327,7 +353,25 @@ async def reject_oversized_requests(request: Request, call_next):
                     )
             except ValueError:
                 pass
-    return await call_next(request)
+
+    response = await call_next(request)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self'; "
+        "style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data: blob:; "
+        "font-src 'self' data:; "
+        "connect-src 'self'; "
+        "worker-src 'self' blob:; "
+        "object-src 'none'; "
+        "base-uri 'self'; "
+        "frame-ancestors 'none'",
+    )
+    return response
 
 
 @app.get("/")
@@ -341,6 +385,8 @@ async def get_models():
     return {
         "default": DEFAULT_RUNTIME_MODEL_ID,
         "data": model_catalog(),
+        "maxUploadBytes": MAX_REQUEST_BYTES,
+        "authRequired": bool(API_TOKEN),
     }
 
 
@@ -355,6 +401,37 @@ async def switch_model_runtime(request: ModelSwitchRequest):
     return await build_model_runtime_payload()
 
 
+def request_is_authenticated(request: Request) -> bool:
+    if not API_TOKEN:
+        return True
+    header = request.headers.get("authorization", "")
+    token = ""
+    if header.lower().startswith("bearer "):
+        token = header.split(" ", 1)[1].strip()
+    token = token or request.headers.get("x-pandocr-token", "").strip()
+    return bool(token) and secrets.compare_digest(token, API_TOKEN)
+
+
+def validate_task_data_dir() -> None:
+    task_dir = TASK_DATA_DIR.resolve()
+    forbidden = {
+        Path(task_dir.anchor).resolve(),
+        PROJECT_ROOT.resolve(),
+        PROJECT_ROOT.parent.resolve(),
+        Path.home().resolve(),
+    }
+    if task_dir in forbidden:
+        raise RuntimeError(f"Unsafe PANDOCR_TASK_DATA_DIR: {task_dir}")
+
+
+def ensure_task_data_dir() -> None:
+    validate_task_data_dir()
+    TASK_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    marker = TASK_DATA_DIR / TASK_STORE_MARKER
+    if not marker.exists():
+        marker.write_text("PaddleOCR Local task store\n", encoding="utf-8")
+
+
 def safe_task_id(task_id: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", task_id or ""):
         raise HTTPException(status_code=400, detail="Invalid task id")
@@ -363,6 +440,14 @@ def safe_task_id(task_id: str) -> str:
 
 def task_file_path(task_id: str) -> Path:
     return TASK_DATA_DIR / safe_task_id(task_id) / "task.json"
+
+
+def task_summary_path(task_id: str) -> Path:
+    return task_dir_path(task_id) / TASK_SUMMARY_FILE
+
+
+def task_result_path(task_id: str) -> Path:
+    return task_dir_path(task_id) / TASK_RESULT_FILE
 
 
 def task_dir_path(task_id: str) -> Path:
@@ -377,32 +462,81 @@ def task_source_url(task_id: str) -> str:
     return f"/api/tasks/{safe_task_id(task_id)}/source"
 
 
-def sanitize_task_for_storage(task: dict) -> dict:
-    """Keep task JSON metadata lightweight even if an older client sends heavy fields."""
+def split_task_for_storage(task: dict) -> tuple[dict, dict | None]:
+    """Keep task.json as metadata and move heavy OCR results into result.json."""
     task_id = task.get("id")
     source_url = task.get("sourceUrl")
     has_external_source = bool(source_url) or (isinstance(task_id, str) and task_source_path(task_id).exists())
 
     stored = dict(task)
     stored.pop("detailLoaded", None)
+    preserve_result = bool(stored.pop("_preserveResult", False))
+
+    result_payload = {}
+    for key in ("markdown", "images", "ocrResults"):
+        if key in stored:
+            result_payload[key] = stored.pop(key)
+
     if has_external_source:
         stored["sourceUrl"] = source_url or task_source_url(task_id)
         stored.pop("sourceDataUrl", None)
 
     batches = stored.get("batches") if isinstance(stored.get("batches"), list) else []
     compact_batches = []
+    batch_markdown = {}
     for batch in batches:
         if not isinstance(batch, dict):
             continue
         compact = dict(batch)
         compact.pop("payloadDataUrl", None)
+        compact.pop("payloadBlob", None)
+        if "markdown" in compact:
+            batch_id = compact.get("id")
+            if batch_id:
+                batch_markdown[str(batch_id)] = compact.pop("markdown")
+            else:
+                compact.pop("markdown", None)
         compact_batches.append(compact)
+    if batch_markdown:
+        result_payload["batchMarkdown"] = batch_markdown
+
+    has_result_payload = any(
+        bool(result_payload.get(key))
+        for key in ("markdown", "images", "ocrResults", "batchMarkdown")
+    )
+    if preserve_result and not has_result_payload and isinstance(task_id, str):
+        previous_state = {}
+        previous_path = task_file_path(task_id)
+        if previous_path.exists():
+            try:
+                previous = read_task_file(previous_path)
+                previous_state = previous.get("_resultState") if isinstance(previous.get("_resultState"), dict) else {}
+            except (OSError, ValueError, json.JSONDecodeError):
+                previous_state = {}
+        stored["batches"] = compact_batches
+        stored["_storage"] = {
+            "version": 2,
+            "resultPath": TASK_RESULT_FILE if task_result_path(task_id).exists() else None,
+        }
+        stored["_resultState"] = previous_state
+        return stored, None
+
     stored["batches"] = compact_batches
-    return stored
+    stored["_storage"] = {
+        "version": 2,
+        "resultPath": TASK_RESULT_FILE if has_result_payload else None,
+    }
+    stored["_resultState"] = {
+        "hasMarkdown": bool(result_payload.get("markdown") or result_payload.get("batchMarkdown")),
+        "hasImages": bool(result_payload.get("images")),
+        "hasOcrResults": bool(result_payload.get("ocrResults")),
+    }
+    return stored, result_payload
 
 
 def task_summary(task: dict) -> dict:
     batches = task.get("batches") if isinstance(task.get("batches"), list) else []
+    result_state = task.get("_resultState") if isinstance(task.get("_resultState"), dict) else {}
     completed_pages = sum(
         int(batch.get("pageCount") or 0)
         for batch in batches
@@ -426,43 +560,183 @@ def task_summary(task: dict) -> dict:
         "error": task.get("error"),
         "completedPages": completed_pages,
         "batchCount": len(batches),
-        "hasMarkdown": bool(task.get("markdown")),
-        "hasOcrResults": bool(task.get("ocrResults")),
+        "hasMarkdown": bool(result_state.get("hasMarkdown") or task.get("markdown")),
+        "hasOcrResults": bool(result_state.get("hasOcrResults") or task.get("ocrResults")),
         "detailLoaded": False,
     }
 
 
-def read_task_file(path: Path) -> dict:
+def read_json_file(path: Path) -> dict:
     with path.open("r", encoding="utf-8") as f:
-        task = json.load(f)
-    if not isinstance(task, dict):
-        raise ValueError("Task file must contain a JSON object")
-    return task
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError(f"{path.name} must contain a JSON object")
+    return payload
 
 
-def write_task_file(path: Path, task: dict) -> None:
+def read_task_file(path: Path) -> dict:
+    return read_json_file(path)
+
+
+def write_json_file(path: Path, payload: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp_path = path.with_suffix(".json.tmp")
+    temp_path = path.with_suffix(path.suffix + ".tmp")
     with temp_path.open("w", encoding="utf-8") as f:
-        json.dump(task, f, ensure_ascii=False)
+        json.dump(payload, f, ensure_ascii=False)
     temp_path.replace(path)
 
 
+def write_task_bundle(task_id: str, task: dict) -> dict:
+    ensure_task_data_dir()
+    stored_task, result_payload = split_task_for_storage(task)
+    task_dir = task_dir_path(task_id)
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    result_path = task_result_path(task_id)
+    if result_payload is None:
+        pass
+    elif stored_task.get("_storage", {}).get("resultPath"):
+        write_json_file(result_path, result_payload)
+    elif result_path.exists():
+        result_path.unlink()
+
+    write_json_file(task_file_path(task_id), stored_task)
+    summary = task_summary(stored_task)
+    write_json_file(task_summary_path(task_id), summary)
+    return stored_task
+
+
+def hydrate_task_detail(task_id: str, task: dict) -> dict:
+    storage = task.get("_storage") if isinstance(task.get("_storage"), dict) else {}
+    result_name = storage.get("resultPath") or TASK_RESULT_FILE
+    result_path = task_dir_path(task_id) / result_name
+    if result_path.exists():
+        try:
+            result_payload = read_json_file(result_path)
+            for key in ("markdown", "images", "ocrResults"):
+                if key in result_payload:
+                    task[key] = result_payload[key]
+            batch_markdown = result_payload.get("batchMarkdown")
+            if isinstance(batch_markdown, dict) and isinstance(task.get("batches"), list):
+                for batch in task["batches"]:
+                    if isinstance(batch, dict) and batch.get("id") in batch_markdown:
+                        batch["markdown"] = batch_markdown[batch["id"]]
+        except (OSError, ValueError, json.JSONDecodeError) as err:
+            logger.warning("Failed to hydrate task result %s: %s", result_path, err)
+
+    task.setdefault("markdown", "")
+    task.setdefault("images", {})
+    task.setdefault("ocrResults", [])
+    return task
+
+
+def task_needs_compaction(task: dict) -> bool:
+    if any(key in task for key in ("markdown", "images", "ocrResults", "detailLoaded")):
+        return True
+    batches = task.get("batches") if isinstance(task.get("batches"), list) else []
+    return any(
+        isinstance(batch, dict) and any(key in batch for key in ("markdown", "payloadDataUrl", "payloadBlob"))
+        for batch in batches
+    )
+
+
+def task_sort_timestamp(task: dict) -> float:
+    value = task.get("updatedAt") or task.get("createdAt")
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return 0
+        try:
+            return float(text)
+        except ValueError:
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return 0
+    return 0
+
+
 def list_task_summaries() -> list[dict]:
-    TASK_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_task_data_dir()
     tasks = []
     for path in TASK_DATA_DIR.glob("*/task.json"):
         try:
-            tasks.append(task_summary(read_task_file(path)))
+            summary_path = path.parent / TASK_SUMMARY_FILE
+            if summary_path.exists():
+                tasks.append(read_json_file(summary_path))
+                continue
+
+            task = read_task_file(path)
+            if task.get("id") == path.parent.name and task_needs_compaction(task):
+                task = write_task_bundle(path.parent.name, task)
+            summary = task_summary(task)
+            write_json_file(summary_path, summary)
+            tasks.append(summary)
         except (OSError, ValueError, json.JSONDecodeError) as err:
             logger.warning("Skipping invalid task file %s: %s", path, err)
-    tasks.sort(key=lambda item: item.get("updatedAt") or 0, reverse=True)
+    tasks.sort(key=task_sort_timestamp, reverse=True)
     return tasks
 
 
-def remove_path(path: Path) -> None:
+def remove_task_dir(task_id: str) -> None:
+    ensure_task_data_dir()
+    path = task_dir_path(task_id).resolve()
+    if path.parent != TASK_DATA_DIR:
+        raise HTTPException(status_code=400, detail="Invalid task path")
     if path.exists():
         shutil.rmtree(path)
+
+
+def clear_task_dirs() -> None:
+    ensure_task_data_dir()
+    for path in TASK_DATA_DIR.iterdir():
+        if path.is_dir() and re.fullmatch(r"[A-Za-z0-9_-]{6,80}", path.name):
+            shutil.rmtree(path)
+
+
+async def read_upload_bytes(file: UploadFile, max_bytes: int | None = None) -> bytes:
+    chunks = []
+    total = 0
+    limit = max_bytes if max_bytes and max_bytes > 0 else None
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_SIZE)
+        if not chunk:
+            break
+        total += len(chunk)
+        if limit and total > limit:
+            raise HTTPException(
+                status_code=413,
+                detail=f"Uploaded file is too large. Max upload size is {limit / 1024 / 1024:.0f} MB.",
+            )
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+async def write_upload_to_path(file: UploadFile, path: Path, max_bytes: int | None = None) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    limit = max_bytes if max_bytes and max_bytes > 0 else None
+    try:
+        with path.open("wb") as buffer:
+            while True:
+                chunk = await file.read(UPLOAD_CHUNK_SIZE)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if limit and total > limit:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"Uploaded file is too large. Max upload size is {limit / 1024 / 1024:.0f} MB.",
+                    )
+                buffer.write(chunk)
+    except Exception:
+        if path.exists():
+            path.unlink()
+        raise
+    return total
 
 
 def extract_pdf_pages(source_path: Path, start_page: int, end_page: int) -> bytes:
@@ -489,15 +763,13 @@ def extract_pdf_pages(source_path: Path, start_page: int, end_page: int) -> byte
 async def upload_task_source(task_id: str, file: UploadFile = File(...)):
     """Persist the original uploaded source outside task.json."""
     source_path = task_source_path(task_id)
-    source_path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = source_path.with_suffix(".tmp")
-    with temp_path.open("wb") as buffer:
-        await run_in_threadpool(shutil.copyfileobj, file.file, buffer)
+    size = await write_upload_to_path(file, temp_path, MAX_REQUEST_BYTES)
     temp_path.replace(source_path)
     return {
         "ok": True,
         "url": task_source_url(task_id),
-        "size": source_path.stat().st_size,
+        "size": size,
         "filename": Path(file.filename or "source").name,
         "contentType": file.content_type or "application/octet-stream",
     }
@@ -568,6 +840,7 @@ async def get_task(task_id: str):
         raise HTTPException(status_code=500, detail="Failed to read task")
     if task_source_path(task_id).exists() and not task.get("sourceUrl"):
         task["sourceUrl"] = task_source_url(task_id)
+    task = hydrate_task_detail(task_id, task)
     task["detailLoaded"] = True
     return task
 
@@ -581,25 +854,21 @@ async def save_task(task_id: str, request: Request):
     if task.get("id") != task_id:
         raise HTTPException(status_code=400, detail="Task id mismatch")
 
-    stored_task = sanitize_task_for_storage(task)
-    path = task_file_path(task_id)
-    await run_in_threadpool(write_task_file, path, stored_task)
+    stored_task = await run_in_threadpool(write_task_bundle, task_id, task)
     return {"ok": True, "task": task_summary(stored_task)}
 
 
 @app.delete("/api/tasks/{task_id}")
 async def delete_task(task_id: str):
     """Delete one locally persisted task."""
-    path = task_file_path(task_id)
-    await run_in_threadpool(remove_path, path.parent)
+    await run_in_threadpool(remove_task_dir, task_id)
     return {"ok": True}
 
 
 @app.delete("/api/tasks")
 async def clear_tasks():
     """Delete all locally persisted tasks."""
-    await run_in_threadpool(remove_path, TASK_DATA_DIR)
-    await run_in_threadpool(TASK_DATA_DIR.mkdir, parents=True, exist_ok=True)
+    await run_in_threadpool(clear_task_dirs)
     return {"ok": True}
 
 
@@ -622,9 +891,7 @@ async def convert_to_pdf(file: UploadFile = File(...)):
     try:
         with tempfile.TemporaryDirectory() as temp_dir:
             input_path = os.path.join(temp_dir, filename)
-
-            with open(input_path, "wb") as buffer:
-                await run_in_threadpool(shutil.copyfileobj, file.file, buffer)
+            await write_upload_to_path(file, Path(input_path), MAX_REQUEST_BYTES)
 
             cmd = [
                 "soffice",
@@ -748,7 +1015,7 @@ async def parse_ocr_input(request: Request) -> tuple[OCRRequest, RawOCRInput]:
         if not upload or not hasattr(upload, "read"):
             raise HTTPException(status_code=400, detail="Missing multipart field: file")
 
-        file_bytes = await upload.read()
+        file_bytes = await read_upload_bytes(upload, MAX_REQUEST_BYTES)
         ocr_request = OCRRequest(
             fileType=parse_optional_int(form.get("fileType")),
             useLayoutDetection=parse_bool(form.get("useLayoutDetection"), True),
@@ -773,7 +1040,14 @@ async def parse_ocr_input(request: Request) -> tuple[OCRRequest, RawOCRInput]:
         )
         return ocr_request, file_bytes
 
-    payload = await request.json()
+    body = await request.body()
+    if MAX_REQUEST_BYTES > 0 and len(body) > MAX_REQUEST_BYTES:
+        max_mb = MAX_REQUEST_BYTES / 1024 / 1024
+        raise HTTPException(status_code=413, detail=f"Request body is too large. Max upload size is {max_mb:.0f} MB.")
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError as err:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload") from err
     ocr_request = OCRRequest(**payload)
     if not ocr_request.image:
         raise HTTPException(status_code=400, detail="Missing JSON field: image")
@@ -989,56 +1263,67 @@ def parse_ppocr_response(data: dict) -> dict:
 
 
 async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
-    runtime = await model_runtime_status("paddleocr-vl-1.6")
-    if not runtime["ready"]:
-        raise HTTPException(status_code=503, detail="PaddleOCR-VL service is not ready. Switch to this model and wait for it to become ready.")
+    global ocr_active_count
+    async with model_runtime_lock:
+        ocr_active_count += 1
+        try:
+            runtime = await model_runtime_status("paddleocr-vl-1.6")
+            if not runtime["ready"]:
+                raise HTTPException(status_code=503, detail="PaddleOCR-VL service is not ready. Switch to this model and wait for it to become ready.")
 
-    base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+            base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+            payload = build_pipeline_payload(ocr_request, base64_data, file_type)
 
-    payload = build_pipeline_payload(ocr_request, base64_data, file_type)
+            logger.info("Sending request to Pipeline Service at %s", PADDLE_SERVICE_URL)
+            timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    PADDLE_SERVICE_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
 
-    logger.info("Sending request to Pipeline Service at %s", PADDLE_SERVICE_URL)
-    timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            PADDLE_SERVICE_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
+                if resp.status_code != 200:
+                    logger.warning("Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                    if resp.status_code == 422:
+                        logger.warning("Validation Error Details: %s", resp.json())
+                    raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
 
-        if resp.status_code != 200:
-            logger.warning("Service Error (HTTP %s): %s", resp.status_code, resp.text)
-            if resp.status_code == 422:
-                logger.warning("Validation Error Details: %s", resp.json())
-            raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
-
-        return parse_pipeline_response(resp.json())
+                return parse_pipeline_response(resp.json())
+        finally:
+            ocr_active_count = max(0, ocr_active_count - 1)
 
 
 async def run_ppocrv6_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
-    runtime = await model_runtime_status("pp-ocrv6")
-    if not runtime["ready"]:
-        raise HTTPException(status_code=503, detail="PP-OCRv6 service is not ready. Switch to this model and wait for it to become ready.")
+    global ocr_active_count
+    async with model_runtime_lock:
+        ocr_active_count += 1
+        try:
+            runtime = await model_runtime_status("pp-ocrv6")
+            if not runtime["ready"]:
+                raise HTTPException(status_code=503, detail="PP-OCRv6 service is not ready. Switch to this model and wait for it to become ready.")
 
-    base64_data, file_type = prepare_service_input(ocr_request, raw_input)
-    payload = build_ppocr_payload(ocr_request, base64_data, file_type)
+            base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+            payload = build_ppocr_payload(ocr_request, base64_data, file_type)
 
-    logger.info("Sending request to PP-OCR service at %s", PADDLE_OCR_SERVICE_URL)
-    timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        resp = await client.post(
-            PADDLE_OCR_SERVICE_URL,
-            json=payload,
-            headers={"Content-Type": "application/json"},
-        )
+            logger.info("Sending request to PP-OCR service at %s", PADDLE_OCR_SERVICE_URL)
+            timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    PADDLE_OCR_SERVICE_URL,
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                )
 
-        if resp.status_code != 200:
-            logger.warning("PP-OCR Service Error (HTTP %s): %s", resp.status_code, resp.text)
-            if resp.status_code == 422:
-                logger.warning("PP-OCR Validation Error Details: %s", resp.json())
-            raise HTTPException(status_code=resp.status_code, detail=f"Upstream PP-OCR error: {resp.text}")
+                if resp.status_code != 200:
+                    logger.warning("PP-OCR Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                    if resp.status_code == 422:
+                        logger.warning("PP-OCR Validation Error Details: %s", resp.json())
+                    raise HTTPException(status_code=resp.status_code, detail=f"Upstream PP-OCR error: {resp.text}")
 
-        return parse_ppocr_response(resp.json())
+                return parse_ppocr_response(resp.json())
+        finally:
+            ocr_active_count = max(0, ocr_active_count - 1)
 
 
 def validate_proxy_input_size(raw_input: RawOCRInput) -> int:

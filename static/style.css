@@ -118,6 +118,12 @@ svg {
     font: inherit;
 }
 
+.model-select-wrap select:disabled {
+    color: var(--faint);
+    background: var(--panel-soft);
+    cursor: not-allowed;
+}
+
 .model-pill {
     min-width: 220px;
     display: flex;

@@ -118,9 +118,13 @@ PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
 PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
 PANDOCR_MAX_UPLOAD_MB=512
+PANDOCR_API_TOKEN=
+PANDOCR_ENABLE_API_DOCS=0
 ```
 
 RTX 30/40 系列等非 Blackwell NVIDIA GPU 使用 `env.docker`，其中两个镜像标签都是 `latest-nvidia-gpu-offline`。
+
+`PANDOCR_API_TOKEN` 为空时保持本机即开即用；如果要把 WebUI 暴露给反向代理、局域网或多人环境，请设置一个长随机 token。前端会在 API 返回 401 时提示输入，并保存在浏览器本地。`PANDOCR_ENABLE_API_DOCS=1` 时才启用 `/docs` 和 `/redoc`，OpenAPI JSON 固定在 `/api/openapi.json`。
 
 常用命令：
 
@@ -250,12 +254,13 @@ PANDOCR_PORT=18000 make mac-up
 - `POST /api/model-runtime/switch`：Docker 模式下启动目标模型容器并停止非活跃模型容器。
 - `GET /api/tasks`：读取本机持久化任务摘要列表，不返回大体积源文件和 OCR 结果。
 - `GET /api/tasks/{task_id}`：读取一个任务的完整详情。
-- `PUT /api/tasks/{task_id}`：保存一个任务到 `data/tasks/`。
+- `PUT /api/tasks/{task_id}`：保存一个任务到 `data/tasks/`；`task.json` 只保存轻量元数据，Markdown、OCR JSON、图片和 batch Markdown 拆到 `result.json`，摘要拆到 `summary.json`。
 - `DELETE /api/tasks/{task_id}`：删除一个本地任务。
-- `DELETE /api/tasks`：清空本地任务历史。
+- `DELETE /api/tasks`：清空本地任务历史，只删除合法 task id 子目录，避免误删任务目录外文件。
 - `POST /api/convert/to-pdf`：将 PPT/PPTX/DOC/DOCX 转为 PDF。
 - `POST /api/paddleocr-vl-1.6`：代理 OCR 请求到 PaddleOCR-VL layout-parsing 服务。
 - `POST /api/pp-ocrv6`：代理 OCR 请求到 PP-OCRv6 服务，返回页面图片、识别文字行、坐标框、置信度和原始 JSON。
+- `GET /api/openapi.json`：当前 WebUI 后端的 OpenAPI JSON；仓库里的 `paddle-layout-openapi.json` 是上游 Paddle layout-parsing 服务接口。
 
 ## 项目结构
 
@@ -284,6 +289,8 @@ PANDOCR_PORT=18000 make mac-up
 │   ├── style.css
 │   └── vendor/katex/
 ├── QUICKSTART.md
+├── webui-openapi.json
+├── paddle-layout-openapi.json
 ├── DOCKER_DEPLOY.md
 └── PROJECT_SUMMARY.md
 ```

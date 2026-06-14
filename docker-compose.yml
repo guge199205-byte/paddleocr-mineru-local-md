@@ -120,11 +120,15 @@ services:
       - PANDOCR_TASK_DATA_DIR=/app/data/tasks
       - PANDOCR_CORS_ORIGINS=${PANDOCR_CORS_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
       - PANDOCR_MAX_UPLOAD_MB=${PANDOCR_MAX_UPLOAD_MB:-512}
+      - PANDOCR_API_TOKEN=${PANDOCR_API_TOKEN:-}
+      - PANDOCR_ENABLE_API_DOCS=${PANDOCR_ENABLE_API_DOCS:-0}
     volumes:
       - ./static:/app/static
       - ./server.py:/app/server.py
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8000/ || exit 1"]
       interval: 30s

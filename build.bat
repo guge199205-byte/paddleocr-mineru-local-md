@@ -23,6 +23,10 @@ if not exist "env.txt" (
         echo PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
         echo PANDOCR_MODEL_SWITCH_TIMEOUT=1200
         echo PADDLE_REQUEST_TIMEOUT=3600
+        echo PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+        echo PANDOCR_MAX_UPLOAD_MB=512
+        echo PANDOCR_API_TOKEN=
+        echo PANDOCR_ENABLE_API_DOCS=0
     ) > env.txt
 )
 

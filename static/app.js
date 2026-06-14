@@ -3,11 +3,13 @@ const DEFAULT_PDF_BATCH_SIZE = 1;
 const MAX_PDF_BATCH_SIZE = 400;
 const PDF_BATCH_SIZE_STORAGE_KEY = 'pandocr.pdfBatchSize';
 const MODEL_STORAGE_KEY = 'pandocr.selectedModelId';
+const API_TOKEN_STORAGE_KEY = 'pandocr.apiToken';
 const DEFAULT_MODEL_ID = 'paddleocr-vl-1.6';
 const DEFAULT_PDF_ZOOM = 1;
 const PDF_DEFAULT_PAGE_WIDTH = 595;
 const PDF_FIT_WIDTH_GUTTER = 12;
 const MAX_DEFAULT_PDF_ZOOM = 1.3;
+const DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
 
 let availableModels = [{
     id: DEFAULT_MODEL_ID,
@@ -41,6 +43,7 @@ let modelRuntime = null;
 let modelRuntimePollTimer = null;
 let modelRuntimeLoadInFlight = false;
 let modelSwitchInFlight = false;
+let maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES;
 const sourcePdfCache = new Map();
 const sourceBytesCache = new Map();
 const JSON_LINE_HEIGHT = 21;
@@ -173,12 +176,63 @@ function setupEventListeners() {
     });
 }
 
+function isLocalApiUrl(url) {
+    const text = String(url || '');
+    if (text.startsWith(API_BASE) || text.startsWith('/api/')) return true;
+    try {
+        const parsed = new URL(text, window.location.href);
+        return parsed.origin === window.location.origin && parsed.pathname.startsWith('/api/');
+    } catch (error) {
+        return false;
+    }
+}
+
+function authHeaders(headers = {}, url = '') {
+    const merged = new Headers(headers);
+    if (isLocalApiUrl(url)) {
+        const token = localStorage.getItem(API_TOKEN_STORAGE_KEY);
+        if (token) merged.set('Authorization', `Bearer ${token}`);
+    }
+    return merged;
+}
+
+async function apiFetch(url, options = {}) {
+    const requestOptions = {
+        ...options,
+        headers: authHeaders(options.headers, url)
+    };
+    let response = await fetch(url, requestOptions);
+    if (response.status !== 401 || !isLocalApiUrl(url)) return response;
+
+    const token = window.prompt('请输入 PaddleOCR Local API Token');
+    if (!token) return response;
+    localStorage.setItem(API_TOKEN_STORAGE_KEY, token.trim());
+    response = await fetch(url, {
+        ...options,
+        headers: authHeaders(options.headers, url)
+    });
+    return response;
+}
+
+async function responseErrorText(response) {
+    const text = await response.text();
+    try {
+        const data = JSON.parse(text);
+        return data.detail || text;
+    } catch (error) {
+        return text;
+    }
+}
+
 async function checkBackendConnection() {
     try {
-        const response = await fetch(`${API_BASE}/models`);
+        const response = await apiFetch(`${API_BASE}/models`);
         if (!response.ok) throw new Error('API Error');
         const data = await response.json();
         availableModels = normalizeModelList(data);
+        if (Number.isFinite(Number(data.maxUploadBytes)) && Number(data.maxUploadBytes) > 0) {
+            maxUploadBytes = Number(data.maxUploadBytes);
+        }
         if (!availableModels.some((model) => model.id === selectedModelId)) {
             selectedModelId = data.default || availableModels[0]?.id || DEFAULT_MODEL_ID;
         }
@@ -189,7 +243,6 @@ async function checkBackendConnection() {
         updateActiveModelDisplay(getActiveTask());
     } catch (error) {
         els.statusDot.className = 'dot error';
-        els.statusText.textContent = '模型未连接';
         els.statusText.textContent = '模型未连接';
         setTimeout(checkBackendConnection, 5000);
     }
@@ -208,9 +261,10 @@ async function loadModelRuntime({ silent = false } = {}) {
     if (modelRuntimeLoadInFlight) return modelRuntime;
     modelRuntimeLoadInFlight = true;
     try {
-        const response = await fetch(`${API_BASE}/model-runtime`, { cache: 'no-store' });
+        const response = await apiFetch(`${API_BASE}/model-runtime`, { cache: 'no-store' });
         if (!response.ok) throw new Error(await response.text());
         modelRuntime = await response.json();
+        syncSelectedModelWithRuntime();
         updateActiveModelDisplay(getActiveTask());
         updateActionState(getActiveTask());
         return modelRuntime;
@@ -258,13 +312,48 @@ function renderModelSelect() {
     });
 }
 
+function syncSelectedModelWithRuntime() {
+    if (!modelRuntime || !availableModels.length || modelSwitchInFlight) return false;
+    const knownModelIds = new Set(availableModels.map((model) => model.id));
+    const operation = modelRuntime.operation;
+    let runtimeModelId = null;
+
+    if (operation?.state === 'switching' && knownModelIds.has(operation.targetModelId)) {
+        runtimeModelId = operation.targetModelId;
+    } else if (knownModelIds.has(modelRuntime.activeModelId)) {
+        const activeStatus = getModelRuntimeStatus(modelRuntime.activeModelId);
+        if (activeStatus?.running || activeStatus?.ready) {
+            runtimeModelId = modelRuntime.activeModelId;
+        }
+    }
+
+    if (!runtimeModelId || runtimeModelId === selectedModelId) return false;
+    selectedModelId = runtimeModelId;
+    localStorage.setItem(MODEL_STORAGE_KEY, selectedModelId);
+    renderModelSelect();
+    return true;
+}
+
 async function handleModelSelectionChange() {
-    selectedModelId = els.modelSelect.value || DEFAULT_MODEL_ID;
+    const nextModelId = els.modelSelect.value || DEFAULT_MODEL_ID;
+    if (isProcessing || modelSwitchInFlight) {
+        els.modelSelect.value = selectedModelId;
+        alert('当前正在解析或切换模型，请完成后再切换。');
+        return;
+    }
+    const previousModelId = selectedModelId;
+    selectedModelId = nextModelId;
     localStorage.setItem(MODEL_STORAGE_KEY, selectedModelId);
     updateActiveModelDisplay(getActiveTask());
     updateActionState(getActiveTask());
-    await loadModelRuntime({ silent: true });
-    await switchModelRuntime(selectedModelId, { wait: false });
+    const switched = await switchModelRuntime(nextModelId, { wait: false });
+    if (!switched) {
+        selectedModelId = previousModelId;
+        localStorage.setItem(MODEL_STORAGE_KEY, selectedModelId);
+        renderModelSelect();
+        updateActiveModelDisplay(getActiveTask());
+        updateActionState(getActiveTask());
+    }
 }
 
 function getSelectedModel() {
@@ -379,13 +468,14 @@ async function switchModelRuntime(modelId, { wait = false } = {}) {
     updateActiveModelDisplay(getActiveTask());
     updateActionState(getActiveTask());
     try {
-        const response = await fetch(`${API_BASE}/model-runtime/switch`, {
+        const response = await apiFetch(`${API_BASE}/model-runtime/switch`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ modelId })
         });
-        if (!response.ok) throw new Error(await response.text());
+        if (!response.ok) throw new Error(await responseErrorText(response));
         modelRuntime = await response.json();
+        syncSelectedModelWithRuntime();
         updateActiveModelDisplay(getActiveTask());
         updateActionState(getActiveTask());
         if (wait) return await waitForModelRuntimeReady(modelId);
@@ -441,18 +531,18 @@ function applySelectedModelToTask(task) {
     return model;
 }
 
-async function saveTask(task) {
-    await saveTaskToServer(task);
+async function saveTask(task, { includeResults = true } = {}) {
+    await saveTaskToServer(task, { includeResults });
 }
 
-async function saveTaskToServer(task) {
-    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(task.id)}`, {
+async function saveTaskToServer(task, { includeResults = true } = {}) {
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(task.id)}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(taskForPersistence(task))
+        body: JSON.stringify(taskForPersistence(task, { includeResults }))
     });
     if (!response.ok) {
-        throw new Error(`保存本地任务失败：${await response.text()}`);
+        throw new Error(`保存本地任务失败：${await responseErrorText(response)}`);
     }
 }
 
@@ -510,7 +600,7 @@ function dedupeTasks(taskItems) {
 
 async function loadServerTasks() {
     try {
-        const response = await fetch(`${API_BASE}/tasks`);
+        const response = await apiFetch(`${API_BASE}/tasks`);
         if (!response.ok) throw new Error(await response.text());
         const data = await response.json();
         return data.tasks || [];
@@ -521,9 +611,9 @@ async function loadServerTasks() {
 }
 
 async function loadTaskFromServer(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
     if (!response.ok) {
-        throw new Error(`读取本地任务失败：${await response.text()}`);
+        throw new Error(`读取本地任务失败：${await responseErrorText(response)}`);
     }
     return reconcileTaskStatus(await response.json());
 }
@@ -559,16 +649,16 @@ async function ensureTaskLoaded(taskId) {
 }
 
 async function deleteAllTasks() {
-    const response = await fetch(`${API_BASE}/tasks`, { method: 'DELETE' });
+    const response = await apiFetch(`${API_BASE}/tasks`, { method: 'DELETE' });
     if (!response.ok) {
-        throw new Error(`清空本地任务失败：${await response.text()}`);
+        throw new Error(`清空本地任务失败：${await responseErrorText(response)}`);
     }
 }
 
 async function deleteTaskById(taskId) {
-    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
     if (!response.ok) {
-        throw new Error(`删除本地任务失败：${await response.text()}`);
+        throw new Error(`删除本地任务失败：${await responseErrorText(response)}`);
     }
 }
 
@@ -586,6 +676,10 @@ async function handleFiles(files) {
 
     if (failed.length > 0) {
         console.warn('Some files could not be added', failed.map((result) => result.reason));
+        const message = failed
+            .map((result) => result.reason?.message || String(result.reason || '文件读取失败'))
+            .join('\n');
+        els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(message)}</div>`;
     }
     if (newTasks.length === 0) {
         if (previousActiveTaskId && tasks.some((task) => task.id === previousActiveTaskId)) {
@@ -641,7 +735,15 @@ function showIncomingFileState(fileList) {
     els.jsonView.textContent = '';
 }
 
+function assertUploadWithinLimit(fileOrBlob, filename = '') {
+    const size = Number(fileOrBlob?.size || 0);
+    if (!maxUploadBytes || !size || size <= maxUploadBytes) return;
+    const name = filename || fileOrBlob.name || '文件';
+    throw new Error(`${name} 超过上传上限 ${formatSize(maxUploadBytes)}，请压缩或拆分后再试。`);
+}
+
 async function createTaskFromFile(file) {
+    assertUploadWithinLimit(file);
     const ext = getExtension(file.name);
     const officeExts = ['ppt', 'pptx', 'doc', 'docx'];
     const imageExts = ['png', 'jpg', 'jpeg', 'bmp', 'webp', 'tiff', 'tif', 'gif'];
@@ -735,31 +837,33 @@ async function createPdfTask(fileOrBlob, name, extra = {}) {
 }
 
 async function uploadTaskSource(taskId, fileOrBlob, filename, mimeType) {
+    assertUploadWithinLimit(fileOrBlob, filename);
     const formData = new FormData();
     const source = fileOrBlob instanceof File
         ? fileOrBlob
         : new File([fileOrBlob], filename, { type: mimeType || fileOrBlob.type || 'application/octet-stream' });
     formData.append('file', source, filename);
-    const response = await fetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/source`, {
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/source`, {
         method: 'POST',
         body: formData
     });
     if (!response.ok) {
-        throw new Error(`保存源文件失败：${await response.text()}`);
+        throw new Error(`保存源文件失败：${await responseErrorText(response)}`);
     }
     const data = await response.json();
     return data.url;
 }
 
 async function convertOfficeToPdf(file) {
+    assertUploadWithinLimit(file);
     const formData = new FormData();
     formData.append('file', file);
-    const response = await fetch(`${API_BASE}/convert/to-pdf`, {
+    const response = await apiFetch(`${API_BASE}/convert/to-pdf`, {
         method: 'POST',
         body: formData
     });
     if (!response.ok) {
-        const detail = await response.text();
+        const detail = await responseErrorText(response);
         throw new Error(`Office 转 PDF 失败：${detail}`);
     }
     return { blob: await response.blob() };
@@ -1971,7 +2075,7 @@ async function processTask(task, { confirmCompleted = true } = {}) {
             if (batch.status === 'completed') continue;
             batch.status = 'processing';
             task.updatedAt = Date.now();
-            await saveTask(task);
+            await saveTask(task, { includeResults: false });
             refreshTaskUi(task);
 
             let result;
@@ -2001,7 +2105,7 @@ async function processTask(task, { confirmCompleted = true } = {}) {
     } finally {
         isProcessing = false;
         task.updatedAt = Date.now();
-        await saveTask(task);
+        await saveTask(task, { includeResults: false });
         refreshTaskUi(task);
     }
 }
@@ -2123,12 +2227,12 @@ async function callOCR(batch, task) {
     formData.append('markdownIgnoreLabels', JSON.stringify(ignoreLabels));
     formData.append('modelId', model.id);
 
-    const response = await fetch(modelApiUrl(model), {
+    const response = await apiFetch(modelApiUrl(model), {
         method: 'POST',
         body: formData
     });
     if (!response.ok) {
-        throw new Error(await response.text());
+        throw new Error(await responseErrorText(response));
     }
     const text = await response.text();
     if (!text.trim()) {
@@ -2166,17 +2270,26 @@ function createPdfBatchDescriptors(pageCount, pdfBatchSize, sourceDataUrl = '') 
     return batches;
 }
 
-function taskForPersistence(task) {
+function taskForPersistence(task, { includeResults = true } = {}) {
     const persisted = { ...task };
     delete persisted.detailLoaded;
+    delete persisted._storage;
+    delete persisted._resultState;
     if (persisted.sourceUrl) {
         delete persisted.sourceDataUrl;
+    }
+    if (!includeResults) {
+        delete persisted.markdown;
+        delete persisted.images;
+        delete persisted.ocrResults;
+        persisted._preserveResult = true;
     }
     persisted.batches = Array.isArray(task.batches)
         ? task.batches.map((batch) => {
             const copy = { ...batch };
             delete copy.payloadBlob;
             delete copy.payloadDataUrl;
+            if (!includeResults) delete copy.markdown;
             return copy;
         })
         : [];
@@ -2189,6 +2302,9 @@ function updateActionState(task) {
     const modelReady = !task || isModelRuntimeReady(taskModel.id);
     const canStartAfterSwitch = task && !modelReady && canSwitchModelRuntime(taskModel.id);
     const modelStarting = task && !modelReady && isModelRuntimeSwitching(taskModel.id);
+    if (els.modelSelect) {
+        els.modelSelect.disabled = isProcessing || modelSwitchInFlight || isModelRuntimeSwitching();
+    }
     els.startBtn.disabled = !task || !isTaskDetailLoaded(task) || isProcessing || (!modelReady && !canStartAfterSwitch);
     els.copyBtn.disabled = !task?.markdown;
     els.downloadBtn.disabled = !hasResult;
@@ -2555,9 +2671,9 @@ function releaseBatchPayload(batch) {
 
 async function fetchPdfBatchBlob(task, startPage, endPage) {
     const url = `${API_BASE}/tasks/${encodeURIComponent(task.id)}/source/pages?start_page=${startPage}&end_page=${endPage}`;
-    const response = await fetch(url);
+    const response = await apiFetch(url);
     if (!response.ok) {
-        throw new Error(`读取 PDF 分页失败：${await response.text()}`);
+        throw new Error(`读取 PDF 分页失败：${await responseErrorText(response)}`);
     }
     return response.blob();
 }
@@ -2574,9 +2690,9 @@ async function getTaskSourceBytes(task) {
     if (!task.sourceUrl) {
         throw new Error('缺少源文件，无法继续解析');
     }
-    const response = await fetch(task.sourceUrl);
+    const response = await apiFetch(task.sourceUrl);
     if (!response.ok) {
-        throw new Error(`读取源文件失败：${await response.text()}`);
+        throw new Error(`读取源文件失败：${await responseErrorText(response)}`);
     }
     const bytes = new Uint8Array(await response.arrayBuffer());
     sourceBytesCache.set(task.id, bytes);
@@ -2590,9 +2706,9 @@ async function getTaskSourceBlob(task, mimeType) {
     if (!task.sourceUrl) {
         throw new Error('缺少源文件，无法继续解析');
     }
-    const response = await fetch(task.sourceUrl);
+    const response = await apiFetch(task.sourceUrl);
     if (!response.ok) {
-        throw new Error(`读取源文件失败：${await response.text()}`);
+        throw new Error(`读取源文件失败：${await responseErrorText(response)}`);
     }
     const blob = await response.blob();
     if (mimeType && blob.type !== mimeType) {

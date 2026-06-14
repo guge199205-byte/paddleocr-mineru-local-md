@@ -27,7 +27,7 @@ help:
 build:
 	@echo "🔨 构建 Docker 镜像..."
 	docker compose --env-file env.txt pull paddleocr-vlm-server paddleocr-vl-api
-	docker compose --env-file env.txt build pandocr-web
+	docker compose --env-file env.txt build paddleocr-ocr-api pandocr-web
 
 # 部署（构建 + 启动）
 deploy: build up
@@ -37,7 +37,9 @@ deploy: build up
 # 启动服务
 up:
 	@echo "▶️  启动服务..."
-	docker compose --env-file env.txt up -d
+	docker compose --env-file env.txt up -d --no-start
+	docker compose --env-file env.txt stop pandocr-web paddleocr-vl-api paddleocr-vlm-server paddleocr-ocr-api > /dev/null 2>&1 || true
+	docker compose --env-file env.txt start pandocr-web
 	@echo "⏳ 等待服务就绪..."
 	@sleep 5
 	@make test
@@ -45,24 +47,24 @@ up:
 # 停止服务
 down:
 	@echo "🛑 停止服务..."
-	docker compose down
+	docker compose --env-file env.txt down
 
 # 重启服务
 restart:
 	@echo "🔄 重启服务..."
-	docker compose restart
+	docker compose --env-file env.txt restart pandocr-web
 
 # 查看日志
 logs:
-	docker compose logs -f
+	docker compose --env-file env.txt logs -f
 
 # 只查看前端日志
 logs-web:
-	docker compose logs -f pandocr-web
+	docker compose --env-file env.txt logs -f pandocr-web
 
 # 只查看 API 日志
 logs-api:
-	docker compose logs -f paddleocr-vl-api
+	docker compose --env-file env.txt logs -f paddleocr-vl-api
 
 # 测试连接
 test:
@@ -72,20 +74,20 @@ test:
 # 清理资源
 clean:
 	@echo "🧹 清理所有资源..."
-	docker compose down -v
+	docker compose --env-file env.txt down -v
 	docker system prune -f
 
 # 查看服务状态
 status:
-	docker compose ps
+	docker compose --env-file env.txt ps
 
 # 进入前端容器
 shell-web:
-	docker compose exec pandocr-web /bin/bash
+	docker compose --env-file env.txt exec pandocr-web /bin/bash
 
 # 进入 API 容器
 shell-api:
-	docker compose exec paddleocr-vl-api /bin/bash
+	docker compose --env-file env.txt exec paddleocr-vl-api /bin/bash
 
 # Apple Silicon 本地部署
 mac-one-click:

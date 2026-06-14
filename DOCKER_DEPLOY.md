@@ -37,6 +37,10 @@ PANDOCR_MODEL_CONTROL=docker
 PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
 PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
+PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+PANDOCR_MAX_UPLOAD_MB=512
+PANDOCR_API_TOKEN=
+PANDOCR_ENABLE_API_DOCS=0
 ```
 
 RTX 30/40 系列等非 Blackwell NVIDIA GPU 使用 `env.docker`，或把两个镜像标签改为：
@@ -73,7 +77,9 @@ curl http://localhost:8000/api/model-runtime
 curl http://localhost:8081/health
 ```
 
-默认情况下只有 `PaddleOCR-VL 1.6` 会启动，`PP-OCRv6` 的健康检查不通是正常的。切到 `PP-OCRv6` 后，`8082/health` 会变为可用，`8081/health` 会进入 standby。
+默认情况下只有 `PaddleOCR-VL 1.6` 会启动，`PP-OCRv6` 的健康检查不通是正常的。切到 `PP-OCRv6` 后，`8082/health` 会变为可用，`8081/health` 会进入 standby。解析正在运行时模型切换会返回 `409`，避免长任务中途被停容器打断。
+
+如果要通过反向代理、局域网或公网暴露 WebUI，请设置 `PANDOCR_API_TOKEN`。前端会在 API 返回 401 时提示输入 token；`PANDOCR_ENABLE_API_DOCS=1` 时才启用 `/docs` 和 `/redoc`。
 
 `/api/models` 应返回：
 
@@ -139,6 +145,8 @@ paddleocr-ocr-api:
 - `./model_cache_ppocrv6_ocr:/home/paddleocr/.paddleocr`：PP-OCRv6 相关缓存
 
 这些缓存目录已加入 `.dockerignore`，不会被打进 `pandocr-web` 镜像构建上下文。
+
+解析历史保存在 `./data/tasks/`。每个任务目录下 `task.json` 只保存轻量元数据，`summary.json` 用于快速列表，`result.json` 保存 Markdown、OCR JSON 和图片 base64。清空历史只删除合法 task id 子目录，不会递归删除整个 `data/`。
 
 ## 清理
 
