@@ -2,6 +2,12 @@
 
 完整部署说明统一维护在默认中文 `README.md` 的“部署方式”章节；那里分为 NVIDIA Docker 版本和 macOS Apple Silicon 版本。
 
+先检查当前机器是否满足一键部署条件：
+
+```bash
+make doctor
+```
+
 ## macOS Apple Silicon
 
 Apple M1/M2/M3/M4 一键部署：
@@ -105,6 +111,7 @@ docker compose --env-file env.txt ps
 curl http://localhost:8000/api/models
 curl http://localhost:8000/api/model-runtime
 curl http://localhost:8081/health
+./test-connection.sh env.txt
 ```
 
 期望看到 4 个容器，其中只有 `pandocr-web` 和当前活跃模型在 running/healthy，另一个模型处于 created/exited/standby 属于正常：

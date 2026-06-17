@@ -97,6 +97,51 @@ svg {
     gap: 12px;
 }
 
+.language-toggle {
+    height: 28px;
+    min-width: 68px;
+    display: inline-grid;
+    grid-template-columns: 1fr 1fr;
+    align-items: center;
+    padding: 2px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    color: var(--muted);
+    background: #fff;
+    cursor: pointer;
+    font-size: 12px;
+    line-height: 1;
+}
+
+.language-toggle span,
+.language-toggle strong {
+    height: 22px;
+    display: grid;
+    place-items: center;
+    border-radius: 999px;
+    font-weight: 700;
+}
+
+.language-toggle strong {
+    color: var(--muted);
+    background: transparent;
+}
+
+.language-toggle span {
+    color: var(--text);
+    background: var(--brand-soft);
+}
+
+.language-toggle[data-lang="en"] span {
+    color: var(--muted);
+    background: transparent;
+}
+
+.language-toggle[data-lang="en"] strong {
+    color: var(--text);
+    background: var(--brand-soft);
+}
+
 .model-select-wrap {
     display: inline-flex;
     align-items: center;

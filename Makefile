@@ -1,9 +1,11 @@
-.PHONY: help build deploy up down restart logs test clean mac-one-click mac-setup mac-setup-mlx mac-up mac-up-mlx mac-down mac-test mac-test-mlx mac-logs
+.PHONY: help doctor check build deploy up down restart logs test clean mac-one-click mac-setup mac-setup-mlx mac-up mac-up-mlx mac-down mac-test mac-test-mlx mac-logs
 
 # 默认目标
 help:
 	@echo "PaddleOCR Local - 可用命令:"
 	@echo ""
+	@echo "  make doctor     - 检查一键部署所需环境"
+	@echo "  make check      - 运行本地质量门禁"
 	@echo "  make build      - 构建 NVIDIA Docker 镜像"
 	@echo "  make deploy     - 部署 NVIDIA Docker 服务"
 	@echo "  make up         - 启动 NVIDIA Docker 服务"
@@ -22,6 +24,12 @@ help:
 	@echo "  make mac-test-mlx - 测试 Apple Silicon MLX-VLM 服务"
 	@echo "  make mac-logs   - 查看 Apple Silicon 本地日志"
 	@echo ""
+
+doctor:
+	bash scripts/doctor.sh
+
+check:
+	bash scripts/check-local.sh
 
 # 构建镜像
 build:

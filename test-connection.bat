@@ -1,8 +1,22 @@
 @echo off
 REM PaddleOCR Local 连接测试脚本 (Windows)
+setlocal
+
+if "%PANDOCR_ENV_FILE%"=="" (
+    set "ENV_FILE=env.txt"
+) else (
+    set "ENV_FILE=%PANDOCR_ENV_FILE%"
+)
+if not "%~1"=="" set "ENV_FILE=%~1"
 
 echo 🔍 测试 PaddleOCR Local 服务连接...
+echo    Env file: %ENV_FILE%
 echo.
+
+if not exist "%ENV_FILE%" (
+    echo ❌ 环境文件不存在: %ENV_FILE%
+    exit /b 1
+)
 
 REM 测试前端服务
 echo 1️⃣  测试前端服务 (localhost:8000)...
@@ -13,18 +27,36 @@ if not errorlevel 1 (
     echo    ❌ 前端服务异常
 )
 
-REM 测试 PaddleOCR API
-echo 2️⃣  测试 PaddleOCR API (localhost:8081)...
+REM 测试模型运行时
+echo 2️⃣  测试 WebUI 模型运行时...
+curl -s -o nul -w "%%{http_code}" http://localhost:8000/api/model-runtime | findstr "200" >nul
+if not errorlevel 1 (
+    echo    ✅ 模型运行时接口正常
+) else (
+    echo    ❌ 模型运行时接口异常
+)
+
+REM 测试 PaddleOCR-VL API
+echo 3️⃣  测试 PaddleOCR-VL API (localhost:8081)...
 curl -s -o nul -w "%%{http_code}" http://localhost:8081/health | findstr "200" >nul
 if not errorlevel 1 (
-    echo    ✅ PaddleOCR API 正常
+    echo    ✅ PaddleOCR-VL API 正常
 ) else (
-    echo    ❌ PaddleOCR API 异常（可能正在启动中...）
+    echo    ⚠️  PaddleOCR-VL API 未就绪（如果当前活跃模型是 PP-OCRv6，这是正常的）
+)
+
+REM 测试 PP-OCRv6 API
+echo 4️⃣  测试 PP-OCRv6 API (localhost:8082)...
+curl -s -o nul -w "%%{http_code}" http://localhost:8082/health | findstr "200" >nul
+if not errorlevel 1 (
+    echo    ✅ PP-OCRv6 API 正常
+) else (
+    echo    ⚠️  PP-OCRv6 API 未就绪（如果当前活跃模型是 PaddleOCR-VL，这是正常的）
 )
 
 REM 测试网络连接
-echo 3️⃣  测试 Docker 内部网络...
-docker compose exec -T pandocr-web curl -s -o /dev/null -w "%%{http_code}" http://paddleocr-vl-api:8080/health 2>nul | findstr "200" >nul
+echo 5️⃣  测试 Docker 内部网络...
+docker compose --env-file "%ENV_FILE%" exec -T pandocr-web curl -s -o /dev/null -w "%%{http_code}" http://localhost:8000/api/model-runtime 2>nul | findstr "200" >nul
 if not errorlevel 1 (
     echo    ✅ 内部网络正常
 ) else (
@@ -32,22 +64,21 @@ if not errorlevel 1 (
 )
 
 REM 测试 GPU 可用性
-echo 4️⃣  测试 GPU 可用性...
-docker compose exec -T paddleocr-vlm-server nvidia-smi >nul 2>&1
+echo 6️⃣  测试 GPU 可用性...
+docker compose --env-file "%ENV_FILE%" exec -T paddleocr-vlm-server nvidia-smi >nul 2>&1
 if not errorlevel 1 (
     echo    ✅ GPU 可用
 ) else (
-    echo    ❌ GPU 不可用
+    echo    ⚠️  GPU 当前不可用（如果 VL 容器待启动，这是正常的）
 )
 
 echo.
 echo 📊 服务状态总览:
-docker compose ps
+docker compose --env-file "%ENV_FILE%" ps -a
 
 echo.
 echo 💡 提示:
-echo    - 如果服务异常，查看日志: docker compose logs -f
+echo    - 如果服务异常，查看日志: docker compose --env-file "%ENV_FILE%" logs -f
 echo    - 如果正在启动中，等待 3-5 分钟后重试
 echo.
 pause
-

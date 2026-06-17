@@ -16,6 +16,7 @@ from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from typing import List, Optional, Union
+from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
@@ -25,11 +26,23 @@ from pydantic import BaseModel, Field
 
 logger = logging.getLogger("pandocr")
 logging.basicConfig(level=os.getenv("PANDOCR_LOG_LEVEL", "INFO"))
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 def parse_csv_env(name: str, default: str) -> list[str]:
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def parse_bool_env(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_positive_int_env(name: str, default: str) -> int:
+    try:
+        return max(1, int(os.getenv(name, default)))
+    except ValueError:
+        return max(1, int(default))
 
 
 PADDLE_SERVICE_URL = os.getenv("PADDLE_SERVICE_URL", "http://localhost:8081/layout-parsing")
@@ -47,7 +60,9 @@ MODEL_RUNTIME_STARTUP = os.getenv("PANDOCR_ACTIVE_MODEL_ON_START", "paddleocr-vl
 DOCKER_SOCKET_PATH = os.getenv("PANDOCR_DOCKER_SOCKET", "/var/run/docker.sock")
 MODEL_SWITCH_TIMEOUT = float(os.getenv("PANDOCR_MODEL_SWITCH_TIMEOUT", "1200"))
 API_TOKEN = os.getenv("PANDOCR_API_TOKEN", "").strip()
-ENABLE_API_DOCS = os.getenv("PANDOCR_ENABLE_API_DOCS", "0").strip().lower() in {"1", "true", "yes", "on"}
+ENABLE_API_DOCS = parse_bool_env("PANDOCR_ENABLE_API_DOCS", "0")
+ENFORCE_ORIGIN_CHECK = parse_bool_env("PANDOCR_ENFORCE_ORIGIN_CHECK", "1")
+MAX_CONCURRENT_OCR = parse_positive_int_env("PANDOCR_MAX_CONCURRENT_OCR", "1")
 TASK_STORE_MARKER = ".pandocr-task-store"
 TASK_RESULT_FILE = "result.json"
 TASK_SUMMARY_FILE = "summary.json"
@@ -74,6 +89,7 @@ MODEL_RUNTIME_CONFIG = {
 DEFAULT_RUNTIME_MODEL_ID = MODEL_RUNTIME_STARTUP if MODEL_RUNTIME_STARTUP in MODEL_RUNTIME_CONFIG else "paddleocr-vl-1.6"
 
 model_runtime_lock = asyncio.Lock()
+ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
 model_runtime_operation = {
     "targetModelId": DEFAULT_RUNTIME_MODEL_ID,
     "state": "idle",
@@ -228,6 +244,8 @@ async def build_model_runtime_payload() -> dict:
         "activeModelId": active_model,
         "defaultModelId": DEFAULT_RUNTIME_MODEL_ID,
         "operation": dict(model_runtime_operation),
+        "ocrActiveCount": ocr_active_count,
+        "maxConcurrentOcr": MAX_CONCURRENT_OCR,
         "models": models,
     }
 
@@ -294,25 +312,26 @@ async def activate_model_runtime(model_id: str) -> None:
             set_model_runtime_operation("error", str(err), model_id)
 
 
-def schedule_model_runtime_activation(model_id: str) -> None:
+async def schedule_model_runtime_activation(model_id: str) -> None:
     global model_runtime_task
     if model_id not in MODEL_RUNTIME_CONFIG:
         raise HTTPException(status_code=400, detail="Unknown model id")
     if not model_control_available():
         raise HTTPException(status_code=503, detail="Docker model control is not available")
-    if ocr_active_count > 0:
-        raise HTTPException(status_code=409, detail="OCR is running. Wait for the active task before switching models.")
-    if model_runtime_task and not model_runtime_task.done():
-        model_runtime_task.cancel()
-    set_model_runtime_operation("switching", f"Switching to {model_id}", model_id)
-    model_runtime_task = asyncio.create_task(activate_model_runtime(model_id))
+    async with model_runtime_lock:
+        if ocr_active_count > 0:
+            raise HTTPException(status_code=409, detail="OCR is running. Wait for the active task before switching models.")
+        if model_runtime_task and not model_runtime_task.done():
+            model_runtime_task.cancel()
+        set_model_runtime_operation("switching", f"Switching to {model_id}", model_id)
+        model_runtime_task = asyncio.create_task(activate_model_runtime(model_id))
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ensure_task_data_dir()
     if model_control_available():
-        schedule_model_runtime_activation(DEFAULT_RUNTIME_MODEL_ID)
+        await schedule_model_runtime_activation(DEFAULT_RUNTIME_MODEL_ID)
     yield
 
 
@@ -336,8 +355,44 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 
+SAFE_API_METHODS = {"GET", "HEAD", "OPTIONS"}
+
+
+def normalize_origin(value: str) -> str:
+    try:
+        parsed = urlsplit(value.strip())
+    except ValueError:
+        return ""
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
+def configured_origins_for_request(request: Request) -> set[str]:
+    origins = {normalize_origin(origin) for origin in CORS_ORIGINS if origin != "*"}
+    request_origin = f"{request.url.scheme}://{request.url.netloc}".lower()
+    origins.add(request_origin)
+    return {origin for origin in origins if origin}
+
+
+def request_origin_is_allowed(request: Request) -> bool:
+    if not ENFORCE_ORIGIN_CHECK or not request.url.path.startswith("/api/"):
+        return True
+    if request.method in SAFE_API_METHODS:
+        return True
+    origin = request.headers.get("origin")
+    if not origin:
+        return True
+    if "*" in CORS_ORIGINS:
+        return True
+    return normalize_origin(origin) in configured_origins_for_request(request)
+
+
 @app.middleware("http")
 async def enforce_request_security(request: Request, call_next):
+    if not request_origin_is_allowed(request):
+        return JSONResponse(status_code=403, content={"detail": "Cross-origin API request is not allowed"})
+
     if API_TOKEN and request.url.path.startswith("/api/") and not request_is_authenticated(request):
         return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
 
@@ -358,6 +413,8 @@ async def enforce_request_security(request: Request, call_next):
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
+    if request.url.path.startswith("/api/") and not API_TOKEN:
+        response.headers.setdefault("X-Pandocr-Auth-Warning", "PANDOCR_API_TOKEN is not set")
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; "
@@ -387,6 +444,8 @@ async def get_models():
         "data": model_catalog(),
         "maxUploadBytes": MAX_REQUEST_BYTES,
         "authRequired": bool(API_TOKEN),
+        "originProtection": ENFORCE_ORIGIN_CHECK,
+        "maxConcurrentOcr": MAX_CONCURRENT_OCR,
     }
 
 
@@ -397,7 +456,7 @@ async def get_model_runtime():
 
 @app.post("/api/model-runtime/switch")
 async def switch_model_runtime(request: ModelSwitchRequest):
-    schedule_model_runtime_activation(request.modelId)
+    await schedule_model_runtime_activation(request.modelId)
     return await build_model_runtime_payload()
 
 
@@ -1262,68 +1321,87 @@ def parse_ppocr_response(data: dict) -> dict:
     }
 
 
-async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
+async def acquire_ocr_slot(model_id: str, not_ready_message: str) -> None:
+    global ocr_active_count
+    await ocr_semaphore.acquire()
+    try:
+        async with model_runtime_lock:
+            operation = model_runtime_operation
+            if operation.get("state") == "switching":
+                target = operation.get("targetModelId") or "requested model"
+                raise HTTPException(status_code=409, detail=f"Model runtime is switching to {target}. Try again when it is ready.")
+            runtime = await model_runtime_status(model_id)
+            if not runtime["ready"]:
+                raise HTTPException(status_code=503, detail=not_ready_message)
+            ocr_active_count += 1
+    except Exception:
+        ocr_semaphore.release()
+        raise
+
+
+async def release_ocr_slot() -> None:
     global ocr_active_count
     async with model_runtime_lock:
-        ocr_active_count += 1
-        try:
-            runtime = await model_runtime_status("paddleocr-vl-1.6")
-            if not runtime["ready"]:
-                raise HTTPException(status_code=503, detail="PaddleOCR-VL service is not ready. Switch to this model and wait for it to become ready.")
+        ocr_active_count = max(0, ocr_active_count - 1)
+    ocr_semaphore.release()
 
-            base64_data, file_type = prepare_service_input(ocr_request, raw_input)
-            payload = build_pipeline_payload(ocr_request, base64_data, file_type)
 
-            logger.info("Sending request to Pipeline Service at %s", PADDLE_SERVICE_URL)
-            timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    PADDLE_SERVICE_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
+async def run_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
+    await acquire_ocr_slot(
+        "paddleocr-vl-1.6",
+        "PaddleOCR-VL service is not ready. Switch to this model and wait for it to become ready.",
+    )
+    try:
+        base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+        payload = build_pipeline_payload(ocr_request, base64_data, file_type)
 
-                if resp.status_code != 200:
-                    logger.warning("Service Error (HTTP %s): %s", resp.status_code, resp.text)
-                    if resp.status_code == 422:
-                        logger.warning("Validation Error Details: %s", resp.json())
-                    raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
+        logger.info("Sending request to Pipeline Service at %s", PADDLE_SERVICE_URL)
+        timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                PADDLE_SERVICE_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
 
-                return parse_pipeline_response(resp.json())
-        finally:
-            ocr_active_count = max(0, ocr_active_count - 1)
+            if resp.status_code != 200:
+                logger.warning("Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                if resp.status_code == 422:
+                    logger.warning("Validation Error Details: %s", resp.json())
+                raise HTTPException(status_code=resp.status_code, detail=f"Upstream error: {resp.text}")
+
+            return parse_pipeline_response(resp.json())
+    finally:
+        await release_ocr_slot()
 
 
 async def run_ppocrv6_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
-    global ocr_active_count
-    async with model_runtime_lock:
-        ocr_active_count += 1
-        try:
-            runtime = await model_runtime_status("pp-ocrv6")
-            if not runtime["ready"]:
-                raise HTTPException(status_code=503, detail="PP-OCRv6 service is not ready. Switch to this model and wait for it to become ready.")
+    await acquire_ocr_slot(
+        "pp-ocrv6",
+        "PP-OCRv6 service is not ready. Switch to this model and wait for it to become ready.",
+    )
+    try:
+        base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+        payload = build_ppocr_payload(ocr_request, base64_data, file_type)
 
-            base64_data, file_type = prepare_service_input(ocr_request, raw_input)
-            payload = build_ppocr_payload(ocr_request, base64_data, file_type)
+        logger.info("Sending request to PP-OCR service at %s", PADDLE_OCR_SERVICE_URL)
+        timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                PADDLE_OCR_SERVICE_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
 
-            logger.info("Sending request to PP-OCR service at %s", PADDLE_OCR_SERVICE_URL)
-            timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                resp = await client.post(
-                    PADDLE_OCR_SERVICE_URL,
-                    json=payload,
-                    headers={"Content-Type": "application/json"},
-                )
+            if resp.status_code != 200:
+                logger.warning("PP-OCR Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                if resp.status_code == 422:
+                    logger.warning("PP-OCR Validation Error Details: %s", resp.json())
+                raise HTTPException(status_code=resp.status_code, detail=f"Upstream PP-OCR error: {resp.text}")
 
-                if resp.status_code != 200:
-                    logger.warning("PP-OCR Service Error (HTTP %s): %s", resp.status_code, resp.text)
-                    if resp.status_code == 422:
-                        logger.warning("PP-OCR Validation Error Details: %s", resp.json())
-                    raise HTTPException(status_code=resp.status_code, detail=f"Upstream PP-OCR error: {resp.text}")
-
-                return parse_ppocr_response(resp.json())
-        finally:
-            ocr_active_count = max(0, ocr_active_count - 1)
+            return parse_ppocr_response(resp.json())
+    finally:
+        await release_ocr_slot()
 
 
 def validate_proxy_input_size(raw_input: RawOCRInput) -> int:

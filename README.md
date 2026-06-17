@@ -3,7 +3,32 @@
 **语言 / Language**: 简体中文 | [English](README.en.md)
 
 PaddleOCR Local 是一个面向 PaddleOCR-VL 和 PP-OCRv6 的轻量 Web 前端。前端负责文件上传、队列、预览、模型切换和下载，后端 FastAPI 做静态文件服务、Office 转 PDF 和请求代理；OCR 推理由独立 PaddleOCR 服务完成，NVIDIA 路线使用官方 Docker 服务，macOS Apple Silicon 路线使用本地 PaddleX/MLX 服务。
+
 <img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/85a247a0-c796-4a20-b596-1cc4148df964" />
+
+## 一键部署
+
+这个项目的默认目标是开源自部署：新用户尽量只运行一条命令，脚本自动检查环境、安装依赖、启动服务并打开 WebUI。
+
+macOS Apple Silicon：
+
+```bash
+./macos-one-click.command
+```
+
+Windows + NVIDIA：
+
+```powershell
+.\windows-one-click.bat
+```
+
+部署前或失败后可先跑诊断：
+
+```bash
+make doctor
+```
+
+macOS 会走本地 PaddlePaddle + PaddleX + 可选 MLX-VLM；Windows/NVIDIA 会走 Docker Compose。默认只绑定本机地址，保持本地即开即用。
 
 
 ## 当前架构
@@ -34,6 +59,7 @@ NVIDIA Compose 保留 4 个服务：
 
 - 支持图片、PDF、PPT/PPTX、DOC/DOCX 上传。
 - 支持在 `PaddleOCR-VL 1.6` 文档解析和 `PP-OCRv6` 文字识别之间自由切换；Docker 单 GPU 部署会按需启停模型，避免两个模型同时占用显存。
+- WebUI 支持中文/英文一键切换并记住用户选择，翻译集中维护在 `static/i18n.js`，便于后续扩展更多语言。
 - PDF 按页发送给 PaddleOCR-VL，便于对齐官方在线解析结果并稳定保留每页原始 JSON。
 - PP-OCRv6 结果使用接近官方的可视化文字层展示：左右页面对齐，上下/左右滚动和缩放同步，识别文字支持复制和纠正，同时保留原始 JSON。
 - 解析任务会持久化到本机 `data/tasks/`，刷新页面后仍可查看历史任务，删除按钮会同步删除本地记录。
@@ -120,13 +146,15 @@ PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
 PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
 PANDOCR_MAX_UPLOAD_MB=512
+PANDOCR_MAX_CONCURRENT_OCR=1
+PANDOCR_ENFORCE_ORIGIN_CHECK=1
 PANDOCR_API_TOKEN=
 PANDOCR_ENABLE_API_DOCS=0
 ```
 
 RTX 30/40 系列等非 Blackwell NVIDIA GPU 使用 `env.docker`，其中两个镜像标签都是 `latest-nvidia-gpu-offline`。
 
-`PANDOCR_API_TOKEN` 为空时保持本机即开即用；如果要把 WebUI 暴露给反向代理、局域网或多人环境，请设置一个长随机 token。前端会在 API 返回 401 时提示输入，并保存在浏览器本地。`PANDOCR_ENABLE_API_DOCS=1` 时才启用 `/docs` 和 `/redoc`，OpenAPI JSON 固定在 `/api/openapi.json`。
+`PANDOCR_API_TOKEN` 为空时保持本机即开即用；如果要把 WebUI 暴露给反向代理、局域网或多人环境，请设置一个长随机 token。`PANDOCR_ENFORCE_ORIGIN_CHECK=1` 会拒绝未加入来源白名单的跨站 API 写请求，但它不能替代 token。前端会在 API 返回 401 时提示输入，并保存在浏览器本地。`PANDOCR_ENABLE_API_DOCS=1` 时才启用 `/docs` 和 `/redoc`，OpenAPI JSON 固定在 `/api/openapi.json`。
 
 常用命令：
 
@@ -240,7 +268,7 @@ PANDOCR_PORT=18000 make mac-up
 | --- | --- |
 | 设备 | MacBook Pro, Apple M4 Pro, 12 核 CPU（8P+4E）, 24GB 内存 |
 | 系统 | macOS 26.5.1, arm64 |
-| 环境 | Python 3.12.13, PaddlePaddle 3.3.0, PaddleOCR 3.6.0, PaddleX 3.6.1, mlx-vlm 0.6.3 |
+| 环境 | Python 3.12.13, PaddlePaddle 3.3.0, PaddleOCR 3.7.0, PaddleX 3.7.1, mlx-vlm 0.6.3 |
 | 启动模式 | `make mac-up-mlx` |
 | 测试输入 | 17KB PNG 小图，经 WebUI 后端 `/api/paddleocr-vl-1.6` 端到端请求 |
 | 5 次耗时 | 1.73s / 1.74s / 1.75s / 1.76s / 1.78s |
@@ -307,3 +335,9 @@ python server.py
 ```
 
 然后打开 http://localhost:8000。
+
+本地质量检查：
+
+```bash
+make check
+```

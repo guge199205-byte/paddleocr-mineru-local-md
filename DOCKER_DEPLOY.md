@@ -39,6 +39,8 @@ PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
 PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
 PANDOCR_MAX_UPLOAD_MB=512
+PANDOCR_MAX_CONCURRENT_OCR=1
+PANDOCR_ENFORCE_ORIGIN_CHECK=1
 PANDOCR_API_TOKEN=
 PANDOCR_ENABLE_API_DOCS=0
 ```
@@ -79,12 +81,12 @@ curl http://localhost:8081/health
 
 默认情况下只有 `PaddleOCR-VL 1.6` 会启动，`PP-OCRv6` 的健康检查不通是正常的。切到 `PP-OCRv6` 后，`8082/health` 会变为可用，`8081/health` 会进入 standby。解析正在运行时模型切换会返回 `409`，避免长任务中途被停容器打断。
 
-如果要通过反向代理、局域网或公网暴露 WebUI，请设置 `PANDOCR_API_TOKEN`。前端会在 API 返回 401 时提示输入 token；`PANDOCR_ENABLE_API_DOCS=1` 时才启用 `/docs` 和 `/redoc`。
+如果要通过反向代理、局域网或公网暴露 WebUI，请设置 `PANDOCR_API_TOKEN`。`PANDOCR_ENFORCE_ORIGIN_CHECK=1` 会拒绝未加入来源白名单的跨站 API 写请求，但它不能替代 token；前端会在 API 返回 401 时提示输入 token。`PANDOCR_ENABLE_API_DOCS=1` 时才启用 `/docs` 和 `/redoc`。
 
 `/api/models` 应返回：
 
 ```json
-{"default":"paddleocr-vl-1.6","data":[{"id":"paddleocr-vl-1.6","name":"PaddleOCR-VL-1.6-0.9B"},{"id":"pp-ocrv6","name":"PP-OCRv6_medium"}]}
+{"default":"paddleocr-vl-1.6","data":[{"id":"paddleocr-vl-1.6","name":"PaddleOCR-VL-1.6-0.9B"},{"id":"pp-ocrv6","name":"PP-OCRv6_medium"}],"originProtection":true,"maxConcurrentOcr":1}
 ```
 
 ## 重启 Web 服务

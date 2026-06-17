@@ -73,7 +73,18 @@ macos_env_ready() {
 import importlib.util
 import sys
 
-required = ["paddle", "paddleocr", "paddlex"]
+required = [
+    "fastapi",
+    "httpx",
+    "multipart",
+    "pydantic",
+    "PIL",
+    "pypdf",
+    "uvicorn",
+    "paddle",
+    "paddleocr",
+    "paddlex",
+]
 missing = [name for name in required if importlib.util.find_spec(name) is None]
 sys.exit(1 if missing else 0)
 PY

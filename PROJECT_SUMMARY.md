@@ -60,6 +60,8 @@ PPOCR_V6_MODEL_NAME=PP-OCRv6_medium
 PANDOCR_MODEL_CONTROL=docker
 PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
 PADDLE_REQUEST_TIMEOUT=3600
+PANDOCR_MAX_CONCURRENT_OCR=1
+PANDOCR_ENFORCE_ORIGIN_CHECK=1
 ```
 
 `PADDLE_REQUEST_TIMEOUT` 建议保持较大值，大 PDF 按页处理时整体耗时仍可能较长。
@@ -81,12 +83,14 @@ PADDLE_REQUEST_TIMEOUT=3600
 代码改动后至少执行：
 
 ```powershell
+make check
 node --check static/app.js
 python -m py_compile server.py
 docker compose --env-file env.txt config --quiet
 docker compose --env-file env.txt build pandocr-web
 docker compose --env-file env.txt up -d --no-deps --force-recreate pandocr-web
 curl http://localhost:8000/api/models
+curl http://localhost:8000/api/model-runtime
 curl http://localhost:8081/health
 ```
 

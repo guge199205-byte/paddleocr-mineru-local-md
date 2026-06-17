@@ -4,6 +4,32 @@
 
 PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL and PP-OCRv6. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate PaddleOCR services. The NVIDIA path uses official Docker services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
 
+<img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/85a247a0-c796-4a20-b596-1cc4148df964" />
+
+## One-Click Deployment
+
+The default goal of this project is open-source self-hosting: new users should usually run one command, let the script check the environment, install dependencies, start services, and open the WebUI.
+
+macOS Apple Silicon:
+
+```bash
+./macos-one-click.command
+```
+
+Windows + NVIDIA:
+
+```powershell
+.\windows-one-click.bat
+```
+
+Before deployment, or after a failed run, use the doctor:
+
+```bash
+make doctor
+```
+
+macOS uses local PaddlePaddle + PaddleX + optional MLX-VLM. Windows/NVIDIA uses Docker Compose. By default, services bind to localhost for a zero-config local setup.
+
 ## Current Architecture
 
 ```text
@@ -32,6 +58,7 @@ For single-GPU machines, the Docker deployment keeps only one OCR model hot-load
 
 - Supports image, PDF, PPT/PPTX, and DOC/DOCX uploads.
 - Supports model switching between `PaddleOCR-VL 1.6` document parsing and `PP-OCRv6` text OCR, with Docker-based on-demand start/stop for single-GPU deployments.
+- The WebUI supports one-click Chinese/English switching, remembers the user's choice, and keeps translations centralized in `static/i18n.js` for future languages.
 - Sends PDFs to PaddleOCR-VL page by page, making it easier to compare with the official online parsing result and reliably keep the raw JSON for each page.
 - Renders PP-OCRv6 results with an official-style visual OCR layer: source/result pages stay aligned, scrolling and zooming are synchronized, recognized text can be copied or corrected, and raw JSON remains available.
 - Persists parsing tasks locally under `data/tasks/`, so history remains available after refreshing the page. Deleting a task also removes the local record.
@@ -118,13 +145,15 @@ PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
 PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
 PANDOCR_MAX_UPLOAD_MB=512
+PANDOCR_MAX_CONCURRENT_OCR=1
+PANDOCR_ENFORCE_ORIGIN_CHECK=1
 PANDOCR_API_TOKEN=
 PANDOCR_ENABLE_API_DOCS=0
 ```
 
 RTX 30/40 series and other non-Blackwell NVIDIA GPUs should use `env.docker`, where both image tags are `latest-nvidia-gpu-offline`.
 
-Leave `PANDOCR_API_TOKEN` empty for local single-user use. If you expose the WebUI through a reverse proxy, LAN, or shared environment, set a long random token. The frontend prompts for the token after an API 401 and stores it in browser local storage. `/docs` and `/redoc` are only enabled when `PANDOCR_ENABLE_API_DOCS=1`; the WebUI OpenAPI JSON is always available at `/api/openapi.json`.
+Leave `PANDOCR_API_TOKEN` empty for local single-user use. If you expose the WebUI through a reverse proxy, LAN, or shared environment, set a long random token. `PANDOCR_ENFORCE_ORIGIN_CHECK=1` rejects cross-origin API mutations from origins outside the allowlist, but it is not a replacement for token authentication. The frontend prompts for the token after an API 401 and stores it in browser local storage. `/docs` and `/redoc` are only enabled when `PANDOCR_ENABLE_API_DOCS=1`; the WebUI OpenAPI JSON is always available at `/api/openapi.json`.
 
 Useful commands:
 
@@ -238,7 +267,7 @@ Local benchmark reference after model caching, excluding first download and cold
 | --- | --- |
 | Device | MacBook Pro, Apple M4 Pro, 12-core CPU (8P+4E), 24GB memory |
 | System | macOS 26.5.1, arm64 |
-| Environment | Python 3.12.13, PaddlePaddle 3.3.0, PaddleOCR 3.6.0, PaddleX 3.6.1, mlx-vlm 0.6.3 |
+| Environment | Python 3.12.13, PaddlePaddle 3.3.0, PaddleOCR 3.7.0, PaddleX 3.7.1, mlx-vlm 0.6.3 |
 | Startup mode | `make mac-up-mlx` |
 | Test input | 17KB PNG image, end-to-end request through the WebUI backend `/api/paddleocr-vl-1.6` |
 | Five runs | 1.73s / 1.74s / 1.75s / 1.76s / 1.78s |
@@ -305,3 +334,9 @@ python server.py
 ```
 
 Then open http://localhost:8000.
+
+Run the local quality gate:
+
+```bash
+make check
+```

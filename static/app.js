@@ -4,12 +4,21 @@ const MAX_PDF_BATCH_SIZE = 400;
 const PDF_BATCH_SIZE_STORAGE_KEY = 'pandocr.pdfBatchSize';
 const MODEL_STORAGE_KEY = 'pandocr.selectedModelId';
 const API_TOKEN_STORAGE_KEY = 'pandocr.apiToken';
+const LANGUAGE_STORAGE_KEY = 'pandocr.language';
 const DEFAULT_MODEL_ID = 'paddleocr-vl-1.6';
 const DEFAULT_PDF_ZOOM = 1;
 const PDF_DEFAULT_PAGE_WIDTH = 595;
 const PDF_FIT_WIDTH_GUTTER = 12;
 const MAX_DEFAULT_PDF_ZOOM = 1.3;
 const DEFAULT_MAX_UPLOAD_BYTES = 512 * 1024 * 1024;
+const I18N_CONFIG = window.PANDOCR_I18N || {
+    defaultLanguage: 'zh-CN',
+    supportedLanguages: ['zh-CN'],
+    titles: {
+        'zh-CN': 'PaddleOCR Local - 本地 OCR 解析工作台'
+    },
+    dictionaries: {}
+};
 
 let availableModels = [{
     id: DEFAULT_MODEL_ID,
@@ -44,8 +53,12 @@ let modelRuntimePollTimer = null;
 let modelRuntimeLoadInFlight = false;
 let modelSwitchInFlight = false;
 let maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES;
+let currentLanguage = normalizeLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || I18N_CONFIG.defaultLanguage);
 const sourcePdfCache = new Map();
 const sourceBytesCache = new Map();
+const i18nTextSources = new WeakMap();
+const i18nAttributeSources = new WeakMap();
+const I18N_ATTRIBUTES = ['title', 'placeholder', 'aria-label'];
 const JSON_LINE_HEIGHT = 21;
 const JSON_PADDING_TOP = 34;
 const JSON_PADDING_RIGHT = 40;
@@ -63,6 +76,7 @@ const els = {
     taskList: document.getElementById('task-list'),
     taskSearch: document.getElementById('task-search'),
     clearHistoryBtn: document.getElementById('clear-history-btn'),
+    languageToggle: document.getElementById('language-toggle'),
     statusDot: document.getElementById('model-status-dot'),
     statusText: document.getElementById('model-status-text'),
     modelSelect: document.getElementById('model-select'),
@@ -98,6 +112,7 @@ const els = {
 
 document.addEventListener('DOMContentLoaded', async () => {
     pdfjsLib.GlobalWorkerOptions.workerSrc = '/static/vendor/pdfjs/pdf.worker.min.js';
+    initLanguage();
     initPdfBatchSizeSetting();
     setupEventListeners();
     renderModelSelect();
@@ -105,8 +120,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadTasks();
     renderTaskList();
     if (tasks.length > 0) {
-        selectTask(tasks[0].id);
+        await selectTask(tasks[0].id);
     }
+    applyLanguage(document.body);
 });
 
 function setupEventListeners() {
@@ -155,6 +171,7 @@ function setupEventListeners() {
     els.markdownView.addEventListener('scroll', handlePPOCRMarkdownScroll);
     els.jsonView.addEventListener('scroll', renderVisibleJsonLines);
     els.modelSelect?.addEventListener('change', handleModelSelectionChange);
+    els.languageToggle?.addEventListener('click', toggleLanguage);
     els.pdfBatchSizeInput?.addEventListener('input', handlePdfBatchSizeInput);
     ['change', 'blur'].forEach((eventName) => {
         els.pdfBatchSizeInput?.addEventListener(eventName, syncPdfBatchSizeSetting);
@@ -174,6 +191,219 @@ function setupEventListeners() {
             setActiveResultView(button.dataset.view);
         });
     });
+}
+
+function initLanguage() {
+    currentLanguage = normalizeLanguage(currentLanguage);
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, currentLanguage);
+    applyLanguage(document.body);
+}
+
+function normalizeLanguage(language) {
+    const supported = Array.isArray(I18N_CONFIG.supportedLanguages)
+        ? I18N_CONFIG.supportedLanguages
+        : ['zh-CN'];
+    if (supported.includes(language)) return language;
+    return I18N_CONFIG.defaultLanguage || supported[0] || 'zh-CN';
+}
+
+function toggleLanguage() {
+    setLanguage(currentLanguage === 'en' ? 'zh-CN' : 'en');
+}
+
+function setLanguage(language) {
+    const nextLanguage = normalizeLanguage(language);
+    if (nextLanguage === currentLanguage) {
+        applyLanguage(document.body);
+        return;
+    }
+    currentLanguage = nextLanguage;
+    localStorage.setItem(LANGUAGE_STORAGE_KEY, currentLanguage);
+    refreshLanguageSensitiveUi();
+}
+
+function refreshLanguageSensitiveUi() {
+    const task = getActiveTask();
+    renderTaskList();
+    updateActiveModelDisplay(task);
+    updateResultViewLabels(task);
+
+    if (task) {
+        els.sourceMeta.textContent = taskSourceMeta(task);
+        els.resultTitle.textContent = resultPaneTitle(task);
+        renderResultPane(task);
+    } else if (!isProcessing) {
+        els.sourceTitle.textContent = t('等待上传文件');
+        els.sourceMeta.textContent = t('PDF、图片、Office 文档');
+        if (els.sourceViewer.querySelector('#drop-zone')) {
+            els.sourceViewer.innerHTML = emptyDropZoneHtml();
+            els.dropZone = document.getElementById('drop-zone');
+            els.browseBtn = document.getElementById('browse-btn');
+            els.browseBtn?.addEventListener('click', () => els.fileInput.click());
+        }
+        renderResultPane(null);
+    }
+
+    updateActionState(task);
+    applyLanguage(document.body);
+}
+
+function applyLanguage(root = document.body) {
+    if (!root) return;
+    document.documentElement.lang = currentLanguage;
+    document.title = I18N_CONFIG.titles?.[currentLanguage] || I18N_CONFIG.titles?.[I18N_CONFIG.defaultLanguage] || document.title;
+    updateLanguageToggle();
+    translateElementTree(root);
+}
+
+function updateLanguageToggle() {
+    if (!els.languageToggle) return;
+    els.languageToggle.dataset.lang = currentLanguage === 'en' ? 'en' : 'zh-CN';
+    const labelSource = currentLanguage === 'en' ? '切换到中文' : '切换到英文';
+    const label = t(labelSource);
+    els.languageToggle.setAttribute('title', label);
+    els.languageToggle.setAttribute('aria-label', label);
+    const sources = getI18nAttributeSources(els.languageToggle);
+    sources.set('title', labelSource);
+    sources.set('aria-label', labelSource);
+}
+
+function translateElementTree(root) {
+    const startingElement = root.nodeType === Node.ELEMENT_NODE ? root : root.parentElement;
+    if (startingElement) translateElementAttributes(startingElement);
+
+    const walker = document.createTreeWalker(
+        root,
+        NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+        {
+            acceptNode(node) {
+                if (node.nodeType === Node.ELEMENT_NODE) {
+                    return shouldSkipI18nElement(node)
+                        ? NodeFilter.FILTER_REJECT
+                        : NodeFilter.FILTER_ACCEPT;
+                }
+                const parent = node.parentElement;
+                if (!parent || shouldSkipI18nElement(parent)) return NodeFilter.FILTER_REJECT;
+                return NodeFilter.FILTER_ACCEPT;
+            }
+        }
+    );
+
+    let node = walker.nextNode();
+    while (node) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+            translateElementAttributes(node);
+        } else {
+            translateTextNode(node);
+        }
+        node = walker.nextNode();
+    }
+}
+
+function shouldSkipI18nElement(element) {
+    if (!element || element.closest('script, style, pre, code, #json-view')) return true;
+    const markdownView = element.closest('#markdown-view');
+    if (!markdownView) return false;
+    if (element.id === 'markdown-view') return false;
+    return Boolean(!element.closest('.empty-result') && !element.querySelector?.('.empty-result'));
+}
+
+function translateElementAttributes(element) {
+    I18N_ATTRIBUTES.forEach((attribute) => {
+        if (!element.hasAttribute(attribute)) return;
+        const value = element.getAttribute(attribute);
+        const sources = getI18nAttributeSources(element);
+        if (!sources.has(attribute) && hasCjk(value)) {
+            sources.set(attribute, value);
+        }
+        const source = sources.get(attribute);
+        if (source) {
+            element.setAttribute(attribute, t(source));
+        }
+    });
+}
+
+function getI18nAttributeSources(element) {
+    let sources = i18nAttributeSources.get(element);
+    if (!sources) {
+        sources = new Map();
+        i18nAttributeSources.set(element, sources);
+    }
+    return sources;
+}
+
+function translateTextNode(node) {
+    const value = node.nodeValue || '';
+    const trimmed = value.trim();
+    if (!trimmed) return;
+    if (!i18nTextSources.has(node) && hasCjk(trimmed)) {
+        i18nTextSources.set(node, trimmed);
+    }
+    const source = i18nTextSources.get(node);
+    if (!source) return;
+    const leading = value.match(/^\s*/)?.[0] || '';
+    const trailing = value.match(/\s*$/)?.[0] || '';
+    node.nodeValue = `${leading}${t(source)}${trailing}`;
+}
+
+function hasCjk(value) {
+    return /[\u3400-\u9fff]/.test(String(value || ''));
+}
+
+function languageLocale() {
+    return currentLanguage === 'en' ? 'en-US' : 'zh-CN';
+}
+
+function t(source, params = {}) {
+    const text = String(source ?? '');
+    const translated = currentLanguage === normalizeLanguage(I18N_CONFIG.defaultLanguage)
+        ? text
+        : (I18N_CONFIG.dictionaries?.[currentLanguage]?.[text] || translateDynamicText(text) || text);
+    return interpolateI18n(translated, params);
+}
+
+function interpolateI18n(text, params = {}) {
+    return String(text).replace(/\{([a-zA-Z0-9_]+)\}/g, (match, key) => (
+        Object.prototype.hasOwnProperty.call(params, key) ? String(params[key]) : match
+    ));
+}
+
+function translateDynamicText(text) {
+    if (currentLanguage === normalizeLanguage(I18N_CONFIG.defaultLanguage)) return text;
+    const dynamicPatterns = [
+        [/^(.+) 状态检查中$/, (name) => `${name} ${t('状态检查中')}`],
+        [/^(.+) 就绪$/, (name) => `${name} ${t('就绪')}`],
+        [/^(.+) 启动中$/, (name) => `${name} ${t('启动中')}`],
+        [/^(.+) 启动失败$/, (name) => `${name} ${t('启动失败')}`],
+        [/^(.+) 容器未创建$/, (name) => `${name} ${t('容器未创建')}`],
+        [/^(.+) 待启动$/, (name) => `${name} ${t('待启动')}`],
+        [/^(.+) 未就绪$/, (name) => `${name} ${t('未就绪')}`],
+        [/^(.+) 还没有就绪，请稍后再试。$/, (name) => t('{name} 还没有就绪，请稍后再试。', { name })],
+        [/^正在读取 (\d+) 个文件\.\.\.$/, (count) => t('正在读取 {count} 个文件...', { count })],
+        [/^(\d+)\/(\d+) 解析中$/, (done, total) => t('{done}/{total} 解析中', { done, total })],
+        [/^(\d+)\/(\d+) 可继续$/, (done, total) => t('{done}/{total} 可继续', { done, total })],
+        [/^解析失败：(.+)$/, (detail) => t('解析失败：{detail}', { detail })],
+        [/^Office 已转 PDF · (.+)$/, (name) => t('Office 已转 PDF · {name}', { name })],
+        [/^第 (\d+) 页$/, (start) => t('第 {start} 页', { start })],
+        [/^第 (\d+)-(\d+) 页$/, (start, end) => t('第 {start}-{end} 页', { start, end })],
+        [/^(.+) 超过上传上限 (.+)，请压缩或拆分后再试。$/, (name, limit) => t('{name} 超过上传上限 {limit}，请压缩或拆分后再试。', { name, limit })],
+        [/^不支持的文件格式：(.+)$/, (name) => t('不支持的文件格式：{name}', { name })],
+        [/^确定要删除“(.+)”吗？当前操作不可回撤。$/, (name) => t('确定要删除“{name}”吗？当前操作不可回撤。', { name })],
+        [/^保存本地任务失败：(.+)$/, (detail) => t('保存本地任务失败：{detail}', { detail })],
+        [/^读取本地任务失败：(.+)$/, (detail) => t('读取本地任务失败：{detail}', { detail })],
+        [/^清空本地任务失败：(.+)$/, (detail) => t('清空本地任务失败：{detail}', { detail })],
+        [/^删除本地任务失败：(.+)$/, (detail) => t('删除本地任务失败：{detail}', { detail })],
+        [/^保存源文件失败：(.+)$/, (detail) => t('保存源文件失败：{detail}', { detail })],
+        [/^Office 转 PDF 失败：(.+)$/, (detail) => t('Office 转 PDF 失败：{detail}', { detail })],
+        [/^读取 PDF 分页失败：(.+)$/, (detail) => t('读取 PDF 分页失败：{detail}', { detail })],
+        [/^读取源文件失败：(.+)$/, (detail) => t('读取源文件失败：{detail}', { detail })]
+    ];
+
+    for (const [pattern, translate] of dynamicPatterns) {
+        const match = text.match(pattern);
+        if (match) return translate(...match.slice(1));
+    }
+    return '';
 }
 
 function isLocalApiUrl(url) {
@@ -204,7 +434,7 @@ async function apiFetch(url, options = {}) {
     let response = await fetch(url, requestOptions);
     if (response.status !== 401 || !isLocalApiUrl(url)) return response;
 
-    const token = window.prompt('请输入 PaddleOCR Local API Token');
+    const token = window.prompt(t('请输入 PaddleOCR Local API Token'));
     if (!token) return response;
     localStorage.setItem(API_TOKEN_STORAGE_KEY, token.trim());
     response = await fetch(url, {
@@ -243,7 +473,7 @@ async function checkBackendConnection() {
         updateActiveModelDisplay(getActiveTask());
     } catch (error) {
         els.statusDot.className = 'dot error';
-        els.statusText.textContent = '模型未连接';
+        els.statusText.textContent = t('模型未连接');
         setTimeout(checkBackendConnection, 5000);
     }
 }
@@ -314,6 +544,7 @@ function renderModelSelect() {
 
 function syncSelectedModelWithRuntime() {
     if (!modelRuntime || !availableModels.length || modelSwitchInFlight) return false;
+    if (modelRuntime.controlAvailable === false) return false;
     const knownModelIds = new Set(availableModels.map((model) => model.id));
     const operation = modelRuntime.operation;
     let runtimeModelId = null;
@@ -338,7 +569,7 @@ async function handleModelSelectionChange() {
     const nextModelId = els.modelSelect.value || DEFAULT_MODEL_ID;
     if (isProcessing || modelSwitchInFlight) {
         els.modelSelect.value = selectedModelId;
-        alert('当前正在解析或切换模型，请完成后再切换。');
+        alert(t('当前正在解析或切换模型，请完成后再切换。'));
         return;
     }
     const previousModelId = selectedModelId;
@@ -433,18 +664,18 @@ function modelRuntimeStatusText(model) {
     const modelName = modelDisplayName(model);
     const status = getModelRuntimeStatus(model.id);
     const operation = modelRuntime?.operation;
-    if (!modelRuntime) return `${modelName} 状态检查中`;
-    if (status?.ready) return `${modelName} 就绪`;
+    if (!modelRuntime) return t('{modelName} 状态检查中', { modelName });
+    if (status?.ready) return t('{modelName} 就绪', { modelName });
     if (isModelRuntimeSwitching(model.id) || status?.state === 'starting' || status?.state === 'partial') {
-        return `${modelName} 启动中`;
+        return t('{modelName} 启动中', { modelName });
     }
     if (operation?.state === 'error' && operation.targetModelId === model.id) {
-        return `${modelName} 启动失败`;
+        return t('{modelName} 启动失败', { modelName });
     }
-    if (status?.state === 'missing') return `${modelName} 容器未创建`;
-    if (status?.state === 'stopped') return `${modelName} 待启动`;
-    if (modelRuntime.controlAvailable === false) return `${modelName} 未就绪`;
-    return `${modelName} 未就绪`;
+    if (status?.state === 'missing') return t('{modelName} 容器未创建', { modelName });
+    if (status?.state === 'stopped') return t('{modelName} 待启动', { modelName });
+    if (modelRuntime.controlAvailable === false) return t('{modelName} 未就绪', { modelName });
+    return t('{modelName} 未就绪', { modelName });
 }
 
 function sleep(ms) {
@@ -483,7 +714,7 @@ async function switchModelRuntime(modelId, { wait = false } = {}) {
     } catch (error) {
         console.error(error);
         els.statusDot.className = 'dot error';
-        els.statusText.textContent = `${modelDisplayName(model)} 启动失败`;
+        els.statusText.textContent = t('{modelName} 启动失败', { modelName: modelDisplayName(model) });
         return false;
     } finally {
         modelSwitchInFlight = false;
@@ -499,18 +730,18 @@ async function waitForModelRuntimeReady(modelId, timeoutMs = 20 * 60 * 1000) {
         if (isModelRuntimeReady(modelId)) return true;
         const operation = modelRuntime?.operation;
         if (operation?.targetModelId === modelId && operation.state === 'error') {
-            throw new Error(operation.message || '模型启动失败');
+            throw new Error(operation.message || t('模型启动失败'));
         }
         await sleep(2500);
     }
-    throw new Error('模型启动超时');
+    throw new Error(t('模型启动超时'));
 }
 
 async function ensureModelRuntimeReadyForTask(task, model) {
     if (isModelRuntimeReady(model.id)) return true;
     const switched = await switchModelRuntime(model.id, { wait: true });
     if (switched && isModelRuntimeReady(model.id)) return true;
-    alert(`${modelDisplayName(model)} 还没有就绪，请稍后再试。`);
+    alert(t('{name} 还没有就绪，请稍后再试。', { name: modelDisplayName(model) }));
     updateActionState(task);
     return false;
 }
@@ -542,7 +773,7 @@ async function saveTaskToServer(task, { includeResults = true } = {}) {
         body: JSON.stringify(taskForPersistence(task, { includeResults }))
     });
     if (!response.ok) {
-        throw new Error(`保存本地任务失败：${await responseErrorText(response)}`);
+        throw new Error(t('保存本地任务失败：{detail}', { detail: await responseErrorText(response) }));
     }
 }
 
@@ -566,7 +797,7 @@ function reconcileTaskStatus(task) {
     const reconciled = {
         ...task,
         status: 'pending',
-        error: task.error || '上次解析中断，可继续解析。',
+        error: task.error || t('上次解析中断，可继续解析。'),
         updatedAt: task.updatedAt || Date.now()
     };
     if (isTaskDetailLoaded(task)) {
@@ -613,7 +844,7 @@ async function loadServerTasks() {
 async function loadTaskFromServer(taskId) {
     const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
     if (!response.ok) {
-        throw new Error(`读取本地任务失败：${await responseErrorText(response)}`);
+        throw new Error(t('读取本地任务失败：{detail}', { detail: await responseErrorText(response) }));
     }
     return reconcileTaskStatus(await response.json());
 }
@@ -637,10 +868,10 @@ async function ensureTaskLoaded(taskId) {
     if (!task) return null;
     if (isTaskDetailLoaded(task)) return task;
 
-    els.sourceTitle.textContent = task.name || '正在加载任务';
-    els.sourceMeta.textContent = '正在加载本地任务详情...';
-    els.resultTitle.textContent = '正在加载';
-    els.markdownView.innerHTML = '<div class="empty-result">正在加载任务详情...</div>';
+    els.sourceTitle.textContent = task.name || t('正在加载任务');
+    els.sourceMeta.textContent = t('正在加载本地任务详情...');
+    els.resultTitle.textContent = t('正在加载');
+    els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(t('正在加载任务详情...'))}</div>`;
     els.jsonView.textContent = '';
     updateActionState(null);
 
@@ -651,14 +882,14 @@ async function ensureTaskLoaded(taskId) {
 async function deleteAllTasks() {
     const response = await apiFetch(`${API_BASE}/tasks`, { method: 'DELETE' });
     if (!response.ok) {
-        throw new Error(`清空本地任务失败：${await responseErrorText(response)}`);
+        throw new Error(t('清空本地任务失败：{detail}', { detail: await responseErrorText(response) }));
     }
 }
 
 async function deleteTaskById(taskId) {
     const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`, { method: 'DELETE' });
     if (!response.ok) {
-        throw new Error(`删除本地任务失败：${await responseErrorText(response)}`);
+        throw new Error(t('删除本地任务失败：{detail}', { detail: await responseErrorText(response) }));
     }
 }
 
@@ -677,7 +908,7 @@ async function handleFiles(files) {
     if (failed.length > 0) {
         console.warn('Some files could not be added', failed.map((result) => result.reason));
         const message = failed
-            .map((result) => result.reason?.message || String(result.reason || '文件读取失败'))
+            .map((result) => result.reason?.message || String(result.reason || t('文件读取失败')))
             .join('\n');
         els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(message)}</div>`;
     }
@@ -723,23 +954,26 @@ function showIncomingFileState(fileList) {
     showResultView('markdown');
     updateActionState(null);
 
-    els.sourceTitle.textContent = primaryFile?.name || '正在读取新文件';
+    els.sourceTitle.textContent = primaryFile?.name || t('正在读取新文件');
     els.sourceMeta.textContent = fileCount > 1
-        ? `正在读取 ${fileCount} 个文件...`
-        : '正在读取文件...';
+        ? t('正在读取 {count} 个文件...', { count: fileCount })
+        : t('正在读取文件...');
     els.pdfControls.classList.add('hidden');
-    els.sourceViewer.innerHTML = '<div class="empty-result">正在读取文件，请稍候...</div>';
+    els.sourceViewer.innerHTML = `<div class="empty-result">${escapeHtml(t('正在读取文件，请稍候...'))}</div>`;
     els.sourceViewer.scrollTop = 0;
-    els.resultTitle.textContent = '准备解析';
-    els.markdownView.innerHTML = '<div class="empty-result">正在读取新文件，解析结果会显示在这里。</div>';
+    els.resultTitle.textContent = t('准备解析');
+    els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(t('正在读取新文件，解析结果会显示在这里。'))}</div>`;
     els.jsonView.textContent = '';
 }
 
 function assertUploadWithinLimit(fileOrBlob, filename = '') {
     const size = Number(fileOrBlob?.size || 0);
     if (!maxUploadBytes || !size || size <= maxUploadBytes) return;
-    const name = filename || fileOrBlob.name || '文件';
-    throw new Error(`${name} 超过上传上限 ${formatSize(maxUploadBytes)}，请压缩或拆分后再试。`);
+    const name = filename || fileOrBlob.name || t('文件');
+    throw new Error(t('{name} 超过上传上限 {limit}，请压缩或拆分后再试。', {
+        name,
+        limit: formatSize(maxUploadBytes)
+    }));
 }
 
 async function createTaskFromFile(file) {
@@ -764,7 +998,7 @@ async function createTaskFromFile(file) {
         return createImageTask(file);
     }
 
-    alert(`不支持的文件格式：${file.name}`);
+    alert(t('不支持的文件格式：{name}', { name: file.name }));
     throw new Error(`Unsupported file type: ${file.name}`);
 }
 
@@ -848,7 +1082,7 @@ async function uploadTaskSource(taskId, fileOrBlob, filename, mimeType) {
         body: formData
     });
     if (!response.ok) {
-        throw new Error(`保存源文件失败：${await responseErrorText(response)}`);
+        throw new Error(t('保存源文件失败：{detail}', { detail: await responseErrorText(response) }));
     }
     const data = await response.json();
     return data.url;
@@ -864,7 +1098,7 @@ async function convertOfficeToPdf(file) {
     });
     if (!response.ok) {
         const detail = await responseErrorText(response);
-        throw new Error(`Office 转 PDF 失败：${detail}`);
+        throw new Error(t('Office 转 PDF 失败：{detail}', { detail }));
     }
     return { blob: await response.blob() };
 }
@@ -878,7 +1112,7 @@ function renderTaskList() {
     });
 
     if (visibleTasks.length === 0) {
-        els.taskList.innerHTML = '<div class="task-empty">暂无任务</div>';
+        els.taskList.innerHTML = `<div class="task-empty">${escapeHtml(t('暂无任务'))}</div>`;
         return;
     }
 
@@ -890,8 +1124,11 @@ function renderTaskList() {
         item.classList.add(`status-${taskVisualStatus(task)}`);
         item.querySelector('.task-icon').innerHTML = taskIcon(task);
         item.querySelector('.task-name').textContent = task.name;
-        item.querySelector('.task-meta').textContent = `${formatDate(task.updatedAt)} · ${task.pageCount || 1} 页`;
+        item.querySelector('.task-meta').textContent = `${formatDate(task.updatedAt)} · ${formatPageCount(task.pageCount || 1)}`;
         item.querySelector('.task-state').textContent = statusText(task);
+        const deleteButton = item.querySelector('.task-delete');
+        deleteButton.setAttribute('title', t('删除任务'));
+        deleteButton.setAttribute('aria-label', t('删除任务'));
         item.addEventListener('click', () => selectTask(task.id));
         item.addEventListener('keydown', (event) => {
             if (event.key === 'Enter' || event.key === ' ') {
@@ -899,7 +1136,7 @@ function renderTaskList() {
                 selectTask(task.id);
             }
         });
-        item.querySelector('.task-delete').addEventListener('click', async (event) => {
+        deleteButton.addEventListener('click', async (event) => {
             event.stopPropagation();
             await deleteTask(task.id);
         });
@@ -911,21 +1148,21 @@ async function deleteTask(taskId) {
     const task = tasks.find((item) => item.id === taskId);
     if (!task) return;
     if (isProcessing && task.id === activeTaskId) {
-        alert('当前文件正在解析中，完成后再删除。');
+        alert(t('当前文件正在解析中，完成后再删除。'));
         return;
     }
     if (task.status === 'processing' && !shouldResumeTask(task)) {
-        alert('当前文件正在解析中，完成后再删除。');
+        alert(t('当前文件正在解析中，完成后再删除。'));
         return;
     }
-    if (!confirm('确定要删除“' + task.name + '”吗？当前操作不可回撤。')) return;
+    if (!confirm(t('确定要删除“{name}”吗？当前操作不可回撤。', { name: task.name }))) return;
 
     const wasActive = activeTaskId === taskId;
     try {
         await deleteTaskById(taskId);
     } catch (error) {
         console.error(error);
-        alert(error.message || '删除失败，请稍后重试。');
+        alert(error.message || t('删除失败，请稍后重试。'));
         return;
     }
     tasks = tasks.filter((item) => item.id !== taskId);
@@ -951,10 +1188,10 @@ async function selectTask(taskId) {
         task = await ensureTaskLoaded(taskId);
     } catch (error) {
         console.error(error);
-        els.sourceTitle.textContent = '任务加载失败';
+        els.sourceTitle.textContent = t('任务加载失败');
         els.sourceMeta.textContent = '';
-        els.resultTitle.textContent = '加载失败';
-        els.markdownView.textContent = error.message || '任务详情加载失败';
+        els.resultTitle.textContent = t('加载失败');
+        els.markdownView.textContent = error.message || t('任务详情加载失败');
         updateActionState(null);
         return;
     }
@@ -963,7 +1200,7 @@ async function selectTask(taskId) {
     renderTaskList();
     updateActiveModelDisplay(task);
     els.sourceTitle.textContent = task.name;
-    els.sourceMeta.textContent = `${sourceLabel(task)} · ${formatSize(task.size)} · ${task.pageCount || 1} 页`;
+    els.sourceMeta.textContent = taskSourceMeta(task);
     els.resultTitle.textContent = resultPaneTitle(task);
     const deferPPOCRVisualResult = isPPOCRVisualTask(task) && task.sourceKind !== 'image';
     if (!deferPPOCRVisualResult) {
@@ -1085,7 +1322,7 @@ function resultDataKey(task) {
 }
 
 function markdownRenderKey(task) {
-    return `${resultDataKey(task)}:${sourceRenderToken}:${currentZoom}`;
+    return `${resultDataKey(task)}:${sourceRenderToken}:${currentZoom}:${currentLanguage}`;
 }
 
 function resetResultRenderCache(taskId = null) {
@@ -1153,8 +1390,8 @@ function renderResultPane(task, { deferJson = false, preserveScroll = true } = {
         updateResultViewLabels(null);
         syncResultMode(null);
         showResultView('markdown');
-        els.resultTitle.textContent = '解析结果';
-        els.markdownView.innerHTML = '<div class="empty-result">选择左侧任务，或上传一个新文件开始解析。</div>';
+        els.resultTitle.textContent = t('解析结果');
+        els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(t('选择左侧任务，或上传一个新文件开始解析。'))}</div>`;
         els.jsonView.textContent = '';
         return;
     }
@@ -1289,7 +1526,7 @@ function cacheJsonLines(text) {
 function updateResultViewLabels(task) {
     const markdownTab = document.querySelector('.view-tab[data-view="markdown"]');
     if (!markdownTab) return;
-    markdownTab.textContent = isPPOCRVisualTask(task) ? '文字识别' : '文档解析';
+    markdownTab.textContent = isPPOCRVisualTask(task) ? t('文字识别') : t('文档解析');
 }
 
 function syncResultMode(task) {
@@ -1371,7 +1608,8 @@ function ppocrVisualRenderContext(task) {
     return [
         task?.id || '',
         sourceRenderToken,
-        currentZoom
+        currentZoom,
+        currentLanguage
     ].join(':');
 }
 
@@ -1544,11 +1782,11 @@ function createPPOCRFloatingToolbar() {
     toolbar.innerHTML = `
         <button type="button" data-action="copy">
             <svg viewBox="0 0 24 24"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
-            <span data-label>\u590d\u5236</span>
+            <span data-label>${escapeHtml(t('复制'))}</span>
         </button>
         <button type="button" data-action="correct">
             <svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg>
-            <span data-label>\u7ea0\u6b63</span>
+            <span data-label>${escapeHtml(t('纠正'))}</span>
         </button>
     `;
     const handleToolbarAction = async (event) => {
@@ -1586,10 +1824,10 @@ async function copyPPOCRToolbarText(toolbar, button) {
     if (!text) return;
     try {
         await writeClipboardText(text);
-        flashToolbarButtonLabel(button, '\u5df2\u590d\u5236', '\u590d\u5236');
+        flashToolbarButtonLabel(button, t('已复制'), t('复制'));
     } catch (error) {
         console.error(error);
-        flashToolbarButtonLabel(button, '\u590d\u5236\u5931\u8d25', '\u590d\u5236');
+        flashToolbarButtonLabel(button, t('复制失败'), t('复制'));
     }
 }
 
@@ -1634,9 +1872,9 @@ function openPPOCRCorrectionEditor(toolbar) {
     const popover = document.createElement('form');
     popover.className = 'ocr-correction-popover';
     popover.innerHTML = `
-        <input type="text" name="text" aria-label="\u7ea0\u6b63\u6587\u5b57">
-        <button type="submit">\u4fdd\u5b58</button>
-        <button type="button" data-action="cancel">\u53d6\u6d88</button>
+        <input type="text" name="text" aria-label="${escapeHtml(t('纠正文字'))}">
+        <button type="submit">${escapeHtml(t('保存'))}</button>
+        <button type="button" data-action="cancel">${escapeHtml(t('取消'))}</button>
     `;
     const input = popover.querySelector('input');
     input.value = active.line.text || '';
@@ -2034,7 +2272,7 @@ async function processActiveTask() {
 
 async function processTask(task, { confirmCompleted = true } = {}) {
     if (!task || isProcessing) return;
-    if (confirmCompleted && task.status === 'completed' && !confirm('这个任务已经解析完成，要重新解析吗？')) return;
+    if (confirmCompleted && task.status === 'completed' && !confirm(t('这个任务已经解析完成，要重新解析吗？'))) return;
 
     const resumeExistingResults = shouldResumeTask(task);
     const targetModel = resumeExistingResults
@@ -2236,15 +2474,18 @@ async function callOCR(batch, task) {
     }
     const text = await response.text();
     if (!text.trim()) {
-        throw new Error(`OCR 服务返回了空响应，请降低每批页数后重试：${batch.label || ''}`);
+        throw new Error(t('OCR 服务返回了空响应，请降低每批页数后重试：{label}', { label: batch.label || '' }));
     }
     try {
         return JSON.parse(text);
     } catch (error) {
         const preview = text.slice(0, 500);
         throw new Error(
-            `OCR 服务返回的 JSON 不完整或格式异常，请降低每批页数后重试：${batch.label || ''}。` +
-            `响应长度 ${text.length} 字符，片段：${preview}`
+            t('OCR 服务返回的 JSON 不完整或格式异常，请降低每批页数后重试：{label}。响应长度 {length} 字符，片段：{preview}', {
+                label: batch.label || '',
+                length: text.length,
+                preview
+            })
         );
     }
 }
@@ -2311,18 +2552,18 @@ function updateActionState(task) {
     const startLabel = startButtonLabel(task);
     const showProcessing = (isProcessing && task?.status === 'processing') || modelStarting;
     els.startBtn.innerHTML = showProcessing
-        ? `<span class="spinner"></span>${modelStarting ? '模型启动中' : '解析中'}`
+        ? `<span class="spinner"></span>${modelStarting ? t('模型启动中') : t('解析中')}`
         : `<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>${startLabel}`;
 }
 
 function startButtonLabel(task) {
-    if (!task) return '开始解析';
+    if (!task) return t('开始解析');
     const taskModel = getTaskModel(task);
-    if (!isModelRuntimeReady(taskModel.id)) return '启动模型并解析';
-    if (task.status === 'completed') return '重新解析';
-    if (task.status === 'error') return '重试解析';
-    if (shouldResumeTask(task)) return '继续解析';
-    return '开始解析';
+    if (!isModelRuntimeReady(taskModel.id)) return t('启动模型并解析');
+    if (task.status === 'completed') return t('重新解析');
+    if (task.status === 'error') return t('重试解析');
+    if (shouldResumeTask(task)) return t('继续解析');
+    return t('开始解析');
 }
 
 async function copyActiveMarkdown() {
@@ -2364,12 +2605,12 @@ async function downloadActiveTask() {
 }
 
 async function clearHistory() {
-    if (!confirm('确认清空所有本地任务历史吗？')) return;
+    if (!confirm(t('确认清空所有本地任务历史吗？'))) return;
     try {
         await deleteAllTasks();
     } catch (error) {
         console.error(error);
-        alert(error.message || '清空失败，请稍后重试。');
+        alert(error.message || t('清空失败，请稍后重试。'));
         return;
     }
     tasks = [];
@@ -2381,8 +2622,8 @@ function resetWorkbench() {
     renderTaskList();
     sourceRenderToken += 1;
     currentPdf = null;
-    els.sourceTitle.textContent = '等待上传文件';
-    els.sourceMeta.textContent = 'PDF、图片、Office 文档';
+    els.sourceTitle.textContent = t('等待上传文件');
+    els.sourceMeta.textContent = t('PDF、图片、Office 文档');
     els.pdfControls.classList.add('hidden');
     els.sourceViewer.innerHTML = emptyDropZoneHtml();
     els.dropZone = document.getElementById('drop-zone');
@@ -2641,10 +2882,10 @@ async function ensureBatchPayload(task, batch) {
     }
 
     if (batch.fileType !== 0) {
-        throw new Error('无法重建当前批次的解析 payload');
+        throw new Error(t('无法重建当前批次的解析 payload'));
     }
     if (!(task.sourceDataUrl || task.sourceUrl)) {
-        throw new Error('缺少源 PDF，无法继续解析');
+        throw new Error(t('缺少源 PDF，无法继续解析'));
     }
     if ((task.pageCount || 1) === 1) {
         batch.payloadBlob = await getTaskSourceBlob(task, 'application/pdf');
@@ -2673,7 +2914,7 @@ async function fetchPdfBatchBlob(task, startPage, endPage) {
     const url = `${API_BASE}/tasks/${encodeURIComponent(task.id)}/source/pages?start_page=${startPage}&end_page=${endPage}`;
     const response = await apiFetch(url);
     if (!response.ok) {
-        throw new Error(`读取 PDF 分页失败：${await responseErrorText(response)}`);
+        throw new Error(t('读取 PDF 分页失败：{detail}', { detail: await responseErrorText(response) }));
     }
     return response.blob();
 }
@@ -2688,11 +2929,11 @@ async function getTaskSourceBytes(task) {
         return bytes;
     }
     if (!task.sourceUrl) {
-        throw new Error('缺少源文件，无法继续解析');
+        throw new Error(t('缺少源文件，无法继续解析'));
     }
     const response = await apiFetch(task.sourceUrl);
     if (!response.ok) {
-        throw new Error(`读取源文件失败：${await responseErrorText(response)}`);
+        throw new Error(t('读取源文件失败：{detail}', { detail: await responseErrorText(response) }));
     }
     const bytes = new Uint8Array(await response.arrayBuffer());
     sourceBytesCache.set(task.id, bytes);
@@ -2704,11 +2945,11 @@ async function getTaskSourceBlob(task, mimeType) {
         return dataUrlToBlob(task.sourceDataUrl);
     }
     if (!task.sourceUrl) {
-        throw new Error('缺少源文件，无法继续解析');
+        throw new Error(t('缺少源文件，无法继续解析'));
     }
     const response = await apiFetch(task.sourceUrl);
     if (!response.ok) {
-        throw new Error(`读取源文件失败：${await responseErrorText(response)}`);
+        throw new Error(t('读取源文件失败：{detail}', { detail: await responseErrorText(response) }));
     }
     const blob = await response.blob();
     if (mimeType && blob.type !== mimeType) {
@@ -2850,6 +3091,7 @@ function officialLayoutRenderContext(task) {
         task?.id || '',
         sourceRenderToken,
         currentZoom,
+        currentLanguage,
         els.ignoreNumberSwitch.checked,
         els.ignoreHeaderSwitch.checked,
         els.ignoreFooterSwitch.checked
@@ -3308,7 +3550,7 @@ function layoutLabelText(label) {
         algorithm: '算法',
         chart: '图表'
     };
-    return labels[normalized] || normalized || '版面块';
+    return labels[normalized] ? t(labels[normalized]) : (normalized || t('版面块'));
 }
 
 function prepareBatchResult(result, batchId) {
@@ -3437,9 +3679,9 @@ function emptyDropZoneHtml() {
     return `
         <div class="drop-zone" id="drop-zone">
             <svg viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-4"/></svg>
-            <h3>拖拽文件到这里</h3>
-            <p>支持 PDF、图片、PPT/PPTX、DOC/DOCX；PDF 会逐页解析。</p>
-            <button class="primary-button" id="browse-btn">选择文件</button>
+            <h3>${escapeHtml(t('拖拽文件到这里'))}</h3>
+            <p>${escapeHtml(t('支持 PDF、图片、PPT/PPTX、DOC/DOCX；PDF 会逐页解析。'))}</p>
+            <button class="primary-button" id="browse-btn">${escapeHtml(t('选择文件'))}</button>
         </div>
     `;
 }
@@ -3453,32 +3695,43 @@ function taskIcon(task) {
 
 function statusText(task) {
     const donePages = task.batches?.filter((batch) => batch.status === 'completed').reduce((sum, batch) => sum + batch.pageCount, 0) || task.completedPages || 0;
-    if (task.status === 'completed') return '完成';
-    if (isTaskActivelyProcessing(task)) return `${donePages}/${task.pageCount || 1} 解析中`;
-    if (shouldResumeTask(task)) return `${donePages}/${task.pageCount || 1} 可继续`;
-    if (task.status === 'error') return '失败';
-    return '待解析';
+    if (task.status === 'completed') return t('完成');
+    if (isTaskActivelyProcessing(task)) return t('{done}/{total} 解析中', { done: donePages, total: task.pageCount || 1 });
+    if (shouldResumeTask(task)) return t('{done}/{total} 可继续', { done: donePages, total: task.pageCount || 1 });
+    if (task.status === 'error') return t('失败');
+    return t('待解析');
 }
 
 function resultPaneTitle(task) {
-    if (task.status === 'completed') return '解析结果';
-    if (task.status === 'processing') return '解析中';
-    if (shouldResumeTask(task)) return '解析中断';
-    if (task.status === 'error') return '解析失败';
-    return '待解析';
+    if (task.status === 'completed') return t('解析结果');
+    if (task.status === 'processing') return t('解析中');
+    if (shouldResumeTask(task)) return t('解析中断');
+    if (task.status === 'error') return t('解析失败');
+    return t('待解析');
 }
 
 function emptyResultText(task) {
-    if (task.status === 'processing') return '正在解析，结果会实时追加到这里。';
-    if (shouldResumeTask(task)) return '上次解析中断，点击“继续解析”从未完成页面恢复。';
-    if (task.status === 'error') return `解析失败：${task.error || '未知错误'}`;
-    return '点击“开始解析”生成 Markdown 或 JSON 结果。';
+    if (task.status === 'processing') return t('正在解析，结果会实时追加到这里。');
+    if (shouldResumeTask(task)) return t('上次解析中断，点击“继续解析”从未完成页面恢复。');
+    if (task.status === 'error') return t('解析失败：{detail}', { detail: task.error || t('未知错误') });
+    return t('点击“开始解析”生成 Markdown 或 JSON 结果。');
 }
 
 function sourceLabel(task) {
-    if (task.sourceKind === 'office') return `Office 已转 PDF · ${task.originalName}`;
-    if (task.sourceKind === 'image') return '图片';
+    if (task.sourceKind === 'office') return t('Office 已转 PDF · {name}', { name: task.originalName });
+    if (task.sourceKind === 'image') return t('图片');
     return 'PDF';
+}
+
+function taskSourceMeta(task) {
+    return `${sourceLabel(task)} · ${formatSize(task.size)} · ${formatPageCount(task.pageCount || 1)}`;
+}
+
+function formatPageCount(count) {
+    if (currentLanguage === 'en') {
+        return `${count} ${Number(count) === 1 ? 'page' : 'pages'}`;
+    }
+    return t('{count} 页', { count });
 }
 
 function getExtension(filename) {
@@ -3526,7 +3779,7 @@ function formatDate(timestamp) {
     const date = new Date(timestamp);
     const now = new Date();
     const sameYear = date.getFullYear() === now.getFullYear();
-    return date.toLocaleString('zh-CN', {
+    return date.toLocaleString(languageLocale(), {
         month: '2-digit',
         day: '2-digit',
         hour: '2-digit',
@@ -3536,17 +3789,15 @@ function formatDate(timestamp) {
 }
 
 function formatSize(bytes = 0) {
-    if (!bytes) return '未知大小';
+    if (!bytes) return t('未知大小');
     if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
     return `${(bytes / 1024 / 1024).toFixed(2)}MB`;
 }
 
 function formatPageLabel(startPage, endPage = startPage) {
-    const prefix = '\u7b2c';
-    const suffix = '\u9875';
     return startPage === endPage
-        ? `${prefix} ${startPage} ${suffix}`
-        : `${prefix} ${startPage}-${endPage} ${suffix}`;
+        ? t('第 {start} 页', { start: startPage })
+        : t('第 {start}-{end} 页', { start: startPage, end: endPage });
 }
 
 function safeDownloadName(name, ext) {

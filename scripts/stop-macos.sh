@@ -20,7 +20,7 @@ stop_pid_file() {
     echo "$name pid file was invalid."
   elif kill -0 "$pid" >/dev/null 2>&1; then
     local command
-    command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    command="$(ps -ww -p "$pid" -o command= 2>/dev/null || true)"
     if [[ "$command" != *"$expected_command"* ]]; then
       echo "$name pid $pid belongs to another process; leaving it alone."
       rm -f "$pid_file"
@@ -47,6 +47,7 @@ stop_pid_file() {
 
 stop_pid_file run/pandocr-web.pid "PaddleOCR Local Web service" "server.py"
 stop_pid_file run/paddlex.pid "PaddleX service" "paddlex --serve"
+stop_pid_file run/ppocrv6.pid "PP-OCRv6 service" "paddlex --serve"
 stop_pid_file run/mlx-vlm.pid "MLX-VLM service" "mlx_vlm.server"
 
 rm -f run/macos-services.env run/macos-services.expected.env

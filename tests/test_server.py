@@ -105,10 +105,29 @@ class ServerTaskApiTests(unittest.TestCase):
         self.assertIn("paddleocr-vl-1.6", payload["models"])
         self.assertIn("pp-ocrv6", payload["models"])
         self.assertIn("controlAvailable", payload)
+        self.assertIn("ocrActiveCount", payload)
+        self.assertIn("maxConcurrentOcr", payload)
 
     def test_model_runtime_switch_requires_docker_control(self):
         with patch.object(self.server, "model_control_available", return_value=False):
             response = self.client.post("/api/model-runtime/switch", json={"modelId": "pp-ocrv6"})
+        self.assertEqual(response.status_code, 503)
+
+    def test_cross_origin_mutation_is_rejected_without_allowlisted_origin(self):
+        response = self.client.post(
+            "/api/model-runtime/switch",
+            json={"modelId": "pp-ocrv6"},
+            headers={"Origin": "https://evil.example"},
+        )
+        self.assertEqual(response.status_code, 403)
+
+    def test_allowlisted_origin_can_reach_api(self):
+        with patch.object(self.server, "model_control_available", return_value=False):
+            response = self.client.post(
+                "/api/model-runtime/switch",
+                json={"modelId": "pp-ocrv6"},
+                headers={"Origin": "http://localhost:8000"},
+            )
         self.assertEqual(response.status_code, 503)
 
     def test_invalid_task_id_is_rejected(self):
@@ -274,6 +293,17 @@ class ServerTaskApiTests(unittest.TestCase):
             self.assertEqual(response.status_code, 409)
         finally:
             self.server.ocr_active_count = 0
+
+    def test_ocr_request_is_rejected_during_model_switch(self):
+        self.server.set_model_runtime_operation("switching", "Switching to pp-ocrv6", "pp-ocrv6")
+        try:
+            response = self.client.post(
+                "/api/paddleocr-vl-1.6",
+                json={"image": "AA==", "fileType": 1},
+            )
+            self.assertEqual(response.status_code, 409)
+        finally:
+            self.server.set_model_runtime_operation("idle", "", "paddleocr-vl-1.6")
 
 
 if __name__ == "__main__":
