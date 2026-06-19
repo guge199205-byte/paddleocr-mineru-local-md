@@ -3119,7 +3119,6 @@ function renderMathWhenReady(container, retries = 20) {
     } catch (e) {
         console.warn('KaTeX render error:', e);
     }
-    });
 }
 
 function renderOfficialLayoutResult(task) {
