@@ -1,8 +1,18 @@
-# PaddleOCR Local - PaddleOCR-VL & PP-OCRv6 WebUI
+# PaddleOCR Local - PaddleOCR-VL & PP-OCRv6 & MinerU WebUI
 
 **Language / 语言**: [简体中文](README.md) | English
 
-PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL and PP-OCRv6. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate PaddleOCR services. The NVIDIA path uses official Docker services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
+PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL, PP-OCRv6, and MinerU. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate PaddleOCR services. The NVIDIA path uses official Docker services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
+
+**Three supported models:**
+
+| Model | Use case | Notes |
+|-------|----------|-------|
+| PaddleOCR-VL 1.6 | Document parsing | Layout analysis, tables, formulas, seal recognition |
+| PP-OCRv6 | Text recognition | Lightweight text-only OCR |
+| MinerU | Document parsing | MinerU2.5-Pro-2605-1.2B, hybrid engine |
+
+On single-GPU deployments, the WebUI model selector automatically manages container start/stop, so only one model occupies VRAM at a time.
 
 <img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/85a247a0-c796-4a20-b596-1cc4148df964" />
 
@@ -40,24 +50,29 @@ Browser
        - Office to PDF conversion
        - PaddleOCR-VL request proxy
        - PP-OCRv6 OCR request proxy
+       - MinerU request proxy
   -> PaddleOCR services
        - NVIDIA: paddleocr-vl-api + paddleocr-ocr-api + paddleocr-vlm-server in docker compose
        - macOS: local paddlex --serve, optionally with mlx_vlm.server
+  -> MinerU service
+       - NVIDIA: mineru-api in docker compose (profile: mineru)
 ```
 
-The NVIDIA Compose stack keeps four services:
+The NVIDIA Compose stack keeps five services:
 
 - `pandocr-web`
 - `paddleocr-vl-api`
 - `paddleocr-ocr-api`
 - `paddleocr-vlm-server`
+- `mineru-api` (Docker profile `mineru`, must be explicitly enabled)
 
-For single-GPU machines, the Docker deployment keeps only one OCR model hot-loaded by default. `pandocr-web` stays online and controls the model containers through the Docker socket: selecting `PaddleOCR-VL 1.6` starts `paddleocr-vlm-server` + `paddleocr-vl-api` and stops `paddleocr-ocr-api`; selecting `PP-OCRv6` does the reverse. The UI polls this runtime state in real time.
+For single-GPU machines, the Docker deployment keeps only one OCR model hot-loaded by default. `pandocr-web` stays online and controls the model containers through the Docker socket: selecting `PaddleOCR-VL 1.6` starts `paddleocr-vlm-server` + `paddleocr-vl-api` and stops other model containers; selecting `PP-OCRv6` or `MinerU` does the reverse. The top bar UI polls this runtime state in real time, showing whether the model is ready, starting, stopped, or failed.
 
 ## Features
 
 - Supports image, PDF, PPT/PPTX, and DOC/DOCX uploads.
-- Supports model switching between `PaddleOCR-VL 1.6` document parsing and `PP-OCRv6` text OCR, with Docker-based on-demand start/stop for single-GPU deployments.
+- Supports model switching between `PaddleOCR-VL 1.6` document parsing, `PP-OCRv6` text OCR, and `MinerU` document parsing; Docker single-GPU deployments start and stop models on demand to avoid multiple models consuming VRAM simultaneously.
+- The left "Parsing Settings" panel automatically switches based on the currently selected model: PaddleOCR models show options for layout detection, chart recognition, document rectification, seal recognition, etc.; MinerU shows options for formula parsing, table parsing, image analysis, parsing method, etc.
 - The WebUI supports one-click Chinese/English switching, remembers the user's choice, and keeps translations centralized in `static/i18n.js` for future languages.
 - Sends PDFs to PaddleOCR-VL page by page, making it easier to compare with the official online parsing result and reliably keep the raw JSON for each page.
 - Renders PP-OCRv6 results with an official-style visual OCR layer: source/result pages stay aligned, scrolling and zooming are synchronized, recognized text can be copied or corrected, and raw JSON remains available.
@@ -81,7 +96,7 @@ For Windows NVIDIA users, the recommended path is the one-click script:
 .\windows-one-click.bat
 ```
 
-It checks Docker, detects the NVIDIA GPU, selects `env.txt` or `env.docker`, pulls the official PaddleOCR-VL images, builds `pandocr-web`, clears old containers, creates all model containers without starting both models, starts the WebUI, waits for the active model health check, and prints key `paddleocr-vlm-server`, `paddleocr-vl-api`, `paddleocr-ocr-api`, and `pandocr-web` logs on failure.
+It checks Docker, detects the NVIDIA GPU, selects `env.txt` or `env.docker`, pulls the official PaddleOCR-VL images, builds `pandocr-web`, clears old containers, creates all model containers without starting both models, starts the WebUI, and waits for the active model health check.
 
 Useful one-click options:
 
@@ -103,29 +118,59 @@ Choose the environment file based on your GPU model:
 
 The commands below use `env.txt` for RTX 50 series as an example. For RTX 30/40 series, replace `env.txt` with `env.docker`.
 
-```powershell
+**Step 1: Pull official PaddleOCR images and build local services**
+
+```bash
 docker compose --env-file env.txt pull paddleocr-vlm-server paddleocr-vl-api
 docker compose --env-file env.txt build paddleocr-ocr-api pandocr-web
+```
+
+**Step 2: Build the MinerU image (optional, only if you need MinerU)**
+
+```bash
+# Use China mirror for faster downloads
+docker build -t mineru:latest https://github.com/opendatalab/MinerU.git#master:docker/china
+
+# Or use the international source
+# docker build -t mineru:latest https://github.com/opendatalab/MinerU.git#master:docker/global
+```
+
+> The MinerU image is based on vllm/vllm-openai, approximately 13GB in size, and takes 15-30 minutes to build (including model weight downloads).
+
+**Step 3: Create and start containers**
+
+```bash
+# Create all containers (without starting)
 docker compose --env-file env.txt up -d --no-start
+
+# If you built the MinerU image, also create the mineru-api container
+docker compose --env-file env.txt --profile mineru up -d --no-start mineru-api
+
+# Start only the WebUI (it will start/stop model containers on demand)
 docker compose --env-file env.txt start pandocr-web
 ```
 
-Keep this `up -d --no-start` then `start pandocr-web` order for single-GPU deployments. Starting the whole compose stack with a plain `docker compose up -d` can hot-load PaddleOCR-VL and PP-OCRv6 at the same time and waste VRAM. After the WebUI is online, use the top-right model selector to switch models; the UI calls `/api/model-runtime/switch`, starts only the selected model containers, stops the inactive model containers, and keeps the runtime badge synchronized with the real container state.
+Keep this `up -d --no-start` then `start pandocr-web` order for single-GPU deployments. Starting the whole compose stack with a plain `docker compose up -d` can hot-load multiple models at the same time and waste VRAM. After the WebUI is online, use the top-right model selector to switch models; the UI calls `/api/model-runtime/switch`, starts only the selected model containers, stops the inactive model containers, and keeps the top bar runtime badge synchronized with the real container state.
 
 Open:
 
-- WebUI: http://localhost:8000
+- WebUI: http://localhost:18000 (default port, configurable via `PANDOCR_PORT` in `env.txt`)
 - PaddleOCR-VL API health: http://localhost:8081/health, available when `PaddleOCR-VL 1.6` is the active model.
 - PP-OCRv6 API health: http://localhost:8082/health, available when `PP-OCRv6` is the active model.
+- MinerU API health: http://localhost:8083/health, available when `MinerU` is the active model.
 
-By default, Compose binds the WebUI and OCR APIs only to `127.0.0.1` to avoid unauthorized LAN access. `pandocr-web` mounts `/var/run/docker.sock` so it can start and stop only the model containers defined in this compose file; treat this as Docker host management access and do not expose the WebUI to untrusted networks without additional controls.
+**LAN access:**
+
+By default, the port binds to `0.0.0.0`, so other devices on the LAN can access the WebUI via `http://<your-IP>:18000`. `PANDOCR_CORS_ORIGINS` must include the LAN access address.
+
+`pandocr-web` mounts `/var/run/docker.sock` so it can start and stop only the model containers defined in this compose file; treat this as Docker host management access and do not expose the WebUI to untrusted networks without additional controls.
 
 Check status:
 
 ```powershell
 docker compose --env-file env.txt ps
-curl http://localhost:8000/api/model-runtime
-curl http://localhost:8000/api/models
+curl http://localhost:18000/api/model-runtime
+curl http://localhost:18000/api/models
 ```
 
 Common environment variables:
@@ -143,12 +188,15 @@ PANDOCR_MODEL_CONTROL=docker
 PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
 PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
-PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+PANDOCR_CORS_ORIGINS=http://localhost:18000,http://127.0.0.1:18000
+PANDOCR_PORT=18000
 PANDOCR_MAX_UPLOAD_MB=512
 PANDOCR_MAX_CONCURRENT_OCR=1
 PANDOCR_ENFORCE_ORIGIN_CHECK=1
 PANDOCR_API_TOKEN=
 PANDOCR_ENABLE_API_DOCS=0
+MINERU_SERVICE_URL=http://mineru-api:8000
+MINERU_MODEL_NAME=MinerU2.5-Pro-2605-1.2B
 ```
 
 RTX 30/40 series and other non-Blackwell NVIDIA GPUs should use `env.docker`, where both image tags are `latest-nvidia-gpu-offline`.
@@ -261,19 +309,17 @@ If the port is occupied, for example to move the WebUI to `18000`:
 PANDOCR_PORT=18000 make mac-up
 ```
 
-Local benchmark reference after model caching, excluding first download and cold startup:
+## MinerU Integration
 
-| Item | Result |
-| --- | --- |
-| Device | MacBook Pro, Apple M4 Pro, 12-core CPU (8P+4E), 24GB memory |
-| System | macOS 26.5.1, arm64 |
-| Environment | Python 3.12.13, PaddlePaddle 3.3.0, PaddleOCR 3.7.0, PaddleX 3.7.1, mlx-vlm 0.6.3 |
-| Startup mode | `make mac-up-mlx` |
-| Test input | 17KB PNG image, end-to-end request through the WebUI backend `/api/paddleocr-vl-1.6` |
-| Five runs | 1.73s / 1.74s / 1.75s / 1.76s / 1.78s |
-| Average time | About 1.75s |
+This project integrates the [MinerU](https://github.com/opendatalab/MinerU) document parsing service on top of the original PaddleOCR version. The integration covers four areas:
 
-Complex PDFs, table/formula-heavy pages, large images, and native mode will be noticeably slower. The first run also needs to download `PP-DocLayoutV3`, `PaddleOCR-VL-1.6-0.9B`, and MLX model weights, with time mainly determined by network and disk speed.
+1. **Backend** (`server.py`): Registers the `mineru` model in `MODEL_RUNTIME_CONFIG` and `model_catalog()`, adds the `/api/mineru` proxy route that forwards WebUI requests as MinerU's `multipart/form-data` format to the `mineru-api` `/file_parse` endpoint, and converts MinerU responses to the paddleocr-local unified format.
+
+2. **Frontend** (`index.html` + `app.js`): The left "Parsing Settings" panel dynamically switches based on the currently selected model -- PaddleOCR models show options for layout detection, chart recognition, document rectification, seal recognition, etc.; MinerU shows options for formula parsing, table parsing, image analysis, parsing method, etc.
+
+3. **Docker** (`docker-compose.yml`): Adds the `mineru-api` service using `profiles: ["mineru"]` so it does not start with a default `docker compose up`. You must build the MinerU image first, then explicitly enable the profile to create the container.
+
+4. **Model switching**: Consistent with other models. When the WebUI model selector switches to MinerU, it automatically stops the current model container and starts `mineru-api`, waiting for the health check to pass before marking it as ready.
 
 ## Main APIs
 
@@ -289,51 +335,52 @@ Complex PDFs, table/formula-heavy pages, large images, and native mode will be n
 - `POST /api/convert/to-pdf`: Converts PPT/PPTX/DOC/DOCX to PDF.
 - `POST /api/paddleocr-vl-1.6`: Proxies OCR requests to the PaddleOCR-VL layout-parsing service.
 - `POST /api/pp-ocrv6`: Proxies OCR requests to the PP-OCRv6 service and returns page images, recognized text lines, boxes, scores, and raw JSON.
+- `POST /api/mineru`: Proxies OCR requests to the MinerU `/file_parse` service and returns Markdown and extracted images.
 - `GET /api/openapi.json`: OpenAPI JSON for this WebUI backend. `paddle-layout-openapi.json` in the repo documents the upstream Paddle layout-parsing service.
 
 ## Project Structure
 
 ```text
 .
-|-- server.py
-|-- requirements.txt
-|-- requirements-macos.txt
-|-- requirements-macos-mlx.txt
-|-- macos-one-click.command
-|-- windows-one-click.bat
-|-- Dockerfile
-|-- Dockerfile.ocr
-|-- docker-compose.yml
-|-- data/                  # Local task data directory, not committed by default
-|-- env.txt
-|-- env.docker
-|-- pipeline_config_ocr_v6.yaml
-|-- pipeline_config_vllm.yaml
-|-- pipeline_config_macos_mlx.template.yaml
-|-- scripts/               # Deployment helper scripts
-|   |-- windows-one-click.ps1
-|-- static/
-|   |-- index.html
-|   |-- app.js
-|   |-- style.css
-|   `-- vendor/katex/
-|-- QUICKSTART.md
-|-- webui-openapi.json
-|-- paddle-layout-openapi.json
-|-- DOCKER_DEPLOY.md
-`-- PROJECT_SUMMARY.md
+├── server.py                  # FastAPI backend (including MinerU proxy)
+├── requirements.txt
+├── requirements-macos.txt
+├── requirements-macos-mlx.txt
+├── macos-one-click.command
+├── windows-one-click.bat
+├── Dockerfile                 # pandocr-web image
+├── Dockerfile.ocr             # paddleocr-ocr-api image
+├── docker-compose.yml         # includes mineru-api service (profile: mineru)
+├── data/                      # Local task data directory, not committed by default
+├── env.txt                    # RTX 50 / Blackwell environment variables
+├── env.docker                 # RTX 30 / 40 environment variables
+├── pipeline_config_ocr_v6.yaml
+├── pipeline_config_vllm.yaml
+├── pipeline_config_macos_mlx.template.yaml
+├── scripts/                   # Deployment helper scripts
+│   ├── windows-one-click.ps1
+├── static/
+│   ├── index.html             # includes MinerU-specific settings panel
+│   ├── app.js                 # includes MinerU model switching and request logic
+│   ├── style.css
+│   └── vendor/katex/
+├── QUICKSTART.md
+├── webui-openapi.json
+├── paddle-layout-openapi.json
+├── DOCKER_DEPLOY.md
+└── PROJECT_SUMMARY.md
 ```
 
 ## Local Development
 
-When running `server.py` locally outside Docker, set `PANDOCR_MODEL_CONTROL=none` and start the model services yourself. You need an existing PaddleOCR-VL service listening at `http://localhost:8081/layout-parsing`. To use PP-OCRv6 locally, also start a PaddleX OCR service at `http://localhost:8082/ocr` or set `PADDLE_OCR_SERVICE_URL`.
+When running `server.py` locally outside Docker, set `PANDOCR_MODEL_CONTROL=none` and start the model services yourself. You need an existing PaddleOCR-VL service listening at `http://localhost:8081/layout-parsing`. To use PP-OCRv6 locally, also start a PaddleX OCR service at `http://localhost:8082/ocr` or set `PADDLE_OCR_SERVICE_URL`. To use MinerU locally, start a MinerU API service at `http://localhost:8083` or set `MINERU_SERVICE_URL`.
 
 ```powershell
 pip install -r requirements.txt
 python server.py
 ```
 
-Then open http://localhost:8000.
+Then open http://localhost:18000.
 
 Run the local quality gate:
 

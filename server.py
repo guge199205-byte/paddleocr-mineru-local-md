@@ -49,6 +49,8 @@ PADDLE_SERVICE_URL = os.getenv("PADDLE_SERVICE_URL", "http://localhost:8081/layo
 PADDLEOCR_VL_MODEL_NAME = os.getenv("PADDLEOCR_VL_MODEL_NAME", "PaddleOCR-VL-1.6-0.9B")
 PADDLE_OCR_SERVICE_URL = os.getenv("PADDLE_OCR_SERVICE_URL", "http://localhost:8082/ocr")
 PPOCR_V6_MODEL_NAME = os.getenv("PPOCR_V6_MODEL_NAME", "PP-OCRv6_medium")
+MINERU_SERVICE_URL = os.getenv("MINERU_SERVICE_URL", "http://localhost:8083")
+MINERU_MODEL_NAME = os.getenv("MINERU_MODEL_NAME", "MinerU2.5-Pro-2605-1.2B")
 PADDLE_REQUEST_TIMEOUT = float(os.getenv("PADDLE_REQUEST_TIMEOUT", "3600"))
 PROJECT_ROOT = Path(__file__).resolve().parent
 TASK_DATA_DIR = Path(os.getenv("PANDOCR_TASK_DATA_DIR", "data/tasks")).resolve()
@@ -85,6 +87,12 @@ MODEL_RUNTIME_CONFIG = {
         "stop_order": ["paddleocr-ocr-api"],
         "health_url": PADDLE_OCR_SERVICE_URL.rsplit("/", 1)[0] + "/health",
     },
+    "mineru": {
+        "containers": ["mineru-api"],
+        "start_order": ["mineru-api"],
+        "stop_order": ["mineru-api"],
+        "health_url": f"{MINERU_SERVICE_URL}/health",
+    },
 }
 DEFAULT_RUNTIME_MODEL_ID = MODEL_RUNTIME_STARTUP if MODEL_RUNTIME_STARTUP in MODEL_RUNTIME_CONFIG else "paddleocr-vl-1.6"
 
@@ -120,6 +128,13 @@ def model_catalog() -> list[dict]:
             "label": "PP-OCRv6",
             "kind": "text_ocr",
             "endpoint": "/api/pp-ocrv6",
+        },
+        {
+            "id": "mineru",
+            "name": MINERU_MODEL_NAME,
+            "label": "MinerU",
+            "kind": "document_parsing",
+            "endpoint": "/api/mineru",
         },
     ]
 
@@ -1439,6 +1454,97 @@ async def proxy_ppocrv6(request: Request):
         raise
     except Exception as e:
         logger.exception("PP-OCRv6 Proxy Error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
+    """Proxy request to MinerU API Service (multipart /file_parse)."""
+    await acquire_ocr_slot(
+        "mineru",
+        "MinerU service is not ready. Switch to this model and wait for it to become ready.",
+    )
+    try:
+        file_bytes = raw_input_to_bytes(raw_input)
+        file_type = ocr_request.fileType
+
+        filename = "upload.pdf" if file_type == 0 else "upload.png"
+
+        files_payload = {"files": (filename, file_bytes)}
+        data_payload = {
+            "return_md": "true",
+            "return_images": "true",
+            "formula_enable": str(ocr_request.useChartRecognition).lower(),
+            "table_enable": "true",
+            "image_analysis": str(ocr_request.useChartRecognition).lower(),
+            "parse_method": "auto",
+        }
+        if ocr_request.useLayoutDetection:
+            data_payload["backend"] = "hybrid-engine"
+        else:
+            data_payload["backend"] = "pipeline"
+
+        logger.info("Sending request to MinerU Service at %s/file_parse", MINERU_SERVICE_URL)
+        timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{MINERU_SERVICE_URL}/file_parse",
+                files=files_payload,
+                data=data_payload,
+            )
+
+            if resp.status_code != 200:
+                logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                raise HTTPException(status_code=resp.status_code, detail=f"Upstream MinerU error: {resp.text}")
+
+            return parse_mineru_response(resp.json())
+    finally:
+        await release_ocr_slot()
+
+
+def parse_mineru_response(data: dict) -> dict:
+    """Convert MinerU /file_parse response to paddleocr-local format."""
+    results = data.get("results") or {}
+    full_markdown = ""
+    all_images = {}
+    layout_results = []
+
+    for doc_name, doc_result in results.items():
+        if not isinstance(doc_result, dict):
+            continue
+        md_content = doc_result.get("md_content") or ""
+        if md_content:
+            full_markdown += md_content + "\n\n"
+        images = doc_result.get("images") or {}
+        for img_name, img_data in images.items():
+            if img_data.startswith("data:"):
+                all_images[img_name] = img_data.split(",", 1)[1] if "," in img_data else img_data
+            else:
+                all_images[img_name] = img_data
+        layout_results.append({
+            "markdown": {"text": md_content, "images": images},
+            "source": "mineru",
+            "document": doc_name,
+        })
+
+    return {
+        "markdown": full_markdown,
+        "images": all_images,
+        "layoutParsingResults": layout_results,
+    }
+
+
+@app.post("/api/mineru")
+async def proxy_mineru(request: Request):
+    """Proxy request to MinerU Document Parsing Service."""
+    try:
+        ocr_request, raw_image = await parse_ocr_input(request)
+        base64_size = validate_proxy_input_size(raw_image)
+        logger.info("Received MinerU request. Base64 input size: %s bytes", base64_size)
+        return await run_mineru_request(ocr_request, raw_image)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("MinerU Proxy Error")
         raise HTTPException(status_code=500, detail=str(e))
 
 

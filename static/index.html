@@ -62,7 +62,7 @@
                             解析设置
                         </span>
                     </summary>
-                    <div class="settings-grid">
+                    <div class="settings-grid" id="paddleocr-settings">
                         <label><input type="checkbox" id="chart-recognition-switch"> 图表解析</label>
                         <label><input type="checkbox" id="doc-unwarping-switch"> 文档矫正</label>
                         <label><input type="checkbox" id="doc-orientation-switch"> 方向识别</label>
@@ -75,6 +75,23 @@
                         <label class="setting-number">
                             <span>每批页数</span>
                             <input type="number" id="pdf-batch-size-input" min="1" max="400" step="1" value="1" inputmode="numeric">
+                        </label>
+                    </div>
+                    <div class="settings-grid hidden" id="mineru-settings">
+                        <label><input type="checkbox" id="mineru-formula-switch" checked> 公式解析</label>
+                        <label><input type="checkbox" id="mineru-table-switch" checked> 表格解析</label>
+                        <label><input type="checkbox" id="mineru-image-switch" checked> 图片分析</label>
+                        <label>
+                            <span>解析方式</span>
+                            <select id="mineru-parse-method">
+                                <option value="auto" selected>自动</option>
+                                <option value="txt">文本模式</option>
+                                <option value="ocr">OCR 模式</option>
+                            </select>
+                        </label>
+                        <label class="setting-number">
+                            <span>每批页数</span>
+                            <input type="number" id="pdf-batch-size-input-mineru" min="1" max="400" step="1" value="1" inputmode="numeric">
                         </label>
                     </div>
                 </details>

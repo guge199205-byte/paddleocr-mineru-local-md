@@ -540,6 +540,7 @@ function renderModelSelect() {
         option.selected = model.id === selectedModelId;
         els.modelSelect.appendChild(option);
     });
+    updateSettingsPanelForModel(selectedModelId);
 }
 
 function syncSelectedModelWithRuntime() {
@@ -575,6 +576,7 @@ async function handleModelSelectionChange() {
     const previousModelId = selectedModelId;
     selectedModelId = nextModelId;
     localStorage.setItem(MODEL_STORAGE_KEY, selectedModelId);
+    updateSettingsPanelForModel(nextModelId);
     updateActiveModelDisplay(getActiveTask());
     updateActionState(getActiveTask());
     const switched = await switchModelRuntime(nextModelId, { wait: false });
@@ -582,9 +584,19 @@ async function handleModelSelectionChange() {
         selectedModelId = previousModelId;
         localStorage.setItem(MODEL_STORAGE_KEY, selectedModelId);
         renderModelSelect();
+        updateSettingsPanelForModel(selectedModelId);
         updateActiveModelDisplay(getActiveTask());
         updateActionState(getActiveTask());
     }
+}
+
+function updateSettingsPanelForModel(modelId) {
+    const paddleocrSettings = document.getElementById('paddleocr-settings');
+    const mineruSettings = document.getElementById('mineru-settings');
+    if (!paddleocrSettings || !mineruSettings) return;
+    const isMineru = modelId === 'mineru';
+    paddleocrSettings.classList.toggle('hidden', isMineru);
+    mineruSettings.classList.toggle('hidden', !isMineru);
 }
 
 function getSelectedModel() {
@@ -2452,12 +2464,15 @@ function refreshTaskUi(task) {
 
 async function callOCR(batch, task) {
     const model = getTaskModel(task);
+    const isMineru = model.id === 'mineru';
     const ignoreLabels = [];
-    if (els.ignoreNumberSwitch.checked) ignoreLabels.push('number');
-    ignoreLabels.push('footnote');
-    if (els.ignoreHeaderSwitch.checked) ignoreLabels.push('header', 'header_image');
-    if (els.ignoreFooterSwitch.checked) ignoreLabels.push('footer', 'footer_image');
-    ignoreLabels.push('aside_text');
+    if (!isMineru) {
+        if (els.ignoreNumberSwitch.checked) ignoreLabels.push('number');
+        ignoreLabels.push('footnote');
+        if (els.ignoreHeaderSwitch.checked) ignoreLabels.push('header', 'header_image');
+        if (els.ignoreFooterSwitch.checked) ignoreLabels.push('footer', 'footer_image');
+        ignoreLabels.push('aside_text');
+    }
 
     const formData = new FormData();
     const filename = batch.fileType === 0 ? `${batch.id}.pdf` : `${batch.id}.image`;
@@ -2469,15 +2484,25 @@ async function callOCR(batch, task) {
         throw new Error(t('无法重建当前批次的解析 payload'));
     }
     formData.append('fileType', String(batch.fileType));
-    formData.append('useLayoutDetection', 'true');
-    formData.append('useChartRecognition', String(els.chartRecognitionSwitch.checked));
-    formData.append('useDocUnwarping', String(els.docUnwarpingSwitch.checked));
-    formData.append('useDocOrientationClassify', String(els.docOrientationSwitch.checked));
-    formData.append('useSealRecognition', String(els.sealRecognitionSwitch.checked));
-    formData.append('formatBlockContent', 'true');
-    formData.append('showFormulaNumber', String(els.formulaNumberSwitch.checked));
-    formData.append('markdownIgnoreLabels', JSON.stringify(ignoreLabels));
-    formData.append('modelId', model.id);
+
+    if (isMineru) {
+        formData.append('useChartRecognition', String(document.getElementById('mineru-image-switch')?.checked ?? true));
+        formData.append('useLayoutDetection', 'true');
+        formData.append('useSealRecognition', 'true');
+        formData.append('formatBlockContent', 'true');
+        formData.append('showFormulaNumber', 'true');
+        formData.append('modelId', model.id);
+    } else {
+        formData.append('useLayoutDetection', 'true');
+        formData.append('useChartRecognition', String(els.chartRecognitionSwitch.checked));
+        formData.append('useDocUnwarping', String(els.docUnwarpingSwitch.checked));
+        formData.append('useDocOrientationClassify', String(els.docOrientationSwitch.checked));
+        formData.append('useSealRecognition', String(els.sealRecognitionSwitch.checked));
+        formData.append('formatBlockContent', 'true');
+        formData.append('showFormulaNumber', String(els.formulaNumberSwitch.checked));
+        formData.append('markdownIgnoreLabels', JSON.stringify(ignoreLabels));
+        formData.append('modelId', model.id);
+    }
 
     const response = await apiFetch(modelApiUrl(model), {
         method: 'POST',

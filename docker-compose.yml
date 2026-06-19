@@ -32,7 +32,7 @@ services:
     image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:${API_IMAGE_TAG_SUFFIX:-latest-nvidia-gpu-offline}
     container_name: paddleocr-vl-api
     ports:
-      - "127.0.0.1:8081:8080"
+      - "0.0.0.0:8081:8080"
     depends_on:
       paddleocr-vlm-server:
         condition: service_healthy
@@ -72,7 +72,7 @@ services:
     image: pandocr-ocr-api:latest
     container_name: paddleocr-ocr-api
     ports:
-      - "127.0.0.1:8082:8080"
+      - "0.0.0.0:8082:8080"
     environment:
       - PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True
     deploy:
@@ -98,6 +98,41 @@ services:
     networks:
       - paddleocr-network
 
+  mineru-api:
+    image: mineru:latest
+    container_name: mineru-api
+    profiles: ["mineru"]
+    ports:
+      - "0.0.0.0:8083:8000"
+    environment:
+      MINERU_MODEL_SOURCE: local
+    entrypoint: mineru-api
+    command:
+      --host 0.0.0.0
+      --port 8000
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    ipc: host
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PANDOCR_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    volumes:
+      - ./model_cache_mineru:/root/.mineru
+    networks:
+      - paddleocr-network
+
   pandocr-web:
     pull_policy: build
     build:
@@ -106,7 +141,7 @@ services:
     image: pandocr-web:latest
     container_name: pandocr-web
     ports:
-      - "127.0.0.1:8000:8000"
+      - "${PANDOCR_PORT:-18000}:8000"
     restart: unless-stopped
     environment:
       - PADDLE_SERVICE_URL=http://paddleocr-vl-api:8080/layout-parsing
@@ -124,6 +159,8 @@ services:
       - PANDOCR_ENFORCE_ORIGIN_CHECK=${PANDOCR_ENFORCE_ORIGIN_CHECK:-1}
       - PANDOCR_API_TOKEN=${PANDOCR_API_TOKEN:-}
       - PANDOCR_ENABLE_API_DOCS=${PANDOCR_ENABLE_API_DOCS:-0}
+      - MINERU_SERVICE_URL=${MINERU_SERVICE_URL:-http://mineru-api:8000}
+      - MINERU_MODEL_NAME=${MINERU_MODEL_NAME:-MinerU2.5-Pro-2605-1.2B}
     volumes:
       - ./static:/app/static
       - ./server.py:/app/server.py
