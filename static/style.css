@@ -1013,18 +1013,56 @@ svg {
     overflow-wrap: break-word;
     font-family: -apple-system, "Noto Sans SC", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif;
 }
+.markdown-preview h1 { font-size: 1.6em; margin: 0.8em 0 0.4em; border-bottom: 1px solid var(--line); padding-bottom: 0.3em; }
+.markdown-preview h2 { font-size: 1.3em; margin: 0.6em 0 0.3em; border-bottom: 1px solid var(--line); padding-bottom: 0.2em; }
+.markdown-preview h3 { font-size: 1.15em; margin: 0.5em 0 0.25em; }
+.markdown-preview h4 { font-size: 1em; margin: 0.4em 0 0.2em; }
+.markdown-preview h5, .markdown-preview h6 { font-size: 0.9em; margin: 0.3em 0 0.15em; color: #555; }
+.markdown-preview p { margin: 0.4em 0; }
+.markdown-preview ul, .markdown-preview ol { margin: 0.4em 0; padding-left: 1.8em; }
+.markdown-preview li { margin: 0.15em 0; }
+.markdown-preview blockquote { border-left: 3px solid var(--brand); padding: 0.3em 1em; margin: 0.5em 0; background: var(--panel-soft); color: #555; }
+.markdown-preview hr { border: none; border-top: 1px solid var(--line); margin: 1em 0; }
+.markdown-preview img { max-width: 100%; height: auto; border-radius: 4px; margin: 0.5em 0; }
 .markdown-preview table {
     overflow-x: auto;
     display: block;
     max-width: 100%;
+    border-collapse: collapse;
+    margin: 0.5em 0;
+    font-size: 0.95em;
 }
+.markdown-preview th, .markdown-preview td {
+    border: 1px solid var(--line);
+    padding: 6px 10px;
+    text-align: left;
+}
+.markdown-preview th { background: var(--panel-soft); font-weight: 600; }
+.markdown-preview tr:nth-child(even) td { background: rgba(0,0,0,0.02); }
 .markdown-preview pre {
     overflow-x: auto;
     max-width: 100%;
+    background: #f5f5f5;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 12px;
+    margin: 0.5em 0;
+    font-size: 0.9em;
+    line-height: 1.5;
 }
 .markdown-preview code {
     word-break: break-all;
+    font-family: "JetBrains Mono", "Fira Code", "Consolas", monospace;
 }
+.markdown-preview :not(pre) > code {
+    background: rgba(0,0,0,0.06);
+    padding: 2px 5px;
+    border-radius: 3px;
+    font-size: 0.88em;
+}
+.markdown-preview .katex-display { margin: 0.6em 0; overflow-x: auto; }
+.markdown-preview .katex { font-size: 1.05em; }
+.markdown-preview .equation-number { float: right; color: #888; font-size: 0.85em; }
 
 .markdown-preview.ocr-visual-mode {
     padding: 18px 24px;

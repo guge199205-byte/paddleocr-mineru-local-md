@@ -3062,11 +3062,18 @@ function escapeHtml(value) {
 
 function renderMarkdownHtml(markdown) {
     const { text, math } = stashMathSegments(markdown);
+    if (!marked._pandocrConfigured) {
+        marked.setOptions({
+            breaks: true,
+            gfm: true,
+        });
+        marked._pandocrConfigured = true;
+    }
     let html = marked.parse(text);
     math.forEach((value, index) => {
-        html = html.split(mathToken(index)).join(escapeHtml(value));
+        html = html.split(mathToken(index)).join(value);
     });
-    return window.DOMPurify ? DOMPurify.sanitize(html) : html;
+    return window.DOMPurify ? DOMPurify.sanitize(html, { ADD_TAGS: ['math', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt', 'mroot', 'munder', 'mover', 'munderover', 'mtable', 'mtr', 'mtd', 'mtext', 'mspace', 'mpadded', 'menclose', 'mfenced', 'mstyle', 'annotation'], ADD_ATTR: ['display', 'mathvariant', 'encoding', 'stretchy', 'lspace', 'rspace', 'minsize', 'maxsize', 'movablelimits', 'symmetric', 'largeop', 'accent', 'linethickness', 'scriptlevel', 'displaystyle', 'xmlns'] }) : html;
 }
 
 function stashMathSegments(markdown) {
@@ -3096,16 +3103,22 @@ function renderMathWhenReady(container, retries = 20) {
         if (retries > 0) setTimeout(() => renderMathWhenReady(container, retries - 1), 150);
         return;
     }
-    renderMathInElement(container, {
-        delimiters: [
-            { left: '$$', right: '$$', display: true },
-            { left: '\\[', right: '\\]', display: true },
-            { left: '\\(', right: '\\)', display: false },
-            { left: '$', right: '$', display: false }
-        ],
-        ignoredTags: ['script', 'noscript', 'style', 'textarea'],
-        throwOnError: false,
-        strict: false
+    try {
+        renderMathInElement(container, {
+            delimiters: [
+                { left: '$$', right: '$$', display: true },
+                { left: '\\[', right: '\\]', display: true },
+                { left: '\\(', right: '\\)', display: false },
+                { left: '$', right: '$', display: false }
+            ],
+            ignoredTags: ['script', 'noscript', 'style', 'textarea', 'code', 'pre'],
+            throwOnError: false,
+            strict: false,
+            trust: true,
+        });
+    } catch (e) {
+        console.warn('KaTeX render error:', e);
+    }
     });
 }
 
