@@ -1473,6 +1473,7 @@ async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) ->
         data_payload = {
             "return_md": "true",
             "return_images": "true",
+            "return_content_list": "true",
             "formula_enable": str(ocr_request.useChartRecognition).lower(),
             "table_enable": "true",
             "image_analysis": str(ocr_request.useChartRecognition).lower(),
@@ -1507,6 +1508,7 @@ def parse_mineru_response(data: dict) -> dict:
     full_markdown = ""
     all_images = {}
     layout_results = []
+    all_content_list = []
 
     for doc_name, doc_result in results.items():
         if not isinstance(doc_result, dict):
@@ -1520,17 +1522,31 @@ def parse_mineru_response(data: dict) -> dict:
                 all_images[img_name] = img_data.split(",", 1)[1] if "," in img_data else img_data
             else:
                 all_images[img_name] = img_data
+        content_list = doc_result.get("content_list") or []
+        for item in content_list:
+            if not isinstance(item, dict):
+                continue
+            all_content_list.append({
+                "type": item.get("type", "text"),
+                "text": item.get("text", ""),
+                "page_idx": item.get("page_idx"),
+                "bbox": item.get("bbox"),
+                "img_idx": item.get("img_idx"),
+            })
         layout_results.append({
             "markdown": {"text": md_content, "images": images},
             "source": "mineru",
             "document": doc_name,
         })
 
-    return {
+    response = {
         "markdown": full_markdown,
         "images": all_images,
         "layoutParsingResults": layout_results,
     }
+    if all_content_list:
+        response["contentList"] = all_content_list
+    return response
 
 
 @app.post("/api/mineru")

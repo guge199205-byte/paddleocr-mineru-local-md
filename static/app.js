@@ -1488,6 +1488,9 @@ function renderResultPane(task, { deferJson = false, preserveScroll = true } = {
     const html = renderMarkdownHtml(renderMarkdown);
     els.markdownView.innerHTML = html;
     linkMarkdownToSourceBlocks(task);
+    if (task.modelId === 'mineru' && Array.isArray(task.contentList)) {
+        bindMineruContentClicks(task);
+    }
     renderedMarkdownKey = markdownKey;
     renderMathWhenReady(els.markdownView);
     warmJsonResultCache(task);
@@ -2322,6 +2325,7 @@ async function processTask(task, { confirmCompleted = true } = {}) {
             task.markdown = '';
             task.images = {};
             task.ocrResults = [];
+            task.contentList = [];
             task.batches.forEach((batch) => {
                 batch.status = 'pending';
                 batch.markdown = '';
@@ -2355,6 +2359,10 @@ async function processTask(task, { confirmCompleted = true } = {}) {
             task.ocrResults.push(...normalizeOCRJsonResults(result).map((pageResult, pageIndex) => (
                 compactOCRJsonResult(pageResult, batch, pageIndex)
             )));
+            if (Array.isArray(result.contentList)) {
+                if (!Array.isArray(task.contentList)) task.contentList = [];
+                task.contentList.push(...result.contentList);
+            }
             task.updatedAt = Date.now();
             await saveTask(task);
             refreshTaskUi(task);
@@ -3907,4 +3915,117 @@ function safeDownloadName(name, ext) {
 
 function createId() {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/* MinerU: click-to-locate & editable text */
+function bindMineruContentClicks(task) {
+    const contentList = task.contentList || [];
+    const elements = els.markdownView.querySelectorAll('h1,h2,h3,h4,h5,h6,p,li,td,th,pre,blockquote');
+    let contentIdx = 0;
+
+    elements.forEach((el) => {
+        const text = el.textContent.trim();
+        if (!text) return;
+
+        let matchedItem = null;
+        for (let i = contentIdx; i < contentList.length; i++) {
+            const item = contentList[i];
+            if (item.type === 'text' && item.text && text.includes(item.text.trim())) {
+                matchedItem = item;
+                contentIdx = i;
+                break;
+            }
+        }
+
+        if (matchedItem && matchedItem.bbox && matchedItem.page_idx != null) {
+            el.dataset.mineruPage = String(matchedItem.page_idx);
+            el.dataset.mineruBbox = JSON.stringify(matchedItem.bbox);
+            el.classList.add('mineru-locatable');
+            el.title = t('点击定位到原文，双击编辑');
+
+            el.addEventListener('click', (e) => {
+                if (el.isContentEditable) return;
+                e.preventDefault();
+                highlightMineruSource(matchedItem.page_idx, matchedItem.bbox);
+            });
+
+            el.addEventListener('dblclick', (e) => {
+                e.preventDefault();
+                el.contentEditable = 'true';
+                el.focus();
+                el.classList.add('mineru-editing');
+            });
+
+            el.addEventListener('blur', () => {
+                el.contentEditable = 'false';
+                el.classList.remove('mineru-editing');
+                const newText = el.textContent.trim();
+                if (newText !== text && matchedItem) {
+                    matchedItem.text = newText;
+                    updateMineruMarkdown(task);
+                }
+            });
+
+            el.addEventListener('keydown', (e) => {
+                if (e.key === 'Escape') {
+                    el.blur();
+                } else if (e.key === 'Enter' && !e.shiftKey) {
+                    e.preventDefault();
+                    el.blur();
+                }
+            });
+        }
+    });
+}
+
+function highlightMineruSource(pageIdx, bbox) {
+    if (pageIdx == null || !Array.isArray(bbox) || bbox.length < 4) return;
+
+    const page = pageIdx + 1;
+    scrollPdfPageIntoView(page, 'smooth');
+
+    clearSourceHighlight();
+
+    requestAnimationFrame(() => {
+        const surface = sourcePageSurface(page);
+        if (!surface) return;
+        const { element, layer } = surface;
+
+        const [x0, y0, x1, y1] = bbox.map(Number);
+        const sw = element.clientWidth || element.width || 1;
+        const sh = element.clientHeight || element.height || 1;
+
+        const highlight = document.createElement('div');
+        highlight.className = 'source-highlight-box source-highlight-box-mineru';
+        highlight.style.left = `${(x0 / 1000) * sw}px`;
+        highlight.style.top = `${(y0 / 1000) * sh}px`;
+        highlight.style.width = `${((x1 - x0) / 1000) * sw}px`;
+        highlight.style.height = `${((y1 - y0) / 1000) * sh}px`;
+        layer.appendChild(highlight);
+    });
+}
+
+function updateMineruMarkdown(task) {
+    const contentList = task.contentList || [];
+    let md = '';
+
+    contentList.forEach((item) => {
+        if (item.type === 'text' && item.text) {
+            const level = item.level;
+            if (level === 1) md += `# ${item.text}\n\n`;
+            else if (level === 2) md += `## ${item.text}\n\n`;
+            else if (level === 3) md += `### ${item.text}\n\n`;
+            else md += `${item.text}\n\n`;
+        } else if (item.type === 'image' && item.img_idx != null) {
+            const imgKey = `images/${item.img_idx}.png`;
+            md += `![](${imgKey})\n\n`;
+        } else if (item.type === 'table') {
+            if (item.text) md += `${item.text}\n\n`;
+        } else if (item.type === 'equation' && item.text) {
+            md += `$$\n${item.text}\n$$\n\n`;
+        }
+    });
+
+    task.markdown = md;
+    saveTask(task);
 }

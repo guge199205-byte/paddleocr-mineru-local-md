@@ -834,6 +834,28 @@ svg {
     background: rgba(49, 91, 255, 0.1);
 }
 
+.source-highlight-box-mineru {
+    border: 2px solid #e8590c;
+    background: rgba(232, 89, 12, 0.18);
+    box-shadow: 0 0 0 2px rgba(232, 89, 12, 0.12);
+}
+
+.mineru-locatable {
+    cursor: pointer;
+    border-radius: 3px;
+    transition: background 0.12s, box-shadow 0.12s;
+}
+.mineru-locatable:hover {
+    background: rgba(49, 91, 255, 0.06);
+    box-shadow: inset 0 0 0 1px rgba(49, 91, 255, 0.12);
+}
+.mineru-locatable.mineru-editing {
+    background: #fffbe6;
+    outline: 2px solid #e8590c;
+    outline-offset: 1px;
+    cursor: text;
+}
+
 .source-link-hotspot {
     position: absolute;
     padding: 0;
