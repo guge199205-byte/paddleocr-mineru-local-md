@@ -43,7 +43,8 @@ model_cache/
 model_cache_ocr/
 model_cache_ppocrv6/
 model_cache_ppocrv6_ocr/
-data/tasks/
+model_cache_mineru/
+data/
 ocr_results_*.md
 ocr_results_*.zip
 *.log
