@@ -1052,7 +1052,7 @@ async function createPdfTask(fileOrBlob, name, extra = {}) {
     const id = createId();
     const arrayBuffer = await fileOrBlob.arrayBuffer();
     const sourceUrl = await uploadTaskSource(id, fileOrBlob, name, 'application/pdf');
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer.slice(0) }).promise;
+    const pdf = await loadPdf(arrayBuffer.slice(0));
     const pageCount = pdf.numPages;
     const thumbnail = await renderPDFPageDataUrl(pdf, 1, 0.35);
     const pdfBatchSize = getConfiguredPdfBatchSize();
@@ -1269,8 +1269,8 @@ async function renderSource(task) {
     currentPage = Math.min(Math.max(currentPage, 1), task.pageCount || 1);
     els.pdfControls.classList.remove('hidden');
     const pdf = task.sourceDataUrl
-        ? await pdfjsLib.getDocument({ data: dataUrlToUint8Array(task.sourceDataUrl) }).promise
-        : await pdfjsLib.getDocument(task.sourceUrl).promise;
+        ? await loadPdf(dataUrlToUint8Array(task.sourceDataUrl))
+        : await loadPdf(task.sourceUrl);
     if (renderToken !== sourceRenderToken) return;
     const firstPage = await pdf.getPage(1);
     if (renderToken !== sourceRenderToken) return;
@@ -1294,11 +1294,14 @@ async function renderPdfDocument(renderToken = sourceRenderToken, scrollAnchor =
         if (renderToken !== sourceRenderToken) return;
 
         const page = await currentPdf.getPage(pageNumber);
-        const viewport = page.getViewport({ scale: currentZoom });
+        const outputScale = window.devicePixelRatio || 1;
+        const viewport = page.getViewport({ scale: currentZoom * outputScale });
         const canvas = document.createElement('canvas');
         const context = canvas.getContext('2d');
         canvas.width = viewport.width;
         canvas.height = viewport.height;
+        canvas.style.width = `${viewport.width / outputScale}px`;
+        canvas.style.height = `${viewport.height / outputScale}px`;
 
         const wrap = document.createElement('div');
         wrap.className = 'pdf-page-wrap';
@@ -3911,6 +3914,17 @@ function formatPageLabel(startPage, endPage = startPage) {
 
 function safeDownloadName(name, ext) {
     return `${name.replace(/\.[^.]+$/, '').replace(/[\\/:*?"<>|]/g, '_')}.${ext}`;
+}
+
+function loadPdf(source) {
+    const opts = typeof source === 'string'
+        ? { url: source }
+        : { data: source };
+    opts.cMapUrl = '/static/vendor/pdfjs/cmaps/';
+    opts.cMapPacked = true;
+    opts.standardFontDataUrl = '/static/vendor/pdfjs/standard_fonts/';
+    opts.useSystemFonts = true;
+    return pdfjsLib.getDocument(opts).promise;
 }
 
 function createId() {

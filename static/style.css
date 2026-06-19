@@ -1011,6 +1011,19 @@ svg {
     font-size: 16px;
     line-height: 1.72;
     overflow-wrap: break-word;
+    font-family: -apple-system, "Noto Sans SC", "Noto Sans CJK SC", "Source Han Sans SC", "Microsoft YaHei", "PingFang SC", "Hiragino Sans GB", sans-serif;
+}
+.markdown-preview table {
+    overflow-x: auto;
+    display: block;
+    max-width: 100%;
+}
+.markdown-preview pre {
+    overflow-x: auto;
+    max-width: 100%;
+}
+.markdown-preview code {
+    word-break: break-all;
 }
 
 .markdown-preview.ocr-visual-mode {
