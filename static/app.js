@@ -38,6 +38,7 @@ let currentZoom = DEFAULT_PDF_ZOOM;
 let pdfDefaultPageWidth = PDF_DEFAULT_PAGE_WIDTH;
 let sourceRenderToken = 0;
 let renderedResultTaskId = null;
+let lastRenderedHtml = '';
 let renderedMarkdownKey = '';
 let renderedOfficialLayoutContext = '';
 let renderedPPOCRVisualContext = '';
@@ -53,6 +54,16 @@ let modelRuntimePollTimer = null;
 let modelRuntimeLoadInFlight = false;
 let modelSwitchInFlight = false;
 let maxUploadBytes = DEFAULT_MAX_UPLOAD_BYTES;
+let maxTotalUploadBytes = 4096 * 1024 * 1024;
+let chunkedUploadThreshold = 100 * 1024 * 1024;
+let defaultChunkSize = 10 * 1024 * 1024;
+let maxBatchBytes = 200 * 1024 * 1024;
+let backgroundProcessingEnabled = true;
+let activeEventSource = null;
+let activePollInterval = null;
+let folders = [];
+let activeFolderId = null; // null = show all
+let draggedTaskId = null;
 let currentLanguage = normalizeLanguage(localStorage.getItem(LANGUAGE_STORAGE_KEY) || I18N_CONFIG.defaultLanguage);
 const sourcePdfCache = new Map();
 const sourceBytesCache = new Map();
@@ -96,6 +107,8 @@ const els = {
     startBtn: document.getElementById('start-btn'),
     copyBtn: document.getElementById('copy-btn'),
     downloadBtn: document.getElementById('download-btn'),
+    clearResultBtn: document.getElementById('clear-result-btn'),
+    translateBtn: document.getElementById('translate-btn'),
     markdownView: document.getElementById('markdown-view'),
     jsonView: document.getElementById('json-view'),
     chartRecognitionSwitch: document.getElementById('chart-recognition-switch'),
@@ -107,6 +120,8 @@ const els = {
     ignoreFooterSwitch: document.getElementById('ignore-footer-switch'),
     ignoreNumberSwitch: document.getElementById('ignore-number-switch'),
     pdfBatchSizeInput: document.getElementById('pdf-batch-size-input'),
+    newFolderBtn: document.getElementById('new-folder-btn'),
+    folderSelect: document.getElementById('folder-select'),
     taskTemplate: document.getElementById('task-item-template')
 };
 
@@ -117,6 +132,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setupEventListeners();
     renderModelSelect();
     await checkBackendConnection();
+    await loadFolders();
     await loadTasks();
     renderTaskList();
     if (tasks.length > 0) {
@@ -159,9 +175,34 @@ function setupEventListeners() {
 
     els.taskSearch.addEventListener('input', renderTaskList);
     els.clearHistoryBtn.addEventListener('click', clearHistory);
-    els.startBtn.addEventListener('click', () => processActiveTask());
+    els.startBtn.addEventListener('click', () => {
+        // If server-side processing is active, cancel instead of starting new
+        const task = getActiveTask();
+        const isBackendProcessing = task?.status === 'processing' && task?.sourceUrl && !task?.sourceDataUrl;
+        if (isProcessing || isBackendProcessing) {
+            cancelServerProcessing(task.id);
+        } else if (shouldResumeTask(task)) {
+            // Ask user: continue from where left off, or restart from scratch?
+            const doneCount = (task.batches || []).filter((b) => b.status === 'completed').length;
+            const totalCount = (task.batches || []).length;
+            const hasContent = Boolean(task.markdown);
+            if (!hasContent && doneCount > 0) {
+                // Results were lost (e.g., server restart without hydration) — offer restart
+                if (confirm(t('之前 {done}/{total} 批次的结果已丢失（可能因服务重启）。建议从头重新解析。是否从头开始？', { done: doneCount, total: totalCount }))) {
+                    resetTaskForFullRerun(task);
+                    processActiveTask();
+                }
+            } else {
+                processActiveTask();
+            }
+        } else {
+            processActiveTask();
+        }
+    });
     els.copyBtn.addEventListener('click', copyActiveResult);
     els.downloadBtn.addEventListener('click', downloadActiveTask);
+    els.clearResultBtn.addEventListener('click', clearActiveResult);
+    els.translateBtn.addEventListener('click', showTranslateDialog);
     els.prevPageBtn.addEventListener('click', () => changePdfPage(-1));
     els.nextPageBtn.addEventListener('click', () => changePdfPage(1));
     els.zoomInBtn.addEventListener('click', () => changeZoom(0.15));
@@ -176,6 +217,12 @@ function setupEventListeners() {
     ['change', 'blur'].forEach((eventName) => {
         els.pdfBatchSizeInput?.addEventListener(eventName, syncPdfBatchSizeSetting);
     });
+    // Model-specific batch size inputs
+    document.getElementById('pdf-batch-size-input-mineru')?.addEventListener('input', handlePdfBatchSizeInput);
+    document.getElementById('pdf-batch-size-input-glm-ocr')?.addEventListener('input', handlePdfBatchSizeInput);
+    els.newFolderBtn?.addEventListener('click', createFolderDialog);
+    els.folderSelect?.addEventListener('change', handleFolderSelectChange);
+    els.folderSelect?.addEventListener('contextmenu', handleFolderContextMenu);
 
     document.querySelectorAll('.task-tab').forEach((button) => {
         button.addEventListener('click', () => {
@@ -463,6 +510,18 @@ async function checkBackendConnection() {
         if (Number.isFinite(Number(data.maxUploadBytes)) && Number(data.maxUploadBytes) > 0) {
             maxUploadBytes = Number(data.maxUploadBytes);
         }
+        if (Number.isFinite(Number(data.maxTotalUploadBytes)) && Number(data.maxTotalUploadBytes) > 0) {
+            maxTotalUploadBytes = Number(data.maxTotalUploadBytes);
+        }
+        if (Number.isFinite(Number(data.chunkedUploadThreshold)) && Number(data.chunkedUploadThreshold) > 0) {
+            chunkedUploadThreshold = Number(data.chunkedUploadThreshold);
+        }
+        if (Number.isFinite(Number(data.defaultChunkSize)) && Number(data.defaultChunkSize) > 0) {
+            defaultChunkSize = Number(data.defaultChunkSize);
+        }
+        if (Number.isFinite(Number(data.maxBatchBytes)) && Number(data.maxBatchBytes) > 0) {
+            maxBatchBytes = Number(data.maxBatchBytes);
+        }
         if (!availableModels.some((model) => model.id === selectedModelId)) {
             selectedModelId = data.default || availableModels[0]?.id || DEFAULT_MODEL_ID;
         }
@@ -471,6 +530,7 @@ async function checkBackendConnection() {
         await loadModelRuntime({ silent: true });
         startModelRuntimePolling();
         updateActiveModelDisplay(getActiveTask());
+        checkTranslateAvailable();
     } catch (error) {
         els.statusDot.className = 'dot error';
         els.statusText.textContent = t('模型未连接');
@@ -494,6 +554,10 @@ async function loadModelRuntime({ silent = false } = {}) {
         const response = await apiFetch(`${API_BASE}/model-runtime`, { cache: 'no-store' });
         if (!response.ok) throw new Error(await response.text());
         modelRuntime = await response.json();
+        // Clear modelSwitchInFlight once the backend operation is no longer 'switching'
+        if (modelSwitchInFlight && modelRuntime?.operation?.state !== 'switching') {
+            modelSwitchInFlight = false;
+        }
         syncSelectedModelWithRuntime();
         updateActiveModelDisplay(getActiveTask());
         updateActionState(getActiveTask());
@@ -552,6 +616,9 @@ function syncSelectedModelWithRuntime() {
 
     if (operation?.state === 'switching' && knownModelIds.has(operation.targetModelId)) {
         runtimeModelId = operation.targetModelId;
+    } else if (operation?.state === 'error' && knownModelIds.has(operation.targetModelId)) {
+        // Switch failed — keep the UI on the failed target so the user sees the error
+        runtimeModelId = operation.targetModelId;
     } else if (knownModelIds.has(modelRuntime.activeModelId)) {
         const activeStatus = getModelRuntimeStatus(modelRuntime.activeModelId);
         if (activeStatus?.running || activeStatus?.ready) {
@@ -593,10 +660,13 @@ async function handleModelSelectionChange() {
 function updateSettingsPanelForModel(modelId) {
     const paddleocrSettings = document.getElementById('paddleocr-settings');
     const mineruSettings = document.getElementById('mineru-settings');
+    const glmOcrSettings = document.getElementById('glm-ocr-settings');
     if (!paddleocrSettings || !mineruSettings) return;
     const isMineru = modelId === 'mineru';
-    paddleocrSettings.classList.toggle('hidden', isMineru);
+    const isGlmOcr = modelId === 'glm-ocr';
+    paddleocrSettings.classList.toggle('hidden', isMineru || isGlmOcr);
     mineruSettings.classList.toggle('hidden', !isMineru);
+    if (glmOcrSettings) glmOcrSettings.classList.toggle('hidden', !isGlmOcr);
 }
 
 function getSelectedModel() {
@@ -657,6 +727,8 @@ function isModelRuntimeSwitching(modelId = null) {
 function canSwitchModelRuntime(modelId) {
     if (!modelRuntime) return true;
     const status = getModelRuntimeStatus(modelId);
+    // glm-ocr is externally managed (Ollama); always allow "switching" to it
+    if (modelId === 'glm-ocr') return true;
     return Boolean(modelRuntime.controlAvailable && status?.state !== 'missing');
 }
 
@@ -669,6 +741,8 @@ function modelRuntimeDotClass(modelId) {
     if (status?.ready) return 'dot connected';
     if (operation?.state === 'error' && operation.targetModelId === modelId) return 'dot error';
     if (status?.state === 'missing') return 'dot error';
+    if (status?.state === 'model_missing') return 'dot error';
+    if (status?.state === 'offline') return 'dot error';
     return 'dot connecting';
 }
 
@@ -685,6 +759,8 @@ function modelRuntimeStatusText(model) {
         return t('{modelName} 启动失败', { modelName });
     }
     if (status?.state === 'missing') return t('{modelName} 容器未创建', { modelName });
+    if (status?.state === 'model_missing') return t('{modelName} 模型未加载', { modelName });
+    if (status?.state === 'offline') return t('{modelName} 服务离线', { modelName });
     if (status?.state === 'stopped') return t('{modelName} 待启动', { modelName });
     if (modelRuntime.controlAvailable === false) return t('{modelName} 未就绪', { modelName });
     return t('{modelName} 未就绪', { modelName });
@@ -721,15 +797,22 @@ async function switchModelRuntime(modelId, { wait = false } = {}) {
         syncSelectedModelWithRuntime();
         updateActiveModelDisplay(getActiveTask());
         updateActionState(getActiveTask());
-        if (wait) return await waitForModelRuntimeReady(modelId);
+        if (wait) {
+            const result = await waitForModelRuntimeReady(modelId);
+            modelSwitchInFlight = false;
+            return result;
+        }
+        // Don't clear modelSwitchInFlight immediately — the backend switch is still
+        // in progress. The polling loop (loadModelRuntime) will clear it once the
+        // operation transitions away from 'switching'.
         return true;
     } catch (error) {
         console.error(error);
+        modelSwitchInFlight = false;
         els.statusDot.className = 'dot error';
         els.statusText.textContent = t('{modelName} 启动失败', { modelName: modelDisplayName(model) });
         return false;
     } finally {
-        modelSwitchInFlight = false;
         updateActiveModelDisplay(getActiveTask());
         updateActionState(getActiveTask());
     }
@@ -934,6 +1017,16 @@ async function handleFiles(files) {
     }
 
     tasks = [...newTasks, ...tasks];
+
+    // Auto-move new tasks into the currently selected folder
+    if (activeFolderId) {
+        const folderName = folders.find(f => f.id === activeFolderId)?.name || '';
+        for (const task of newTasks) {
+            task.folderId = activeFolderId;
+            task.folderName = folderName;
+        }
+    }
+
     renderTaskList();
     await selectTask(newTasks[0].id);
     const saveResults = await Promise.allSettled(newTasks.map((task) => saveTask(task)));
@@ -953,6 +1046,7 @@ function showIncomingFileState(fileList) {
     const fileCount = filesToAdd.length;
 
     activeTaskId = null;
+    isViewingTranslation = false;
     sourceRenderToken += 1;
     currentPdf = null;
     currentPage = 1;
@@ -980,12 +1074,24 @@ function showIncomingFileState(fileList) {
 
 function assertUploadWithinLimit(fileOrBlob, filename = '') {
     const size = Number(fileOrBlob?.size || 0);
-    if (!maxUploadBytes || !size || size <= maxUploadBytes) return;
-    const name = filename || fileOrBlob.name || t('文件');
-    throw new Error(t('{name} 超过上传上限 {limit}，请压缩或拆分后再试。', {
-        name,
-        limit: formatSize(maxUploadBytes)
-    }));
+    if (!size) return;
+    // Large files go through chunked upload, checked against maxTotalUploadBytes
+    if (size > chunkedUploadThreshold) {
+        if (size > maxTotalUploadBytes) {
+            throw new Error(t('{name} 超过最大上传限制 {limit}，请压缩或拆分后再试。', {
+                name: filename || fileOrBlob.name || t('文件'),
+                limit: formatSize(maxTotalUploadBytes)
+            }));
+        }
+        return;
+    }
+    // Small files use single upload, checked against maxUploadBytes
+    if (maxUploadBytes && size > maxUploadBytes) {
+        throw new Error(t('{name} 超过上传上限 {limit}，请压缩或拆分后再试。', {
+            name: filename || fileOrBlob.name || t('文件'),
+            limit: formatSize(maxUploadBytes)
+        }));
+    }
 }
 
 async function createTaskFromFile(file) {
@@ -1050,6 +1156,43 @@ async function createImageTask(file) {
 
 async function createPdfTask(fileOrBlob, name, extra = {}) {
     const id = createId();
+    const size = Number(fileOrBlob.size || 0);
+
+    // For large files: upload first, then get page count from server
+    // This avoids loading the entire PDF into browser memory
+    if (size > chunkedUploadThreshold) {
+        const sourceUrl = await uploadTaskSource(id, fileOrBlob, name, 'application/pdf');
+        const info = await fetchSourceInfo(id);
+        const pageCount = info.pageCount || 1;
+        const thumbnail = await renderPDFPageDataUrlFromSource(id, 1, 0.35) || '';
+        const pdfBatchSize = getConfiguredPdfBatchSize();
+        const batches = createPdfBatchDescriptors(pageCount, pdfBatchSize);
+
+        const now = Date.now();
+        const task = {
+            id,
+            name,
+            sourceKind: extra.sourceKind || 'pdf',
+            originalName: extra.originalName || name,
+            mimeType: 'application/pdf',
+            size,
+            createdAt: now,
+            updatedAt: now,
+            status: 'pending',
+            pageCount,
+            pdfBatchSize,
+            sourceUrl,
+            thumbnail,
+            batches,
+            markdown: '',
+            images: {},
+            ocrResults: []
+        };
+        applySelectedModelToTask(task);
+        return task;
+    }
+
+    // Small files: use the existing client-side PDF-lib path
     const arrayBuffer = await fileOrBlob.arrayBuffer();
     const sourceUrl = await uploadTaskSource(id, fileOrBlob, name, 'application/pdf');
     const pdf = await loadPdf(arrayBuffer.slice(0));
@@ -1083,6 +1226,11 @@ async function createPdfTask(fileOrBlob, name, extra = {}) {
 }
 
 async function uploadTaskSource(taskId, fileOrBlob, filename, mimeType) {
+    const size = Number(fileOrBlob?.size || 0);
+    // Use chunked upload for large files
+    if (size > chunkedUploadThreshold) {
+        return chunkedUpload(taskId, fileOrBlob, filename, mimeType);
+    }
     assertUploadWithinLimit(fileOrBlob, filename);
     const formData = new FormData();
     const source = fileOrBlob instanceof File
@@ -1098,6 +1246,103 @@ async function uploadTaskSource(taskId, fileOrBlob, filename, mimeType) {
     }
     const data = await response.json();
     return data.url;
+}
+
+async function chunkedUpload(taskId, fileOrBlob, filename, mimeType) {
+    const size = Number(fileOrBlob.size || 0);
+    if (size > maxTotalUploadBytes) {
+        throw new Error(t('{name} 超过最大上传限制 {limit}，请压缩或拆分后再试。', {
+            name: filename,
+            limit: formatSize(maxTotalUploadBytes)
+        }));
+    }
+
+    // Create upload session
+    const createResponse = await apiFetch(`${API_BASE}/uploads`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            filename,
+            totalSize: size,
+            chunkSize: defaultChunkSize,
+            taskId
+        })
+    });
+    if (!createResponse.ok) {
+        throw new Error(t('创建上传会话失败：{detail}', { detail: await responseErrorText(createResponse) }));
+    }
+    const session = await createResponse.json();
+    const { uploadId, chunkSize, totalChunks } = session;
+
+    // Check for existing chunks (resume support)
+    const statusResponse = await apiFetch(`${API_BASE}/uploads/${encodeURIComponent(uploadId)}`);
+    let receivedChunks = new Set();
+    if (statusResponse.ok) {
+        const status = await statusResponse.json();
+        receivedChunks = new Set(status.receivedChunks || []);
+    }
+
+    // Upload missing chunks sequentially
+    for (let index = 0; index < totalChunks; index++) {
+        if (receivedChunks.has(index)) continue;
+
+        const offset = index * chunkSize;
+        const end = Math.min(offset + chunkSize, size);
+        const chunkBlob = fileOrBlob.slice(offset, end);
+
+        const chunkFormData = new FormData();
+        chunkFormData.append('file', chunkBlob, `chunk_${index}`);
+
+        const chunkResponse = await apiFetch(
+            `${API_BASE}/uploads/${encodeURIComponent(uploadId)}/chunks/${index}`,
+            { method: 'PUT', body: chunkFormData }
+        );
+        if (!chunkResponse.ok) {
+            throw new Error(t('上传分片 {index}/{total} 失败：{detail}', {
+                index: index + 1,
+                total: totalChunks,
+                detail: await responseErrorText(chunkResponse)
+            }));
+        }
+
+        // Update progress
+        const uploadedBytes = Math.min((index + 1) * chunkSize, size);
+        updateUploadProgress(taskId, uploadedBytes, size);
+    }
+
+    // Complete upload
+    const completeResponse = await apiFetch(
+        `${API_BASE}/uploads/${encodeURIComponent(uploadId)}/complete`,
+        { method: 'POST' }
+    );
+    if (!completeResponse.ok) {
+        throw new Error(t('完成上传失败：{detail}', { detail: await responseErrorText(completeResponse) }));
+    }
+
+    const result = await completeResponse.json();
+    updateUploadProgress(taskId, size, size); // 100%
+    return result.url;
+}
+
+function updateUploadProgress(taskId, uploadedBytes, totalBytes) {
+    const task = tasks.find((t) => t.id === taskId);
+    if (!task) return;
+    const percent = totalBytes > 0 ? Math.round(uploadedBytes / totalBytes * 100) : 0;
+    if (els.sourceMeta && activeTaskId === taskId) {
+        els.sourceMeta.textContent = t('上传中 {percent}% ({uploaded}/{total})', {
+            percent,
+            uploaded: formatSize(uploadedBytes),
+            total: formatSize(totalBytes)
+        });
+    }
+}
+
+async function fetchSourceInfo(taskId) {
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/source/info`);
+    if (!response.ok) {
+        throw new Error(t('获取源文件信息失败：{detail}', { detail: await responseErrorText(response) }));
+    }
+    return response.json();
 }
 
 async function convertOfficeToPdf(file) {
@@ -1120,6 +1365,12 @@ function renderTaskList() {
     els.taskList.innerHTML = '';
     const visibleTasks = tasks.filter((task) => {
         if (activeFilter === 'done' && task.status !== 'completed') return false;
+        // Folder filter: show only tasks in the selected folder
+        if (activeFolderId) {
+            if (task.folderId !== activeFolderId) return false;
+        } else {
+            // "全部文件" shows everything
+        }
         return !keyword || task.name.toLowerCase().includes(keyword);
     });
 
@@ -1136,7 +1387,10 @@ function renderTaskList() {
         item.classList.add(`status-${taskVisualStatus(task)}`);
         item.querySelector('.task-icon').innerHTML = taskIcon(task);
         item.querySelector('.task-name').textContent = task.name;
-        item.querySelector('.task-meta').textContent = `${formatDate(task.updatedAt)} · ${formatPageCount(task.pageCount || 1)}`;
+        const folderTag = task.folderName
+            ? ` · <span class="folder-tag">${escapeHtml(task.folderName)}</span>`
+            : '';
+        item.querySelector('.task-meta').innerHTML = `${formatDate(task.updatedAt)} · ${formatPageCount(task.pageCount || 1)}${folderTag}`;
         item.querySelector('.task-state').textContent = statusText(task);
         const deleteButton = item.querySelector('.task-delete');
         deleteButton.setAttribute('title', t('删除任务'));
@@ -1151,6 +1405,13 @@ function renderTaskList() {
         deleteButton.addEventListener('click', async (event) => {
             event.stopPropagation();
             await deleteTask(task.id);
+        });
+        // Drag support for moving task to folder
+        setupTaskDragDrop(item, task.id);
+        // Right-click context menu for folder assignment
+        item.addEventListener('contextmenu', (e) => {
+            e.preventDefault();
+            showTaskFolderMenu(e, task);
         });
         els.taskList.appendChild(item);
     }
@@ -1232,6 +1493,14 @@ async function selectTask(taskId) {
     }
     renderResultPane(task);
     updateActionState(task);
+
+    // Auto-show saved translation if available
+    if (task.translation && task.translationLang) {
+        isViewingTranslation = true;
+        showTranslationResult(task);
+    } else {
+        isViewingTranslation = false;
+    }
 }
 
 function getActiveTask() {
@@ -1290,9 +1559,129 @@ async function renderPdfDocument(renderToken = sourceRenderToken, scrollAnchor =
     flow.className = 'pdf-document-flow';
     els.sourceViewer.appendChild(flow);
 
-    for (let pageNumber = 1; pageNumber <= currentPdf.numPages; pageNumber += 1) {
-        if (renderToken !== sourceRenderToken) return;
+    const totalPages = currentPdf.numPages;
+    const PDF_PLACEHOLDER_HEIGHT = 842;
+    const estimatedHeight = PDF_PLACEHOLDER_HEIGHT * currentZoom;
 
+    // Build all wrappers in a DocumentFragment for single DOM insertion
+    const fragment = document.createDocumentFragment();
+    const pageWrappers = []; // Direct reference — no querySelector needed
+    for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+        const wrap = document.createElement('div');
+        wrap.className = 'pdf-page-wrap pdf-page-placeholder';
+        wrap.dataset.page = String(pageNumber);
+        wrap.dataset.rendered = 'false';
+        wrap.style.minHeight = `${estimatedHeight}px`;
+        const canvasBox = document.createElement('div');
+        canvasBox.className = 'pdf-canvas-box';
+        const placeholderText = document.createElement('div');
+        placeholderText.className = 'pdf-page-placeholder-text';
+        placeholderText.textContent = `${pageNumber}`;
+        canvasBox.appendChild(placeholderText);
+        const highlightLayer = document.createElement('div');
+        highlightLayer.className = 'pdf-highlight-layer';
+        canvasBox.appendChild(highlightLayer);
+        wrap.appendChild(canvasBox);
+        fragment.appendChild(wrap);
+        pageWrappers[pageNumber] = wrap;
+    }
+    flow.appendChild(fragment);
+
+    observePdfPages(renderToken, pageWrappers);
+
+    if (scrollAnchor) {
+        restoreSourceScrollAnchor(scrollAnchor, 'auto');
+    } else {
+        scrollPdfPageIntoView(currentPage, 'auto');
+        resetSplitHorizontalScroll();
+    }
+    updateCurrentPageFromScroll();
+}
+
+// Virtual scrolling: priority queue + cancel-on-scroll-away
+const PDF_RENDER_BUFFER = 2;
+const PDF_PREFETCH_BUFFER = 6;
+const RECYCLE_THRESHOLD = 12;
+let pdfPageObserver = null;
+let pdfRenderedPages = new Set();
+let pdfPageWrappers = [];
+let pdfRenderQueue = [];
+let pdfRenderInFlight = false;
+
+function observePdfPages(renderToken, pageWrappers) {
+    if (pdfPageObserver) pdfPageObserver.disconnect();
+    pdfRenderedPages.clear();
+    pdfPageWrappers = pageWrappers || [];
+    pdfRenderQueue = [];
+    pdfRenderInFlight = false;
+
+    pdfPageObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (!entry.isIntersecting) continue;
+            const pageNumber = parseInt(entry.target.dataset.page, 10);
+            if (pageNumber) schedulePdfPageRender(pageNumber, renderToken);
+        }
+    }, {
+        root: els.sourceViewer,
+        rootMargin: '150% 0px',
+        threshold: 0
+    });
+
+    for (let i = 1; i < pdfPageWrappers.length; i++) {
+        if (pdfPageWrappers[i]) pdfPageObserver.observe(pdfPageWrappers[i]);
+    }
+}
+
+function schedulePdfPageRender(centerPage, renderToken) {
+    if (!currentPdf) return;
+    const totalPages = currentPdf.numPages;
+
+    // Drop queue items that are now far from current viewport
+    pdfRenderQueue = pdfRenderQueue.filter((item) =>
+        Math.abs(item.page - centerPage) <= PDF_PREFETCH_BUFFER + 2
+    );
+
+    for (let offset = 0; offset <= PDF_PREFETCH_BUFFER; offset++) {
+        for (const page of [centerPage + offset, centerPage - offset]) {
+            if (page < 1 || page > totalPages) continue;
+            if (pdfRenderedPages.has(page)) continue;
+            const wrap = pdfPageWrappers[page];
+            if (!wrap || wrap.dataset.rendered === 'true') continue;
+            const priority = Math.abs(page - centerPage);
+            const existing = pdfRenderQueue.find((item) => item.page === page);
+            if (existing) {
+                if (priority < existing.priority) existing.priority = priority;
+            } else {
+                pdfRenderQueue.push({ page, priority, renderToken });
+            }
+        }
+    }
+
+    pdfRenderQueue.sort((a, b) => a.priority - b.priority);
+    if (!pdfRenderInFlight) processPdfRenderQueue();
+}
+
+async function processPdfRenderQueue() {
+    if (pdfRenderInFlight) return;
+    pdfRenderInFlight = true;
+    let count = 0;
+    while (pdfRenderQueue.length > 0) {
+        const item = pdfRenderQueue.shift();
+        if (item.renderToken !== sourceRenderToken) continue;
+        if (pdfRenderedPages.has(item.page)) continue;
+        const wrap = pdfPageWrappers[item.page];
+        if (!wrap || wrap.dataset.rendered === 'true') continue;
+        await renderSinglePdfPage(item.page, wrap, item.renderToken);
+        count++;
+        if (count % 3 === 0) recycleDistantPages(item.page);
+    }
+    pdfRenderInFlight = false;
+}
+
+async function renderSinglePdfPage(pageNumber, wrap, renderToken) {
+    if (renderToken !== sourceRenderToken || pdfRenderedPages.has(pageNumber)) return;
+    pdfRenderedPages.add(pageNumber);
+    try {
         const page = await currentPdf.getPage(pageNumber);
         const outputScale = window.devicePixelRatio || 1;
         const viewport = page.getViewport({ scale: currentZoom * outputScale });
@@ -1302,29 +1691,41 @@ async function renderPdfDocument(renderToken = sourceRenderToken, scrollAnchor =
         canvas.height = viewport.height;
         canvas.style.width = `${viewport.width / outputScale}px`;
         canvas.style.height = `${viewport.height / outputScale}px`;
-
-        const wrap = document.createElement('div');
-        wrap.className = 'pdf-page-wrap';
-        wrap.dataset.page = String(pageNumber);
-        const canvasBox = document.createElement('div');
-        canvasBox.className = 'pdf-canvas-box';
-        canvasBox.appendChild(canvas);
-        const highlightLayer = document.createElement('div');
-        highlightLayer.className = 'pdf-highlight-layer';
-        canvasBox.appendChild(highlightLayer);
-        wrap.appendChild(canvasBox);
-        flow.appendChild(wrap);
-
+        const canvasBox = wrap.querySelector('.pdf-canvas-box');
+        if (!canvasBox) { pdfRenderedPages.delete(pageNumber); return; }
+        const placeholderText = canvasBox.querySelector('.pdf-page-placeholder-text');
+        if (placeholderText) placeholderText.remove();
+        canvasBox.insertBefore(canvas, canvasBox.firstChild);
+        wrap.style.minHeight = '';
+        wrap.classList.remove('pdf-page-placeholder');
+        wrap.dataset.rendered = 'true';
         await page.render({ canvasContext: context, viewport }).promise;
+    } catch (err) {
+        console.warn(`Failed to render PDF page ${pageNumber}`, err);
+        pdfRenderedPages.delete(pageNumber);
     }
+}
 
-    if (scrollAnchor) {
-        restoreSourceScrollAnchor(scrollAnchor, 'auto');
-    } else {
-        scrollPdfPageIntoView(currentPage, 'auto');
-        resetSplitHorizontalScroll();
+function recycleDistantPages(centerPage) {
+    for (let i = 1; i < pdfPageWrappers.length; i++) {
+        const wrap = pdfPageWrappers[i];
+        if (!wrap || wrap.dataset.rendered !== 'true') continue;
+        if (Math.abs(i - centerPage) > RECYCLE_THRESHOLD) {
+            const canvas = wrap.querySelector('canvas');
+            if (canvas) { canvas.width = 0; canvas.height = 0; canvas.remove(); }
+            wrap.dataset.rendered = 'false';
+            pdfRenderedPages.delete(i);
+            const canvasBox = wrap.querySelector('.pdf-canvas-box');
+            if (canvasBox && !canvasBox.querySelector('.pdf-page-placeholder-text')) {
+                const placeholderText = document.createElement('div');
+                placeholderText.className = 'pdf-page-placeholder-text';
+                placeholderText.textContent = `${i}`;
+                canvasBox.insertBefore(placeholderText, canvasBox.firstChild);
+            }
+            wrap.style.minHeight = `${842 * currentZoom}px`;
+            wrap.classList.add('pdf-page-placeholder');
+        }
     }
-    updateCurrentPageFromScroll();
 }
 
 function setActiveResultView(view) {
@@ -1460,15 +1861,19 @@ function renderResultPane(task, { deferJson = false, preserveScroll = true } = {
         return;
     }
 
-    const officialRender = renderOfficialLayoutResult(task);
-    if (officialRender.rendered) {
-        renderedMarkdownKey = markdownKey;
-        if (officialRender.changed) {
-            officialRender.mathRoots.forEach((root) => renderMathWhenReady(root));
+    const isDocumentParser = ['mineru', 'glm-ocr'].includes(task.modelId) || task.ocrResults?.some(p => ['mineru', 'glm-ocr'].includes(p.parser));
+    
+    if (!isDocumentParser) {
+        const officialRender = renderOfficialLayoutResult(task);
+        if (officialRender.rendered) {
+            renderedMarkdownKey = markdownKey;
+            if (officialRender.changed) {
+                officialRender.mathRoots.forEach((root) => renderMathWhenReady(root));
+            }
+            warmJsonResultCache(task);
+            restoreResultScrollState(scrollState);
+            return;
         }
-        warmJsonResultCache(task);
-        restoreResultScrollState(scrollState);
-        return;
     }
 
     const markdown = prepareMarkdownForRender(task.markdown || '');
@@ -1485,17 +1890,41 @@ function renderResultPane(task, { deferJson = false, preserveScroll = true } = {
 
     let renderMarkdown = markdown;
     renderedOfficialLayoutContext = '';
-    Object.entries(task.images || {}).forEach(([path, base64]) => {
-        renderMarkdown = renderMarkdown.split(path).join(`data:image/jpeg;base64,${base64}`);
-    });
+    // Image source replacement — handle both Markdown ![](path) and HTML <img src="path">
+    const images = task.images || {};
+    const imageKeys = Object.keys(images);
+    if (imageKeys.length > 0) {
+        // Replace Markdown-style image refs: ![alt](path)
+        renderMarkdown = renderMarkdown.split(/(!\[[^\]]*\]\()([^)\s]+)/g).map((part, i) => {
+            if (i % 3 === 2 && images[part]) {
+                return `data:image/jpeg;base64,${images[part]}`;
+            }
+            return part;
+        }).join('');
+        // Replace HTML-style image refs: <img src="path"> or <img src='path'>
+        for (const [path, base64] of Object.entries(images)) {
+            const dataUrl = `data:image/jpeg;base64,${base64}`;
+            // Double quotes
+            renderMarkdown = renderMarkdown.split(`src="${path}"`).join(`src="${dataUrl}"`);
+            // Single quotes
+            renderMarkdown = renderMarkdown.split(`src='${path}'`).join(`src='${dataUrl}'`);
+        }
+    }
     const html = renderMarkdownHtml(renderMarkdown);
+    // Skip DOM update if rendered HTML hasn't changed (cheap string reference check)
+    if (html === lastRenderedHtml) {
+        warmJsonResultCache(task);
+        restoreResultScrollState(scrollState);
+        return;
+    }
+    lastRenderedHtml = html;
     els.markdownView.innerHTML = html;
+    renderedMarkdownKey = markdownKey;
+    renderMathWhenReady(els.markdownView);
     linkMarkdownToSourceBlocks(task);
     if (task.modelId === 'mineru' && Array.isArray(task.contentList)) {
         bindMineruContentClicks(task);
     }
-    renderedMarkdownKey = markdownKey;
-    renderMathWhenReady(els.markdownView);
     warmJsonResultCache(task);
     restoreResultScrollState(scrollState);
 }
@@ -1690,6 +2119,11 @@ function collectPPOCRVisualPages(task) {
 function collectPPOCRLines(pageResult) {
     if (Array.isArray(pageResult?.ocrLines)) {
         return pageResult.ocrLines
+            .map((line, index) => normalizePPOCRLine(line, index))
+            .filter(Boolean);
+    }
+    if (Array.isArray(pageResult?.lines)) {
+        return pageResult.lines
             .map((line, index) => normalizePPOCRLine(line, index))
             .filter(Boolean);
     }
@@ -2304,12 +2738,41 @@ async function processTask(task, { confirmCompleted = true } = {}) {
     if (!task || isProcessing) return;
     if (confirmCompleted && task.status === 'completed' && !confirm(t('这个任务已经解析完成，要重新解析吗？'))) return;
 
-    const resumeExistingResults = shouldResumeTask(task);
-    const targetModel = resumeExistingResults
-        ? getTaskModel(task)
-        : ((confirmCompleted || !task.modelId) ? getSelectedModel() : getTaskModel(task));
+    let resumeExistingResults = shouldResumeTask(task);
+    let targetModel = resumeExistingResults ? getTaskModel(task) : getSelectedModel();
+
+    if (task.modelId && task.modelId !== selectedModelId) {
+        if (resumeExistingResults && task.batches.some(b => b.status === 'completed')) {
+            if (confirm(t('你已切换到新的解析模型，是否要清空旧模型的解析结果并重新开始？\n\n点击“确定”使用新模型重新解析，点击“取消”继续使用旧模型解析剩余页面。'))) {
+                resumeExistingResults = false;
+                targetModel = getSelectedModel();
+                applySelectedModelToTask(task);
+            } else {
+                els.modelSelect.value = task.modelId;
+                selectedModelId = task.modelId;
+                localStorage.setItem(MODEL_STORAGE_KEY, selectedModelId);
+                updateActiveModelDisplay(task);
+            }
+        } else {
+            resumeExistingResults = false;
+            targetModel = getSelectedModel();
+            applySelectedModelToTask(task);
+        }
+    } else if (confirmCompleted && task.status === 'completed') {
+        resumeExistingResults = false;
+        targetModel = getSelectedModel();
+        applySelectedModelToTask(task);
+    } else if (!task.modelId) {
+        applySelectedModelToTask(task);
+        targetModel = getSelectedModel();
+    }
+
     const modelReady = await ensureModelRuntimeReadyForTask(task, targetModel);
     if (!modelReady) return;
+
+    // Decide processing mode: server-side (background) for tasks with sourceUrl,
+    // client-side for small tasks without server source
+    const useServerProcessing = backgroundProcessingEnabled && task.sourceUrl && !task.sourceDataUrl;
 
     isProcessing = true;
     try {
@@ -2340,6 +2803,14 @@ async function processTask(task, { confirmCompleted = true } = {}) {
         await saveTask(task);
         refreshTaskUi(task);
 
+        if (useServerProcessing) {
+            // Server-side background processing with SSE progress
+            // Do NOT clear isProcessing in finally — SSE/polling handler will do it
+            await startServerProcessing(task, targetModel);
+            return; // processTask is done; SSE handler will update UI
+        }
+
+        // Client-side sequential batch processing (original logic)
         for (const batch of task.batches) {
             if (batch.status === 'completed') continue;
             batch.status = 'processing';
@@ -2375,17 +2846,295 @@ async function processTask(task, { confirmCompleted = true } = {}) {
         console.error(error);
         task.status = 'error';
         task.error = error.message;
-    } finally {
+        // Always clear isProcessing and save/refresh on error
         isProcessing = false;
         task.updatedAt = Date.now();
-        await saveTask(task, { includeResults: false });
+        await saveTask(task);
         refreshTaskUi(task);
+    } finally {
+        if (useServerProcessing && task.status !== 'error') {
+            // For server processing (non-error), isProcessing is managed by SSE/polling handlers
+            task.updatedAt = Date.now();
+        } else if (task.status !== 'error') {
+            // Client-side processing: normal cleanup
+            isProcessing = false;
+            task.updatedAt = Date.now();
+            await saveTask(task, { includeResults: false });
+            refreshTaskUi(task);
+        }
+    }
+}
+
+async function startServerProcessing(task, model) {
+    // Close any previous SSE/polling connections
+    cleanupServerProcessingListeners();
+
+    // Collect OCR options from UI controls
+    const ocrOptions = collectOcrOptions(model.id);
+
+    // Start background processing on server
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(task.id)}/process`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ modelId: model.id, ocrOptions })
+    });
+    if (!response.ok) {
+        const detail = await responseErrorText(response);
+        throw new Error(t('启动服务端处理失败：{detail}', { detail }));
+    }
+
+    // Listen to SSE for progress
+    const progressUrl = `${API_BASE}/tasks/${encodeURIComponent(task.id)}/progress`;
+    try {
+        activeEventSource = new EventSource(progressUrl);
+    } catch (_) {
+        // SSE fallback: poll task status
+        pollTaskProgress(task.id);
+        return;
+    }
+
+    activeEventSource.onmessage = (event) => {
+        try {
+            const progress = JSON.parse(event.data);
+            updateProcessingProgress(task.id, progress);
+            if (progress.status === 'completed') {
+                activeEventSource.close();
+                activeEventSource = null;
+                finishServerProcessing(task.id, 'completed');
+            } else if (progress.status === 'error') {
+                activeEventSource.close();
+                activeEventSource = null;
+                finishServerProcessing(task.id, 'error', progress.error);
+            } else if (progress.status === 'cancelled') {
+                activeEventSource.close();
+                activeEventSource = null;
+                finishServerProcessing(task.id, 'paused');
+            } else if (progress.status === 'running') {
+                // Refresh results from server every few progress updates
+                refreshServerResults(task.id);
+            }
+        } catch (err) {
+            console.warn('Failed to parse SSE progress event', err);
+        }
+    };
+
+    activeEventSource.onerror = () => {
+        if (activeEventSource) {
+            activeEventSource.close();
+            activeEventSource = null;
+        }
+        // Fallback to polling
+        pollTaskProgress(task.id);
+    };
+}
+
+function cleanupServerProcessingListeners() {
+    if (activeEventSource) {
+        activeEventSource.close();
+        activeEventSource = null;
+    }
+    if (activePollInterval) {
+        clearInterval(activePollInterval);
+        activePollInterval = null;
+    }
+}
+
+function collectOcrOptions(modelId) {
+    const isMineru = modelId === 'mineru';
+    const isGlmOcr = modelId === 'glm-ocr';
+    const options = {};
+    if (isMineru) {
+        options.useChartRecognition = document.getElementById('mineru-image-switch')?.checked ?? true;
+        options.useLayoutDetection = true;
+        options.useSealRecognition = true;
+        options.formatBlockContent = true;
+        options.showFormulaNumber = true;
+    } else if (isGlmOcr) {
+        const glmLayoutSwitch = document.getElementById('glm-ocr-layout-switch');
+        options.useLayoutDetection = glmLayoutSwitch?.checked ?? true;
+        options.formatBlockContent = true;
+    } else {
+        options.useLayoutDetection = true;
+        options.useChartRecognition = els.chartRecognitionSwitch?.checked ?? false;
+        options.useDocUnwarping = els.docUnwarpingSwitch?.checked ?? false;
+        options.useDocOrientationClassify = els.docOrientationSwitch?.checked ?? false;
+        options.useSealRecognition = els.sealRecognitionSwitch?.checked ?? true;
+        options.formatBlockContent = true;
+        options.showFormulaNumber = els.formulaNumberSwitch?.checked ?? true;
+        const ignoreLabels = [];
+        if (els.ignoreNumberSwitch?.checked) ignoreLabels.push('number');
+        ignoreLabels.push('footnote');
+        if (els.ignoreHeaderSwitch?.checked) ignoreLabels.push('header', 'header_image');
+        if (els.ignoreFooterSwitch?.checked) ignoreLabels.push('footer', 'footer_image');
+        ignoreLabels.push('aside_text');
+        options.markdownIgnoreLabels = ignoreLabels;
+    }
+    return options;
+}
+
+function updateProcessingProgress(taskId, progress) {
+    const task = getActiveTask();
+    if (!task || task.id !== taskId) return;
+
+    const percent = progress.percent || 0;
+    const batchIndex = progress.currentBatchIndex || 0;
+    const totalBatches = progress.totalBatches || 0;
+    const label = progress.currentBatchLabel || '';
+
+    if (progress.status === 'running') {
+        if (els.startBtn) {
+            els.startBtn.innerHTML = `<span class="spinner"></span>${t('解析中')} ${percent}%`;
+        }
+        if (els.sourceMeta) {
+            els.sourceMeta.textContent = t('解析批次 {current}/{total}: {label}', {
+                current: batchIndex + 1,
+                total: totalBatches,
+                label
+            });
+        }
+    } else if (progress.status === 'cancelling') {
+        if (els.startBtn) {
+            els.startBtn.innerHTML = `<span class="spinner"></span>${t('正在取消...')}`;
+        }
+    }
+}
+
+let lastResultRefreshTime = 0;
+const RESULT_REFRESH_INTERVAL = 3000; // 3 seconds
+let mdRenderThrottle = null; // Throttle markdown re-renders during processing
+
+async function refreshServerResults(taskId) {
+    // Throttle: don't refresh more often than every 3 seconds
+    const now = Date.now();
+    if (now - lastResultRefreshTime < RESULT_REFRESH_INTERVAL) return;
+    lastResultRefreshTime = now;
+
+    try {
+        const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+        if (!response.ok) return;
+        const serverTask = await response.json();
+
+        // Update local task data
+        const localIndex = tasks.findIndex((t) => t.id === taskId);
+        if (localIndex >= 0) {
+            tasks[localIndex] = serverTask;
+        }
+
+        // Refresh result pane if this task is active — with throttle
+        if (activeTaskId === taskId) {
+            scheduleMdRender(serverTask);
+        }
+
+        // Update task list in sidebar (lightweight)
+        renderTaskList();
+    } catch (err) {
+        // Silent fail — don't disrupt processing
+    }
+}
+
+function scheduleMdRender(task) {
+    // Cancel any pending render
+    if (mdRenderThrottle) {
+        cancelAnimationFrame(mdRenderThrottle);
+    }
+    // Defer render to next animation frame — coalesces multiple SSE events
+    mdRenderThrottle = requestAnimationFrame(() => {
+        mdRenderThrottle = null;
+        renderResultPane(task);
+        updateActionState(task);
+    });
+}
+
+async function finishServerProcessing(taskId, status, error = null) {
+    isProcessing = false;
+    // Clean up SSE/polling listeners
+    cleanupServerProcessingListeners();
+    // Reload task from server to get updated results
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+    if (response.ok) {
+        const serverTask = await response.json();
+        // Merge server results into local task
+        const localIndex = tasks.findIndex((t) => t.id === taskId);
+        if (localIndex >= 0) {
+            tasks[localIndex] = serverTask;
+        }
+        if (activeTaskId === taskId) {
+            refreshTaskUi(serverTask);
+        }
+    } else {
+        // Fallback: update local task
+        const task = tasks.find((t) => t.id === taskId);
+        if (task) {
+            task.status = status;
+            task.error = error;
+            task.updatedAt = Date.now();
+            await saveTask(task);
+            refreshTaskUi(task);
+        }
+    }
+    updateActionState(tasks.find((t) => t.id === taskId));
+}
+
+function pollTaskProgress(taskId) {
+    // Fallback polling when SSE is unavailable
+    let lastPollRefresh = 0;
+    activePollInterval = setInterval(async () => {
+        try {
+            const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+            if (!response.ok) return;
+            const serverTask = await response.json();
+            const localIndex = tasks.findIndex((t) => t.id === taskId);
+            if (localIndex >= 0) {
+                tasks[localIndex] = serverTask;
+            }
+            if (serverTask.status === 'completed' || serverTask.status === 'error' || serverTask.status === 'paused') {
+                clearInterval(activePollInterval);
+                activePollInterval = null;
+                isProcessing = false;
+                if (activeTaskId === taskId) {
+                    refreshTaskUi(serverTask);
+                }
+                renderTaskList();
+                updateActionState(serverTask);
+            } else if (activeTaskId === taskId) {
+                // Update progress display
+                const completedBatches = (serverTask.batches || []).filter((b) => b.status === 'completed').length;
+                const totalBatches = (serverTask.batches || []).length;
+                const percent = totalBatches > 0 ? Math.round(completedBatches / totalBatches * 100) : 0;
+                // Show cancel button during polling
+                if (els.startBtn) {
+                    els.startBtn.disabled = false;
+                    els.startBtn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>${t('停止')} ${percent}%`;
+                }
+                // Refresh results every 3 seconds
+                const now = Date.now();
+                if (now - lastPollRefresh >= RESULT_REFRESH_INTERVAL) {
+                    lastPollRefresh = now;
+                    renderResultPane(serverTask);
+                    renderTaskList();
+                }
+            }
+        } catch (err) {
+            console.warn('Polling failed', err);
+        }
+    }, 2000);
+}
+
+async function cancelServerProcessing(taskId) {
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}/cancel`, {
+        method: 'POST'
+    });
+    if (!response.ok) {
+        const detail = await responseErrorText(response);
+        console.warn('Cancel failed:', detail);
     }
 }
 
 function shouldResumeTask(task) {
     if (isTaskActivelyProcessing(task)) return false;
-    const canResumeStatus = task?.status === 'pending';
+    // Allow resume from any non-completed status (pending, error, paused, etc.)
+    // as long as some batches are already done and some are not.
+    const canResumeStatus = task?.status !== 'completed';
     if (!canResumeStatus) return false;
 
     if (Array.isArray(task?.batches)) {
@@ -2397,6 +3146,24 @@ function shouldResumeTask(task) {
     const completedPages = Number(task?.completedPages || 0);
     const pageCount = Number(task?.pageCount || 0);
     return completedPages > 0 && (!pageCount || completedPages < pageCount);
+}
+
+async function resetTaskForFullRerun(task) {
+    // Reset all batch statuses and clear results so the task can be re-parsed from scratch.
+    task.markdown = '';
+    task.images = {};
+    task.ocrResults = [];
+    task.contentList = [];
+    if (Array.isArray(task.batches)) {
+        task.batches.forEach((batch) => {
+            batch.status = 'pending';
+            batch.markdown = '';
+        });
+    }
+    task.status = 'pending';
+    task.error = null;
+    task.updatedAt = Date.now();
+    await saveTask(task);
 }
 
 function isTaskActivelyProcessing(task) {
@@ -2476,8 +3243,9 @@ function refreshTaskUi(task) {
 async function callOCR(batch, task) {
     const model = getTaskModel(task);
     const isMineru = model.id === 'mineru';
+    const isGlmOcr = model.id === 'glm-ocr';
     const ignoreLabels = [];
-    if (!isMineru) {
+    if (!isMineru && !isGlmOcr) {
         if (els.ignoreNumberSwitch.checked) ignoreLabels.push('number');
         ignoreLabels.push('footnote');
         if (els.ignoreHeaderSwitch.checked) ignoreLabels.push('header', 'header_image');
@@ -2502,6 +3270,11 @@ async function callOCR(batch, task) {
         formData.append('useSealRecognition', 'true');
         formData.append('formatBlockContent', 'true');
         formData.append('showFormulaNumber', 'true');
+        formData.append('modelId', model.id);
+    } else if (isGlmOcr) {
+        const glmLayoutSwitch = document.getElementById('glm-ocr-layout-switch');
+        formData.append('useLayoutDetection', String(glmLayoutSwitch?.checked ?? true));
+        formData.append('formatBlockContent', 'true');
         formData.append('modelId', model.id);
     } else {
         formData.append('useLayoutDetection', 'true');
@@ -2593,17 +3366,25 @@ function updateActionState(task) {
     const modelReady = !task || isModelRuntimeReady(taskModel.id);
     const canStartAfterSwitch = task && !modelReady && canSwitchModelRuntime(taskModel.id);
     const modelStarting = task && !modelReady && isModelRuntimeSwitching(taskModel.id);
+    const isServerProcessing = isProcessing && task?.sourceUrl && !task?.sourceDataUrl;
+    const isBackendProcessing = task?.status === 'processing' && task?.sourceUrl && !task?.sourceDataUrl;
     if (els.modelSelect) {
         els.modelSelect.disabled = isProcessing || modelSwitchInFlight || isModelRuntimeSwitching();
     }
-    els.startBtn.disabled = !task || !isTaskDetailLoaded(task) || isProcessing || (!modelReady && !canStartAfterSwitch);
+    if ((isServerProcessing || isBackendProcessing) && task?.status === 'processing') {
+        // Show cancel button during server-side processing
+        els.startBtn.disabled = false;
+        els.startBtn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M6 6h12v12H6z"/></svg>${t('停止')}`;
+    } else {
+        els.startBtn.disabled = !task || !isTaskDetailLoaded(task) || isProcessing || (!modelReady && !canStartAfterSwitch);
+        const startLabel = startButtonLabel(task);
+        const showProcessing = (isProcessing && task?.status === 'processing') || modelStarting;
+        els.startBtn.innerHTML = showProcessing
+            ? `<span class="spinner"></span>${modelStarting ? t('模型启动中') : t('解析中')}`
+            : `<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>${startLabel}`;
+    }
     updateCopyButtonState(task);
     els.downloadBtn.disabled = !hasResult;
-    const startLabel = startButtonLabel(task);
-    const showProcessing = (isProcessing && task?.status === 'processing') || modelStarting;
-    els.startBtn.innerHTML = showProcessing
-        ? `<span class="spinner"></span>${modelStarting ? t('模型启动中') : t('解析中')}`
-        : `<svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>${startLabel}`;
 }
 
 function startButtonLabel(task) {
@@ -2634,6 +3415,35 @@ function updateCopyButtonState(task) {
     els.copyBtn.disabled = !canCopyActiveResult(task);
     els.copyBtn.setAttribute('title', label);
     els.copyBtn.setAttribute('aria-label', label);
+    // Show clear-result button only when there are results or task is in error/paused state
+    const hasResults = Boolean(task?.markdown) || Boolean(task?.ocrResults?.length);
+    const canClear = hasResults || task?.status === 'error' || task?.status === 'paused';
+    if (els.clearResultBtn) {
+        els.clearResultBtn.style.display = canClear ? '' : 'none';
+    }
+    if (els.translateBtn) {
+        if (!hasResults && !isTranslating) {
+            els.translateBtn.style.display = 'none';
+        } else if (isTranslating) {
+            // Show translate button as stop button during translation
+            els.translateBtn.style.display = '';
+            els.translateBtn.title = t('停止翻译');
+        } else {
+            els.translateBtn.style.display = '';
+            if (task?.translation) {
+                // Already translated — toggle between original / translation
+                if (isViewingTranslation) {
+                    els.translateBtn.title = t('查看原文');
+                } else {
+                    els.translateBtn.title = t('查看翻译');
+                }
+            } else if (translateAvailable) {
+                els.translateBtn.title = t('翻译');
+            } else {
+                els.translateBtn.style.display = 'none';
+            }
+        }
+    }
 }
 
 function activeResultCopyText(task) {
@@ -2658,6 +3468,291 @@ async function copyActiveResult() {
         alert(error.message || t('复制失败'));
     }
 }
+
+async function clearActiveResult() {
+    const task = getActiveTask();
+    if (!task) return;
+    if (!task.markdown && !task.ocrResults?.length && task.status !== 'error' && task.status !== 'paused') return;
+    if (!confirm(t('确定清空当前任务的解析结果？此操作不可撤销。'))) return;
+    await resetTaskForFullRerun(task);
+    const updated = await loadTaskFromServer(task.id);
+    replaceTask(updated);
+    refreshTaskUi(updated);
+}
+
+// ----- Translation -----
+
+const TRANSLATE_LANGUAGES = [
+    { code: 'zh-CN', name: '简体中文' },
+    { code: 'zh-TW', name: '繁體中文' },
+    { code: 'en', name: 'English' },
+    { code: 'ja', name: '日本語' },
+    { code: 'ko', name: '한국어' },
+    { code: 'fr', name: 'Français' },
+    { code: 'de', name: 'Deutsch' },
+    { code: 'es', name: 'Español' },
+    { code: 'ru', name: 'Русский' },
+];
+
+let translateAvailable = false;
+let isTranslating = false;
+let isViewingTranslation = false; // whether we are currently showing the translation
+let translateAbortController = null; // for cancelling translation
+
+async function checkTranslateAvailable() {
+    try {
+        const resp = await apiFetch(`${API_BASE}/translate/config`);
+        if (resp.ok) {
+            const config = await resp.json();
+            translateAvailable = config.available;
+        }
+    } catch (_) {}
+}
+
+function showTranslateDialog() {
+    const task = getActiveTask();
+    if (!task || !task.markdown) return;
+
+    // If currently translating, click = stop
+    if (isTranslating && translateAbortController) {
+        translateAbortController.abort();
+        return;
+    }
+
+    if (isTranslating) return;
+
+    // If we already have a saved translation, show options: view / re-translate
+    if (task.translation) {
+        if (isViewingTranslation) {
+            // Currently viewing translation — switch back to original
+            isViewingTranslation = false;
+            const indicator = document.querySelector('.translation-indicator');
+            if (indicator) indicator.remove();
+            resetResultRenderCache(task.id);
+            lastRenderedHtml = '';
+            renderResultPane(task);
+        } else {
+            // Not viewing translation — show it
+            isViewingTranslation = true;
+            showTranslationResult(task);
+        }
+        updateActionState(task);
+        return;
+    }
+
+    // No existing translation — show the language picker dialog
+    if (!translateAvailable) {
+        alert(t('翻译功能未配置。请在环境变量中设置 PANDOCR_TRANSLATE_API_URL 和 PANDOCR_TRANSLATE_API_KEY。'));
+        return;
+    }
+
+    showTranslateLangDialog(task);
+}
+
+function showTranslateLangDialog(task, isRetranslate = false) {
+    const existing = document.getElementById('translate-dialog');
+    if (existing) existing.remove();
+
+    const dialog = document.createElement('div');
+    dialog.id = 'translate-dialog';
+    dialog.style.cssText = 'position:fixed;inset:0;z-index:9999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,0.5)';
+
+    const currentLang = task.translationLang || '';
+    const title = isRetranslate ? t('重新翻译') : t('翻译');
+    const options = TRANSLATE_LANGUAGES.map((lang) =>
+        `<option value="${lang.code}" ${lang.code === currentLang ? 'selected' : ''} ${lang.code === 'zh-CN' && !currentLang ? 'selected' : ''}>${lang.name}</option>`
+    ).join('');
+
+    dialog.innerHTML = `
+        <div style="background:var(--surface-color,#fff);border-radius:12px;padding:24px;min-width:300px;box-shadow:0 8px 32px rgba(0,0,0,0.3)">
+            <h3 style="margin:0 0 16px;font-size:16px">${title}</h3>
+            <label style="display:block;margin-bottom:8px;font-size:13px;color:var(--text-secondary,#666)">${t('目标语言')}</label>
+            <select id="translate-target-lang" style="width:100%;padding:8px;border-radius:6px;border:1px solid var(--border-color,#ddd);font-size:14px;background:var(--input-bg,#fff);color:var(--text-color,#333)">${options}</select>
+            <div style="display:flex;gap:8px;margin-top:16px;justify-content:flex-end">
+                <button id="translate-cancel" style="padding:6px 16px;border-radius:6px;border:1px solid var(--border-color,#ddd);cursor:pointer;background:var(--surface-color,#fff);color:var(--text-color,#333)">${t('取消')}</button>
+                <button id="translate-start" style="padding:6px 16px;border-radius:6px;border:none;cursor:pointer;background:var(--primary-color,#4f46e5);color:#fff;font-weight:500">${title}</button>
+            </div>
+        </div>`;
+
+    document.body.appendChild(dialog);
+
+    document.getElementById('translate-cancel').onclick = () => dialog.remove();
+    dialog.onclick = (e) => { if (e.target === dialog) dialog.remove(); };
+    document.getElementById('translate-start').onclick = () => {
+        const targetLang = document.getElementById('translate-target-lang').value;
+        dialog.remove();
+        startTranslation(task.id, targetLang);
+    };
+}
+
+async function startTranslation(taskId, targetLang) {
+    if (isTranslating) return;
+    isTranslating = true;
+
+    // Create abort controller for cancellation
+    translateAbortController = new AbortController();
+
+    // Show progress bar on translate button
+    const btn = els.translateBtn;
+    if (btn) {
+        btn.style.color = 'var(--primary-color, #4f46e5)';
+        btn.title = t('翻译中... 0%');
+        btn.innerHTML = `<span class="spinner" style="width:14px;height:14px;border-width:2px;display:inline-block;vertical-align:middle"></span><span style="vertical-align:middle;font-size:12px;margin-left:3px">0%</span>`;
+        btn.style.minWidth = '72px';
+        btn.style.whiteSpace = 'nowrap';
+    }
+
+    try {
+        const url = `${API_BASE}/tasks/${encodeURIComponent(taskId)}/translate`;
+        const resp = await apiFetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ targetLang }),
+            signal: translateAbortController.signal,
+        });
+
+        if (!resp.ok) {
+            const detail = await responseErrorText(resp);
+            throw new Error(detail);
+        }
+
+        // Read SSE stream
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        let lastPercent = 0;
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+
+            for (const line of lines) {
+                if (!line.startsWith('data: ')) continue;
+                try {
+                    const data = JSON.parse(line.slice(6));
+                    if (data.type === 'progress') {
+                        lastPercent = data.percent;
+                        if (btn) {
+                            btn.title = t('翻译中... {p}%', { p: data.percent });
+                            btn.innerHTML = `<span class="spinner" style="width:14px;height:14px;border-width:2px;display:inline-block;vertical-align:middle"></span><span style="vertical-align:middle;font-size:12px;margin-left:3px">${data.percent}%</span>`;
+                        }
+                    } else if (data.type === 'error') {
+                        console.warn('Translation chunk error:', data.error);
+                    } else if (data.type === 'done') {
+                        // Translation complete — but only update if user is still on this task
+                        if (activeTaskId !== taskId) break;
+                        const updated = await loadTaskFromServer(taskId);
+                        replaceTask(updated);
+                        isViewingTranslation = true;
+                        showTranslationResult(updated);
+                        updateActionState(updated);
+                    }
+                } catch (_) {}
+            }
+        }
+    } catch (err) {
+        if (err.name === 'AbortError') {
+            // User cancelled — translation was stopped mid-way
+            // Reload task to get whatever was saved
+            const updated = await loadTaskFromServer(taskId);
+            replaceTask(updated);
+            if (updated.translation) {
+                isViewingTranslation = true;
+                showTranslationResult(updated);
+            }
+        } else {
+            alert(t('翻译失败：{err}', { err: err.message }));
+        }
+    } finally {
+        isTranslating = false;
+        translateAbortController = null;
+        if (btn) {
+            btn.style.color = '';
+            btn.style.minWidth = '';
+            btn.style.whiteSpace = '';
+            btn.title = t('翻译');
+            // Restore the translate SVG icon
+            btn.innerHTML = `<svg viewBox="0 0 24 24"><path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0014.07 6H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>`;
+        }
+        updateActionState(getActiveTask());
+    }
+}
+
+function showTranslationResult(task) {
+    if (!task.translation) return;
+    // Safety: only show if this task is still the active one
+    if (activeTaskId && task.id !== activeTaskId) return;
+
+    // Clear render caches
+    resetResultRenderCache(task.id);
+    lastRenderedHtml = '';
+    renderedOfficialLayoutContext = '';
+    renderedPPOCRVisualContext = '';
+
+    // Render the translation as plain markdown (bypass layout/ppocr visual modes)
+    const html = renderMarkdownHtml(prepareMarkdownForRender(task.translation));
+    els.markdownView.innerHTML = html;
+    renderMathWhenReady(els.markdownView);
+
+    // Remove any existing indicator
+    const old = document.querySelector('.translation-indicator');
+    if (old) old.remove();
+
+    // Add indicator bar: language label | download | re-translate | view original
+    const indicator = document.createElement('div');
+    indicator.className = 'translation-indicator';
+    indicator.style.cssText = 'padding:6px 16px;background:var(--primary-color,#4f46e5);color:#fff;font-size:13px;display:flex;align-items:center;gap:6px;border-radius:8px 8px 0 0;position:sticky;top:0;z-index:10;flex-wrap:wrap';
+    const langLabel = LANG_DISPLAY_NAMES?.[task.translationLang] || task.translationLang || '';
+    const btnStyle = 'background:rgba(255,255,255,0.2);border:none;color:#fff;padding:3px 10px;border-radius:4px;cursor:pointer;font-size:12px;white-space:nowrap';
+    indicator.innerHTML = `
+        <span style="flex:1">${t('{lang} 翻译', { lang: langLabel })}</span>
+        <button id="download-translation-btn" style="${btnStyle}" title="${t('下载翻译MD')}">⬇ ${t('下载')}</button>
+        <button id="retranslate-btn" style="${btnStyle}" title="${t('重新翻译')}">🔄 ${t('重翻')}</button>
+        <button id="view-original-btn" style="${btnStyle}" title="${t('查看原文')}">↩ ${t('原文')}</button>`;
+
+    // Download translation as .md
+    indicator.querySelector('#download-translation-btn').onclick = () => {
+        const name = (task.name || 'translation').replace(/\.[^.]+$/, '');
+        const lang = task.translationLang || 'translated';
+        downloadBlob(new Blob([task.translation], { type: 'text/markdown;charset=utf-8' }), `${name}_${lang}.md`);
+    };
+
+    // Re-translate — open language dialog
+    indicator.querySelector('#retranslate-btn').onclick = () => {
+        indicator.remove();
+        isViewingTranslation = false;
+        resetResultRenderCache(task.id);
+        lastRenderedHtml = '';
+        renderResultPane(task);
+        showTranslateLangDialog(task, true);
+    };
+
+    // View original — just toggle state, don't remove indicator tracking
+    indicator.querySelector('#view-original-btn').onclick = () => {
+        isViewingTranslation = false;
+        indicator.remove();
+        resetResultRenderCache(task.id);
+        lastRenderedHtml = '';
+        renderResultPane(task);
+        updateActionState(task);
+    };
+    els.markdownView.parentElement.insertBefore(indicator, els.markdownView);
+}
+
+// Display names for translation target languages
+const LANG_DISPLAY_NAMES = {
+    'zh-CN': '简体中文', 'zh-TW': '繁體中文',
+    'en': 'English', 'ja': '日本語', 'ko': '한국어',
+    'fr': 'Français', 'de': 'Deutsch', 'es': 'Español',
+    'pt': 'Português', 'ru': 'Русский', 'ar': 'العربية',
+    'it': 'Italiano', 'nl': 'Nederlands', 'pl': 'Polski',
+    'tr': 'Türkçe', 'vi': 'Tiếng Việt', 'th': 'ไทย',
+    'id': 'Bahasa Indonesia', 'ms': 'Bahasa Melayu', 'hi': 'हिन्दी',
+};
 
 async function downloadActiveTask() {
     const task = getActiveTask();
@@ -2944,6 +4039,30 @@ async function renderPDFPageDataUrl(pdf, pageNumber, scale) {
     return canvas.toDataURL('image/jpeg', 0.78);
 }
 
+async function renderPDFPageDataUrlFromSource(taskId, pageNumber, scale) {
+    // Render a PDF page thumbnail from the server — extract just one page
+    // to avoid downloading the entire PDF into browser memory
+    try {
+        const pageUrl = `${API_BASE}/tasks/${encodeURIComponent(taskId)}/source/pages?start_page=${pageNumber}&end_page=${pageNumber}`;
+        const response = await apiFetch(pageUrl);
+        if (!response.ok) throw new Error(t('无法加载 PDF 页面'));
+        const arrayBuffer = await response.arrayBuffer();
+        const pdf = await loadPdf(arrayBuffer.slice(0));
+        return renderPDFPageDataUrl(pdf, 1, scale);
+    } catch (err) {
+        // Fallback: return empty thumbnail
+        console.warn('Failed to render thumbnail from server', err);
+        return null;
+    }
+}
+
+async function loadPdfFromUrl(url) {
+    const response = await apiFetch(url);
+    if (!response.ok) throw new Error(t('无法加载 PDF'));
+    const arrayBuffer = await response.arrayBuffer();
+    return loadPdf(arrayBuffer);
+}
+
 async function createPDFBatchBlob(sourcePdf, startPage, endPage) {
     return new Blob([await createPDFBatchBytes(sourcePdf, startPage, endPage)], { type: 'application/pdf' });
 }
@@ -2977,17 +4096,25 @@ async function ensureBatchPayload(task, batch) {
         return;
     }
 
-    if (task.sourceUrl && !task.sourceDataUrl) {
+    // Always use server-side page extraction for PDF batches.
+    // This avoids loading the entire PDF into browser memory (PDF-lib).
+    if (task.sourceUrl) {
         batch.payloadBlob = await fetchPdfBatchBlob(task, batch.startPage, batch.endPage);
         return;
     }
 
-    let sourcePdf = sourcePdfCache.get(task.id);
-    if (!sourcePdf) {
-        sourcePdf = await PDFLib.PDFDocument.load(await getTaskSourceBytes(task));
-        sourcePdfCache.set(task.id, sourcePdf);
+    // Fallback: only use client-side PDF-lib for small PDFs with sourceDataUrl
+    if (task.sourceDataUrl && (task.size || 0) <= chunkedUploadThreshold) {
+        let sourcePdf = sourcePdfCache.get(task.id);
+        if (!sourcePdf) {
+            sourcePdf = await PDFLib.PDFDocument.load(await getTaskSourceBytes(task));
+            sourcePdfCache.set(task.id, sourcePdf);
+        }
+        batch.payloadBlob = await createPDFBatchBlob(sourcePdf, batch.startPage, batch.endPage);
+        return;
     }
-    batch.payloadBlob = await createPDFBatchBlob(sourcePdf, batch.startPage, batch.endPage);
+
+    throw new Error(t('缺少源 PDF，无法继续解析'));
 }
 
 function releaseBatchPayload(batch) {
@@ -3073,7 +4200,25 @@ function renderMarkdownHtml(markdown) {
     math.forEach((value, index) => {
         html = html.split(mathToken(index)).join(value);
     });
-    return window.DOMPurify ? DOMPurify.sanitize(html, { ADD_TAGS: ['math', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt', 'mroot', 'munder', 'mover', 'munderover', 'mtable', 'mtr', 'mtd', 'mtext', 'mspace', 'mpadded', 'menclose', 'mfenced', 'mstyle', 'annotation'], ADD_ATTR: ['display', 'mathvariant', 'encoding', 'stretchy', 'lspace', 'rspace', 'minsize', 'maxsize', 'movablelimits', 'symmetric', 'largeop', 'accent', 'linethickness', 'scriptlevel', 'displaystyle', 'xmlns'] }) : html;
+    if (!window.DOMPurify) return html;
+    // For large documents (>50KB), use a faster sanitize pass.
+    // OCR results come from our own server — not user-generated XSS vectors.
+    // Math blocks are already stashed/replaced with safe tokens.
+    if (html.length > 50000) {
+        return DOMPurify.sanitize(html, {
+            ADD_TAGS: ['math', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt', 'mroot', 'munder', 'mover', 'munderover', 'mtable', 'mtr', 'mtd', 'mtext', 'mspace', 'mpadded', 'menclose', 'mfenced', 'mstyle', 'annotation'],
+            ADD_ATTR: ['display', 'mathvariant', 'encoding', 'stretchy', 'lspace', 'rspace', 'minsize', 'maxsize', 'movablelimits', 'symmetric', 'largeop', 'accent', 'linethickness', 'scriptlevel', 'displaystyle', 'xmlns'],
+            ALLOW_DATA_ATTR: true,
+            // Allow data:image src attributes for inline images
+            ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp|data):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+        });
+    }
+    return DOMPurify.sanitize(html, {
+        ADD_TAGS: ['math', 'semantics', 'mrow', 'mi', 'mo', 'mn', 'msup', 'msub', 'mfrac', 'msqrt', 'mroot', 'munder', 'mover', 'munderover', 'mtable', 'mtr', 'mtd', 'mtext', 'mspace', 'mpadded', 'menclose', 'mfenced', 'mstyle', 'annotation'],
+        ADD_ATTR: ['display', 'mathvariant', 'encoding', 'stretchy', 'lspace', 'rspace', 'minsize', 'maxsize', 'movablelimits', 'symmetric', 'largeop', 'accent', 'linethickness', 'scriptlevel', 'displaystyle', 'xmlns'],
+        ALLOW_DATA_ATTR: true,
+        ALLOWED_URI_REGEXP: /^(?:(?:(?:f|ht)tps?|mailto|tel|callto|cid|xmpp|data):|[^a-z]|[a-z+.\-]+(?:[^a-z+.\-:]|$))/i,
+    });
 }
 
 function stashMathSegments(markdown) {
@@ -3111,7 +4256,12 @@ function renderMathWhenReady(container, retries = 20) {
                 { left: '\\(', right: '\\)', display: false },
                 { left: '$', right: '$', display: false }
             ],
-            ignoredTags: ['script', 'noscript', 'style', 'textarea', 'code', 'pre'],
+            // Only render elements not already processed by KaTeX
+            preProcess: (el) => {
+                if (el.querySelector && el.querySelector('.katex')) return null;
+                return el;
+            },
+            ignoredTags: ['script', 'noscript', 'style', 'textarea', 'code', 'pre', 'katex'],
             throwOnError: false,
             strict: false,
             trust: true,
@@ -3716,11 +4866,11 @@ function rewriteMarkdownImageMaps(value, batchId) {
 }
 
 function normalizeOCRJsonResults(result) {
-    if (Array.isArray(result.layoutParsingResults)) {
-        return result.layoutParsingResults;
-    }
     if (Array.isArray(result.pages)) {
         return result.pages;
+    }
+    if (Array.isArray(result.layoutParsingResults)) {
+        return result.layoutParsingResults;
     }
     if (Array.isArray(result.results)) {
         return result.results;
@@ -3875,21 +5025,25 @@ function syncPdfBatchSizeSetting() {
     return batchSize;
 }
 
-function handlePdfBatchSizeInput() {
-    if (!els.pdfBatchSizeInput) return;
-    const rawValue = els.pdfBatchSizeInput.value;
+function handlePdfBatchSizeInput(event) {
+    const input = event?.target || els.pdfBatchSizeInput;
+    if (!input) return;
+    const rawValue = input.value;
     if (rawValue === '') return;
     const parsed = Number.parseInt(rawValue, 10);
     if (!Number.isFinite(parsed)) return;
     const batchSize = clampPdfBatchSize(parsed);
     if (String(parsed) !== String(batchSize)) {
-        els.pdfBatchSizeInput.value = String(batchSize);
+        input.value = String(batchSize);
     }
     localStorage.setItem(PDF_BATCH_SIZE_STORAGE_KEY, String(batchSize));
 }
 
 function getConfiguredPdfBatchSize() {
-    const rawValue = els.pdfBatchSizeInput?.value || localStorage.getItem(PDF_BATCH_SIZE_STORAGE_KEY);
+    // Check model-specific batch size inputs first, then fall back to the shared one
+    const modelId = selectedModelId;
+    const modelInput = document.getElementById(`pdf-batch-size-input-${modelId}`);
+    const rawValue = modelInput?.value || els.pdfBatchSizeInput?.value || localStorage.getItem(PDF_BATCH_SIZE_STORAGE_KEY);
     return clampPdfBatchSize(rawValue);
 }
 
@@ -4054,4 +5208,315 @@ function updateMineruMarkdown(task) {
 
     task.markdown = md;
     saveTask(task);
+}
+
+// ── Folder Management ─────────────────────────────────────────
+
+async function loadFolders() {
+    try {
+        const resp = await fetch('/api/folders');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        folders = data.folders || [];
+        renderFolderSelect();
+    } catch (err) {
+        console.error('Failed to load folders:', err);
+    }
+}
+
+function renderFolderSelect() {
+    const sel = els.folderSelect;
+    if (!sel) return;
+    const current = sel.value;
+    // Keep first option ("全部文件")
+    while (sel.options.length > 1) sel.remove(1);
+    for (const f of folders) {
+        const opt = document.createElement('option');
+        opt.value = f.id;
+        opt.textContent = `${f.name} (${f.taskCount ?? 0})`;
+        sel.appendChild(opt);
+    }
+    // Restore selection if still valid
+    if (current && folders.some(f => f.id === current)) {
+        sel.value = current;
+    }
+}
+
+async function createFolderDialog() {
+    const name = prompt(t('请输入文件夹名称：'));
+    if (!name) return;
+    try {
+        const resp = await fetch('/api/folders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name }),
+        });
+        if (!resp.ok) {
+            const data = await resp.json();
+            alert(data.detail || t('创建文件夹失败'));
+            return;
+        }
+        await loadFolders();
+        // Auto-select the new folder
+        const newFolder = folders[folders.length - 1];
+        if (newFolder) {
+            els.folderSelect.value = newFolder.id;
+            activeFolderId = newFolder.id;
+            renderTaskList();
+        }
+    } catch (err) {
+        console.error('Failed to create folder:', err);
+        alert(t('创建文件夹失败'));
+    }
+}
+
+function handleFolderSelectChange() {
+    activeFolderId = els.folderSelect.value || null;
+    renderTaskList();
+}
+
+function handleFolderContextMenu(e) {
+    e.preventDefault();
+    const folderId = els.folderSelect.value;
+    if (!folderId) return;
+    const folder = folders.find(f => f.id === folderId);
+    if (!folder) return;
+
+    const menu = document.createElement('div');
+    menu.className = 'folder-context-menu';
+    menu.innerHTML = `
+        <button class="folder-menu-item" data-action="rename">${t('重命名')}</button>
+        <button class="folder-menu-item folder-menu-danger" data-action="delete">${t('删除文件夹')}</button>
+    `;
+    document.body.appendChild(menu);
+
+    // Position
+    const rect = els.folderSelect.getBoundingClientRect();
+    menu.style.top = rect.bottom + 4 + 'px';
+    menu.style.left = rect.left + 'px';
+
+    function closeMenu() { menu.remove(); }
+    menu.addEventListener('click', async (ev) => {
+        const action = ev.target.dataset.action;
+        closeMenu();
+        if (action === 'rename') {
+            const newName = prompt(t('请输入新名称：'), folder.name);
+            if (!newName || newName === folder.name) return;
+            try {
+                const resp = await fetch(`/api/folders/${folderId}`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: newName }),
+                });
+                if (resp.ok) {
+                    await loadFolders();
+                    await loadTasks();
+                    renderTaskList();
+                }
+            } catch (err) {
+                console.error('Rename folder failed:', err);
+            }
+        } else if (action === 'delete') {
+            if (!confirm(t('确定删除文件夹「{name}」？文件将移回根目录。', { name: folder.name }))) return;
+            try {
+                const resp = await fetch(`/api/folders/${folderId}`, { method: 'DELETE' });
+                if (resp.ok) {
+                    activeFolderId = null;
+                    els.folderSelect.value = '';
+                    await loadFolders();
+                    await loadTasks();
+                    renderTaskList();
+                }
+            } catch (err) {
+                console.error('Delete folder failed:', err);
+            }
+        }
+    });
+    // Close on outside click
+    setTimeout(() => {
+        document.addEventListener('click', function handler(ev) {
+            if (!menu.contains(ev.target)) {
+                closeMenu();
+                document.removeEventListener('click', handler);
+            }
+        });
+    }, 0);
+}
+
+async function moveTaskToFolder(taskId, targetFolderId) {
+    try {
+        const resp = await fetch(`/api/tasks/${taskId}/folder`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ folderId: targetFolderId || null }),
+        });
+        if (resp.ok) {
+            await loadFolders();
+            await loadTasks();
+            renderTaskList();
+        } else {
+            const data = await resp.json();
+            alert(data.detail || t('移动失败'));
+        }
+    } catch (err) {
+        console.error('Move task failed:', err);
+        alert(t('移动失败'));
+    }
+}
+
+// ── Drag & Drop for tasks into folders ────────────────────────────
+
+function setupTaskDragDrop(el, taskId) {
+    el.addEventListener('dragstart', (e) => {
+        draggedTaskId = taskId;
+        e.dataTransfer.effectAllowed = 'move';
+        e.dataTransfer.setData('text/plain', taskId);
+        el.classList.add('dragging');
+    });
+    el.addEventListener('dragend', () => {
+        draggedTaskId = null;
+        el.classList.remove('dragging');
+        // Remove drop highlight from sidebar
+        els.sidebar?.classList.remove('folder-drop-active');
+    });
+}
+
+// Set up the sidebar as a drop target — when a folder is selected in the
+// dropdown, dropping a task on the sidebar moves it into that folder.
+// When "全部文件" is selected, dropping moves the task OUT of any folder.
+(function initFolderDropZone() {
+    const sidebar = document.getElementById('sidebar');
+    if (!sidebar) return;
+
+    sidebar.addEventListener('dragover', (e) => {
+        if (!draggedTaskId) return;
+        // Only activate if user has a folder selected (not "全部文件")
+        const targetFolderId = els.folderSelect?.value;
+        if (targetFolderId) {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            sidebar.classList.add('folder-drop-active');
+        }
+    });
+
+    sidebar.addEventListener('dragleave', (e) => {
+        // Only remove highlight if actually leaving the sidebar
+        if (!sidebar.contains(e.relatedTarget)) {
+            sidebar.classList.remove('folder-drop-active');
+        }
+    });
+
+    sidebar.addEventListener('drop', async (e) => {
+        e.preventDefault();
+        sidebar.classList.remove('folder-drop-active');
+        const taskId = e.dataTransfer.getData('text/plain') || draggedTaskId;
+        if (!taskId) return;
+        const targetFolderId = els.folderSelect?.value || null;
+        if (targetFolderId) {
+            await moveTaskToFolder(taskId, targetFolderId);
+        }
+        draggedTaskId = null;
+    });
+})();
+
+// ── Right-click context menu for task folder assignment ─────────────
+
+function showTaskFolderMenu(e, task) {
+    // Remove any existing menu
+    document.getElementById('task-folder-menu')?.remove();
+
+    const menu = document.createElement('div');
+    menu.id = 'task-folder-menu';
+    menu.className = 'folder-context-menu';
+
+    // Build folder options
+    let html = '';
+    if (folders.length === 0) {
+        html = `<button class="folder-menu-item" data-action="create">${t('新建文件夹')}</button>`;
+    } else {
+        // "移出文件夹" option (only if task is currently in a folder)
+        if (task.folderId) {
+            html += `<button class="folder-menu-item" data-action="remove">${t('移出文件夹')}</button>`;
+        }
+        // List all folders as options
+        for (const f of folders) {
+            const isCurrent = f.id === task.folderId;
+            const icon = isCurrent ? '✓ ' : '';
+            html += `<button class="folder-menu-item${isCurrent ? ' current-folder' : ''}" data-folder-id="${f.id}">${icon}${f.name}</button>`;
+        }
+        html += `<div class="folder-menu-divider"></div>`;
+        html += `<button class="folder-menu-item" data-action="create">${t('新建文件夹')}</button>`;
+    }
+
+    menu.innerHTML = html;
+    document.body.appendChild(menu);
+
+    // Position the menu near the click point
+    menu.style.top = e.clientY + 'px';
+    menu.style.left = e.clientX + 'px';
+    // Adjust if menu would overflow viewport
+    requestAnimationFrame(() => {
+        const rect = menu.getBoundingClientRect();
+        if (rect.right > window.innerWidth) {
+            menu.style.left = (window.innerWidth - rect.width - 8) + 'px';
+        }
+        if (rect.bottom > window.innerHeight) {
+            menu.style.top = (window.innerHeight - rect.height - 8) + 'px';
+        }
+    });
+
+    function closeMenu() { menu.remove(); }
+
+    menu.addEventListener('click', async (ev) => {
+        const btn = ev.target.closest('.folder-menu-item');
+        if (!btn) return;
+        closeMenu();
+
+        const action = btn.dataset.action;
+        const folderId = btn.dataset.folderId;
+
+        if (action === 'remove') {
+            // Move task out of current folder
+            await moveTaskToFolder(task.id, null);
+        } else if (action === 'create') {
+            // Create a new folder and move task into it
+            const name = prompt(t('请输入文件夹名称：'));
+            if (!name) return;
+            try {
+                const resp = await fetch('/api/folders', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name }),
+                });
+                if (!resp.ok) {
+                    const data = await resp.json();
+                    alert(data.detail || t('创建文件夹失败'));
+                    return;
+                }
+                const newFolder = resp.json ? await resp.json() : null;
+                if (newFolder?.id) {
+                    await moveTaskToFolder(task.id, newFolder.id);
+                }
+            } catch (err) {
+                console.error('Create folder failed:', err);
+                alert(t('创建文件夹失败'));
+            }
+        } else if (folderId) {
+            // Move task into the selected folder
+            await moveTaskToFolder(task.id, folderId);
+        }
+    });
+
+    // Close on outside click or scroll
+    setTimeout(() => {
+        const handler = (ev) => {
+            if (!menu.contains(ev.target)) {
+                closeMenu();
+                document.removeEventListener('click', handler);
+                document.removeEventListener('scroll', handler, true);
+            }
+        };
+        document.addEventListener('click', handler);
+        document.addEventListener('scroll', handler, true);
+    }, 0);
 }

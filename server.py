@@ -21,8 +21,9 @@ from fastapi import FastAPI, HTTPException, File, UploadFile, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, Response, JSONResponse
+from starlette.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 logger = logging.getLogger("pandocr")
 logging.basicConfig(level=os.getenv("PANDOCR_LOG_LEVEL", "INFO"))
@@ -51,10 +52,20 @@ PADDLE_OCR_SERVICE_URL = os.getenv("PADDLE_OCR_SERVICE_URL", "http://localhost:8
 PPOCR_V6_MODEL_NAME = os.getenv("PPOCR_V6_MODEL_NAME", "PP-OCRv6_medium")
 MINERU_SERVICE_URL = os.getenv("MINERU_SERVICE_URL", "http://localhost:8083")
 MINERU_MODEL_NAME = os.getenv("MINERU_MODEL_NAME", "MinerU2.5-Pro-2605-1.2B")
+OLLAMA_BASE_URL = os.getenv("PANDOCR_OLLAMA_BASE_URL", "http://localhost:11434").strip()
+OLLAMA_MODEL = os.getenv("PANDOCR_OLLAMA_MODEL", "glm-ocr").strip()
+OLLAMA_NUM_CTX = int(os.getenv("PANDOCR_OLLAMA_NUM_CTX", "8192"))
+OLLAMA_NUM_PREDICT = int(os.getenv("PANDOCR_OLLAMA_NUM_PREDICT", "4096"))
 PADDLE_REQUEST_TIMEOUT = float(os.getenv("PADDLE_REQUEST_TIMEOUT", "3600"))
 PROJECT_ROOT = Path(__file__).resolve().parent
 TASK_DATA_DIR = Path(os.getenv("PANDOCR_TASK_DATA_DIR", "data/tasks")).resolve()
 MAX_REQUEST_BYTES = int(float(os.getenv("PANDOCR_MAX_UPLOAD_MB", "512")) * 1024 * 1024)
+MAX_TOTAL_UPLOAD_BYTES = int(float(os.getenv("PANDOCR_MAX_TOTAL_UPLOAD_MB", "4096")) * 1024 * 1024)
+DEFAULT_CHUNK_SIZE = int(float(os.getenv("PANDOCR_DEFAULT_CHUNK_SIZE_MB", "10")) * 1024 * 1024)
+CHUNKED_UPLOAD_THRESHOLD = int(float(os.getenv("PANDOCR_CHUNKED_UPLOAD_THRESHOLD_MB", "100")) * 1024 * 1024)
+MAX_BATCH_BYTES = int(float(os.getenv("PANDOCR_MAX_BATCH_MB", "200")) * 1024 * 1024)
+UPLOAD_SESSION_DIR = Path(os.getenv("PANDOCR_UPLOAD_DIR", "data/uploads")).resolve()
+UPLOAD_SESSION_TTL_HOURS = float(os.getenv("PANDOCR_UPLOAD_TTL_HOURS", "24"))
 PANDOCR_HOST = os.getenv("PANDOCR_HOST", "0.0.0.0")
 PANDOCR_PORT = int(os.getenv("PANDOCR_PORT", "8000"))
 MODEL_CONTROL_MODE = os.getenv("PANDOCR_MODEL_CONTROL", "docker").strip().lower()
@@ -65,9 +76,13 @@ API_TOKEN = os.getenv("PANDOCR_API_TOKEN", "").strip()
 ENABLE_API_DOCS = parse_bool_env("PANDOCR_ENABLE_API_DOCS", "0")
 ENFORCE_ORIGIN_CHECK = parse_bool_env("PANDOCR_ENFORCE_ORIGIN_CHECK", "1")
 MAX_CONCURRENT_OCR = parse_positive_int_env("PANDOCR_MAX_CONCURRENT_OCR", "1")
+TRANSLATE_API_URL = os.getenv("PANDOCR_TRANSLATE_API_URL", "").strip()
+TRANSLATE_API_KEY = os.getenv("PANDOCR_TRANSLATE_API_KEY", "").strip()
+TRANSLATE_MODEL = os.getenv("PANDOCR_TRANSLATE_MODEL", "gpt-4o-mini").strip()
 TASK_STORE_MARKER = ".pandocr-task-store"
 TASK_RESULT_FILE = "result.json"
 TASK_SUMMARY_FILE = "summary.json"
+FOLDER_STORE_FILE = "folders.json"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
 CORS_ORIGINS = parse_csv_env(
     "PANDOCR_CORS_ORIGINS",
@@ -93,6 +108,12 @@ MODEL_RUNTIME_CONFIG = {
         "stop_order": ["mineru-api"],
         "health_url": f"{MINERU_SERVICE_URL}/health",
     },
+    "glm-ocr": {
+        "containers": ["paddleocr-ocr-api"],  # PP-OCRv6 stays running for layout detection
+        "start_order": ["paddleocr-ocr-api"],
+        "stop_order": [],  # Don't stop PP-OCRv6 when switching away from glm-ocr
+        "health_url": f"{OLLAMA_BASE_URL}/api/tags",
+    },
 }
 DEFAULT_RUNTIME_MODEL_ID = MODEL_RUNTIME_STARTUP if MODEL_RUNTIME_STARTUP in MODEL_RUNTIME_CONFIG else "paddleocr-vl-1.6"
 
@@ -111,6 +132,27 @@ ocr_active_count = 0
 
 class ModelSwitchRequest(BaseModel):
     modelId: str
+
+
+class CreateUploadRequest(BaseModel):
+    filename: str
+    totalSize: int
+    chunkSize: int = DEFAULT_CHUNK_SIZE
+    taskId: str | None = None
+
+    @field_validator("filename")
+    @classmethod
+    def sanitize_filename(cls, v: str) -> str:
+        # Strip directory components and reject suspicious names
+        safe_name = Path(v).name
+        if not safe_name or safe_name.startswith("."):
+            raise ValueError("Invalid filename")
+        return safe_name
+
+
+class ProcessRequest(BaseModel):
+    modelId: str
+    ocrOptions: dict = Field(default_factory=dict)
 
 
 def model_catalog() -> list[dict]:
@@ -135,6 +177,13 @@ def model_catalog() -> list[dict]:
             "label": "MinerU",
             "kind": "document_parsing",
             "endpoint": "/api/mineru",
+        },
+        {
+            "id": "glm-ocr",
+            "name": OLLAMA_MODEL,
+            "label": "GLM-OCR (Ollama)",
+            "kind": "document_parsing",
+            "endpoint": "/api/glm-ocr",
         },
     ]
 
@@ -209,6 +258,45 @@ async def check_http_health(url: str) -> bool:
 
 async def model_runtime_status(model_id: str) -> dict:
     config = MODEL_RUNTIME_CONFIG[model_id]
+
+    # GLM-OCR (Ollama) has no Docker containers; use HTTP health check directly
+    if model_id == "glm-ocr":
+        containers = []
+        health_ok = await check_http_health(config["health_url"])
+        # For Ollama, also verify the model is loaded
+        if health_ok:
+            try:
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        models = [m["name"] for m in data.get("models", [])]
+                        has_model = any(OLLAMA_MODEL in m for m in models)
+                        if has_model:
+                            state = "ready"
+                        else:
+                            state = "model_missing"
+                        return {
+                            "id": model_id,
+                            "containers": containers,
+                            "running": True,
+                            "ready": has_model,
+                            "state": state,
+                            "healthUrl": config["health_url"],
+                            "ollamaModel": OLLAMA_MODEL,
+                        }
+            except Exception:
+                pass
+        return {
+            "id": model_id,
+            "containers": containers,
+            "running": False,
+            "ready": False,
+            "state": "offline",
+            "healthUrl": config["health_url"],
+            "ollamaModel": OLLAMA_MODEL,
+        }
+
     containers = [await inspect_container(name) for name in config["containers"]]
     if not model_control_available():
         health_ok = await check_http_health(config["health_url"])
@@ -250,9 +338,11 @@ async def build_model_runtime_payload() -> dict:
         model_id: await model_runtime_status(model_id)
         for model_id in MODEL_RUNTIME_CONFIG
     }
-    ready_models = [model_id for model_id, status in models.items() if status["ready"]]
-    running_models = [model_id for model_id, status in models.items() if status["running"]]
-    active_model = ready_models[0] if ready_models else (running_models[0] if running_models else None)
+    active_model = model_runtime_operation.get("targetModelId", DEFAULT_RUNTIME_MODEL_ID)
+    
+    # If the target model failed, and another model is ready, we could fallback,
+    # but it's better to stay on the target model and show the error state.
+    
     return {
         "controlMode": MODEL_CONTROL_MODE,
         "controlAvailable": model_control_available(),
@@ -301,23 +391,26 @@ async def wait_container_runtime_ready(container_name: str, timeout: float) -> N
 async def activate_model_runtime(model_id: str) -> None:
     if model_id not in MODEL_RUNTIME_CONFIG:
         raise ValueError(f"Unknown model id: {model_id}")
-    if not model_control_available():
+    # glm-ocr doesn't need Docker — Ollama runs externally
+    if model_id != "glm-ocr" and not model_control_available():
         raise RuntimeError("Docker model control is not available")
 
     async with model_runtime_lock:
         set_model_runtime_operation("switching", f"Switching to {model_id}", model_id)
         switch_started_at = time.monotonic()
         try:
-            for other_model_id, config in MODEL_RUNTIME_CONFIG.items():
-                if other_model_id == model_id:
-                    continue
-                for container_name in config["stop_order"]:
-                    await docker_container_action(container_name, "stop")
+            # Stop other models' containers (skip if Docker is unavailable)
+            if model_control_available():
+                for other_model_id, config in MODEL_RUNTIME_CONFIG.items():
+                    if other_model_id == model_id:
+                        continue
+                    for container_name in config["stop_order"]:
+                        await docker_container_action(container_name, "stop")
 
-            for container_name in MODEL_RUNTIME_CONFIG[model_id]["start_order"]:
-                remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
-                await docker_container_action(container_name, "start")
-                await wait_container_runtime_ready(container_name, remaining_timeout)
+                for container_name in MODEL_RUNTIME_CONFIG[model_id]["start_order"]:
+                    remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
+                    await docker_container_action(container_name, "start")
+                    await wait_container_runtime_ready(container_name, remaining_timeout)
 
             remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
             await wait_model_ready(model_id, remaining_timeout)
@@ -331,7 +424,8 @@ async def schedule_model_runtime_activation(model_id: str) -> None:
     global model_runtime_task
     if model_id not in MODEL_RUNTIME_CONFIG:
         raise HTTPException(status_code=400, detail="Unknown model id")
-    if not model_control_available():
+    # glm-ocr doesn't need Docker — Ollama runs externally
+    if model_id != "glm-ocr" and not model_control_available():
         raise HTTPException(status_code=503, detail="Docker model control is not available")
     async with model_runtime_lock:
         if ocr_active_count > 0:
@@ -345,6 +439,11 @@ async def schedule_model_runtime_activation(model_id: str) -> None:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     ensure_task_data_dir()
+    ensure_upload_dir()
+    # Clean up stale chunked upload sessions
+    await run_in_threadpool(cleanup_stale_uploads)
+    # Crash recovery: reset tasks stuck in "processing" state
+    await run_in_threadpool(reset_stuck_processing_tasks)
     if model_control_available():
         await schedule_model_runtime_activation(DEFAULT_RUNTIME_MODEL_ID)
     yield
@@ -412,17 +511,20 @@ async def enforce_request_security(request: Request, call_next):
         return JSONResponse(status_code=401, content={"detail": "Missing or invalid API token"})
 
     if request.method in {"POST", "PUT", "PATCH"} and MAX_REQUEST_BYTES > 0:
-        content_length = request.headers.get("content-length")
-        if content_length:
-            try:
-                if int(content_length) > MAX_REQUEST_BYTES:
-                    max_mb = MAX_REQUEST_BYTES / 1024 / 1024
-                    return JSONResponse(
-                        status_code=413,
-                        content={"detail": f"Request body is too large. Max upload size is {max_mb:.0f} MB."},
-                    )
-            except ValueError:
-                pass
+        # Chunk upload endpoints are exempt: each chunk is small (≤ chunkSize)
+        is_chunk_upload = request.url.path.startswith("/api/uploads/") and "/chunks/" in request.url.path
+        if not is_chunk_upload:
+            content_length = request.headers.get("content-length")
+            if content_length:
+                try:
+                    if int(content_length) > MAX_REQUEST_BYTES:
+                        max_mb = MAX_REQUEST_BYTES / 1024 / 1024
+                        return JSONResponse(
+                            status_code=413,
+                            content={"detail": f"Request body is too large. Max upload size is {max_mb:.0f} MB."},
+                        )
+                except ValueError:
+                    pass
 
     response = await call_next(request)
     response.headers.setdefault("X-Content-Type-Options", "nosniff")
@@ -458,6 +560,10 @@ async def get_models():
         "default": DEFAULT_RUNTIME_MODEL_ID,
         "data": model_catalog(),
         "maxUploadBytes": MAX_REQUEST_BYTES,
+        "maxTotalUploadBytes": MAX_TOTAL_UPLOAD_BYTES,
+        "chunkedUploadThreshold": CHUNKED_UPLOAD_THRESHOLD,
+        "defaultChunkSize": DEFAULT_CHUNK_SIZE,
+        "maxBatchBytes": MAX_BATCH_BYTES,
         "authRequired": bool(API_TOKEN),
         "originProtection": ENFORCE_ORIGIN_CHECK,
         "maxConcurrentOcr": MAX_CONCURRENT_OCR,
@@ -547,7 +653,7 @@ def split_task_for_storage(task: dict) -> tuple[dict, dict | None]:
     preserve_result = bool(stored.pop("_preserveResult", False))
 
     result_payload = {}
-    for key in ("markdown", "images", "ocrResults"):
+    for key in ("markdown", "images", "ocrResults", "translation", "translationLang"):
         if key in stored:
             result_payload[key] = stored.pop(key)
 
@@ -636,6 +742,8 @@ def task_summary(task: dict) -> dict:
         "batchCount": len(batches),
         "hasMarkdown": bool(result_state.get("hasMarkdown") or task.get("markdown")),
         "hasOcrResults": bool(result_state.get("hasOcrResults") or task.get("ocrResults")),
+        "folderId": task.get("folderId"),
+        "folderName": task.get("folderName"),
         "detailLoaded": False,
     }
 
@@ -672,7 +780,14 @@ def write_task_bundle(task_id: str, task: dict) -> dict:
     elif stored_task.get("_storage", {}).get("resultPath"):
         write_json_file(result_path, result_payload)
     elif result_path.exists():
-        result_path.unlink()
+        # SAFETY: Never delete an existing result.json even if the current
+        # payload is empty. The task may have accumulated results from
+        # previous processing runs that aren't in the current task object
+        # (e.g., after crash recovery without hydration).
+        # Only overwrite if we actually have data to write.
+        if any(bool(result_payload.get(key)) for key in ("markdown", "images", "ocrResults", "batchMarkdown", "translation")):
+            write_json_file(result_path, result_payload)
+        # else: keep existing result.json intact
 
     write_json_file(task_file_path(task_id), stored_task)
     summary = task_summary(stored_task)
@@ -687,7 +802,7 @@ def hydrate_task_detail(task_id: str, task: dict) -> dict:
     if result_path.exists():
         try:
             result_payload = read_json_file(result_path)
-            for key in ("markdown", "images", "ocrResults"):
+            for key in ("markdown", "images", "ocrResults", "translation", "translationLang"):
                 if key in result_payload:
                     task[key] = result_payload[key]
             batch_markdown = result_payload.get("batchMarkdown")
@@ -701,6 +816,24 @@ def hydrate_task_detail(task_id: str, task: dict) -> dict:
     task.setdefault("markdown", "")
     task.setdefault("images", {})
     task.setdefault("ocrResults", [])
+
+    # Migrate legacy nested format: old compact_ocr_json_result wrapped
+    # the page result inside a "result" key. The frontend expects fields
+    # like parser, ocrLines, pageImage at the top level.
+    ocr_results = task.get("ocrResults")
+    if isinstance(ocr_results, list):
+        for i, item in enumerate(ocr_results):
+            if not isinstance(item, dict):
+                continue
+            inner = item.get("result")
+            if isinstance(inner, dict) and ("parser" in inner or "ocrLines" in inner):
+                # Merge inner fields to top level, preserving metadata
+                merged = dict(inner)
+                for meta_key in ("batchId", "pageIndex", "label", "sourcePage"):
+                    if meta_key in item and meta_key not in merged:
+                        merged[meta_key] = item[meta_key]
+                ocr_results[i] = merged
+
     return task
 
 
@@ -755,6 +888,159 @@ def list_task_summaries() -> list[dict]:
     return tasks
 
 
+# ---------------------------------------------------------------------------
+# Folder management
+# ---------------------------------------------------------------------------
+
+def folder_store_path() -> Path:
+    return TASK_DATA_DIR / FOLDER_STORE_FILE
+
+
+def read_folder_store() -> dict:
+    ensure_task_data_dir()
+    path = folder_store_path()
+    if not path.exists():
+        return {"folders": []}
+    try:
+        return read_json_file(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"folders": []}
+
+
+def write_folder_store(store: dict) -> None:
+    ensure_task_data_dir()
+    write_json_file(folder_store_path(), store)
+
+
+def sanitize_folder_name(name: str) -> str:
+    """Sanitize folder name: strip, collapse whitespace, reject empty or dots-only."""
+    clean = re.sub(r"\s+", " ", name.strip())
+    if not clean or clean.strip(".") == "":
+        raise HTTPException(status_code=400, detail="Invalid folder name")
+    if len(clean) > 100:
+        raise HTTPException(status_code=400, detail="Folder name too long (max 100 characters)")
+    return clean
+
+
+@app.get("/api/folders")
+async def list_folders():
+    """Return all folders with their task counts."""
+    store = await run_in_threadpool(read_folder_store)
+    folder_task_counts = {}
+    for folder in store.get("folders", []):
+        folder_task_counts[folder["id"]] = 0
+    # Count tasks per folder
+    tasks = await run_in_threadpool(list_task_summaries)
+    for task in tasks:
+        fid = task.get("folderId")
+        if fid and fid in folder_task_counts:
+            folder_task_counts[fid] += 1
+    result = []
+    for folder in store.get("folders", []):
+        result.append({**folder, "taskCount": folder_task_counts.get(folder["id"], 0)})
+    return {"folders": result}
+
+
+class CreateFolderRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/folders")
+async def create_folder(req: CreateFolderRequest):
+    """Create a new folder."""
+    name = await run_in_threadpool(sanitize_folder_name, req.name)
+    store = await run_in_threadpool(read_folder_store)
+    folder_id = secrets.token_urlsafe(8)
+    now = time.time()
+    folder = {
+        "id": folder_id,
+        "name": name,
+        "createdAt": now,
+        "updatedAt": now,
+    }
+    store.setdefault("folders", []).append(folder)
+    await run_in_threadpool(write_folder_store, store)
+    return {**folder, "taskCount": 0}
+
+
+class RenameFolderRequest(BaseModel):
+    name: str
+
+
+@app.put("/api/folders/{folder_id}")
+async def rename_folder(folder_id: str, req: RenameFolderRequest):
+    """Rename a folder."""
+    name = await run_in_threadpool(sanitize_folder_name, req.name)
+    store = await run_in_threadpool(read_folder_store)
+    found = False
+    for folder in store.get("folders", []):
+        if folder["id"] == folder_id:
+            folder["name"] = name
+            folder["updatedAt"] = time.time()
+            found = True
+            break
+    if not found:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    await run_in_threadpool(write_folder_store, store)
+    return {"ok": True}
+
+
+@app.delete("/api/folders/{folder_id}")
+async def delete_folder(folder_id: str):
+    """Delete a folder. Tasks in the folder are moved to root (folderId cleared)."""
+    store = await run_in_threadpool(read_folder_store)
+    original_len = len(store.get("folders", []))
+    store["folders"] = [f for f in store.get("folders", []) if f["id"] != folder_id]
+    if len(store["folders"]) == original_len:
+        raise HTTPException(status_code=404, detail="Folder not found")
+    await run_in_threadpool(write_folder_store, store)
+    # Clear folderId from all tasks in this folder
+    await run_in_threadpool(clear_folder_from_tasks, folder_id)
+    return {"ok": True}
+
+
+def clear_folder_from_tasks(folder_id: str) -> None:
+    """Remove folderId from all tasks in the given folder."""
+    for path in TASK_DATA_DIR.glob("*/task.json"):
+        try:
+            task = read_task_file(path)
+            if task.get("folderId") == folder_id:
+                task.pop("folderId", None)
+                task.pop("folderName", None)
+                write_task_bundle(path.parent.name, task)
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+
+class MoveTaskToFolderRequest(BaseModel):
+    folderId: str | None = None  # None = move to root
+
+
+@app.put("/api/tasks/{task_id}/folder")
+async def move_task_to_folder(task_id: str, req: MoveTaskToFolderRequest):
+    """Move a task to a folder (or root if folderId is null)."""
+    path = task_file_path(task_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Task not found")
+    task = await run_in_threadpool(read_task_file, path)
+    # Hydrate to preserve result.json
+    task = hydrate_task_detail(task_id, task)
+
+    if req.folderId is None:
+        task.pop("folderId", None)
+        task.pop("folderName", None)
+    else:
+        store = await run_in_threadpool(read_folder_store)
+        folder = next((f for f in store.get("folders", []) if f["id"] == req.folderId), None)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Folder not found")
+        task["folderId"] = req.folderId
+        task["folderName"] = folder["name"]
+
+    stored = await run_in_threadpool(write_task_bundle, task_id, task)
+    return {"ok": True, "task": task_summary(stored)}
+
+
 def remove_task_dir(task_id: str) -> None:
     ensure_task_data_dir()
     path = task_dir_path(task_id).resolve()
@@ -769,6 +1055,122 @@ def clear_task_dirs() -> None:
     for path in TASK_DATA_DIR.iterdir():
         if path.is_dir() and re.fullmatch(r"[A-Za-z0-9_-]{6,80}", path.name):
             shutil.rmtree(path)
+
+
+def reset_stuck_processing_tasks() -> None:
+    """Reset tasks stuck in 'processing' state from a previous server crash.
+
+    IMPORTANT: Must hydrate the task before writing to preserve result.json.
+    Without hydration, split_task_for_storage sees no results and deletes result.json,
+    permanently losing all OCR data.
+    """
+    ensure_task_data_dir()
+    reset_count = 0
+    for path in TASK_DATA_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        task_path = path / "task.json"
+        if not task_path.exists():
+            continue
+        try:
+            task = read_task_file(task_path)
+            if task.get("status") == "processing":
+                # Hydrate to preserve result.json — without this, write_task_bundle
+                # would see an empty result_payload and DELETE result.json
+                task = hydrate_task_detail(path.name, task)
+                # Reset processing batches to pending so they can be resumed
+                for batch in task.get("batches", []):
+                    if isinstance(batch, dict) and batch.get("status") == "processing":
+                        batch["status"] = "pending"
+                task["status"] = "pending"
+                task["error"] = "Server restarted during processing; task reset to pending."
+                write_task_bundle(path.name, task)
+                reset_count += 1
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    if reset_count:
+        logger.info("Reset %d stuck processing task(s) on startup", reset_count)
+
+
+# ---------------------------------------------------------------------------
+# Chunked upload session helpers
+# ---------------------------------------------------------------------------
+
+# Per-upload locks to prevent TOCTOU races on meta.json during concurrent chunk uploads
+_upload_locks: dict[str, asyncio.Lock] = {}
+
+
+def _upload_session_dir(upload_id: str) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{6,80}", upload_id):
+        raise HTTPException(status_code=400, detail="Invalid upload id")
+    return UPLOAD_SESSION_DIR / upload_id
+
+
+def ensure_upload_dir() -> None:
+    """Ensure the upload session directory exists and is writable."""
+    UPLOAD_SESSION_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _upload_meta_path(upload_id: str) -> Path:
+    return _upload_session_dir(upload_id) / "meta.json"
+
+
+def _read_upload_meta(upload_id: str) -> dict:
+    path = _upload_meta_path(upload_id)
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Upload session not found")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as err:
+        raise HTTPException(status_code=500, detail=f"Failed to read upload session: {err}") from err
+
+
+def _write_upload_meta(upload_id: str, meta: dict) -> None:
+    path = _upload_meta_path(upload_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(meta, ensure_ascii=False), encoding="utf-8")
+
+
+def cleanup_stale_uploads() -> None:
+    """Remove upload sessions older than UPLOAD_SESSION_TTL_HOURS."""
+    if not UPLOAD_SESSION_DIR.exists():
+        return
+    cutoff = time.time() - UPLOAD_SESSION_TTL_HOURS * 3600
+    for entry in UPLOAD_SESSION_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        meta_path = entry / "meta.json"
+        if not meta_path.exists():
+            shutil.rmtree(entry, ignore_errors=True)
+            _upload_locks.pop(entry.name, None)
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            if meta.get("createdAt", 0) < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+                _upload_locks.pop(entry.name, None)
+                logger.info("Cleaned up stale upload session: %s", entry.name)
+        except (OSError, json.JSONDecodeError):
+            shutil.rmtree(entry, ignore_errors=True)
+            _upload_locks.pop(entry.name, None)
+
+
+def reassemble_chunks(upload_id: str, target_path: Path) -> int:
+    """Reassemble all chunks into a single file at *target_path*. Returns total bytes."""
+    meta = _read_upload_meta(upload_id)
+    session_dir = _upload_session_dir(upload_id)
+    total_chunks = meta["totalChunks"]
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    total = 0
+    with target_path.open("wb") as out:
+        for index in range(total_chunks):
+            chunk_path = session_dir / "chunks" / str(index)
+            if not chunk_path.exists():
+                raise HTTPException(status_code=400, detail=f"Missing chunk {index}")
+            data = chunk_path.read_bytes()
+            out.write(data)
+            total += len(data)
+    return total
 
 
 async def read_upload_bytes(file: UploadFile, max_bytes: int | None = None) -> bytes:
@@ -813,7 +1215,26 @@ async def write_upload_to_path(file: UploadFile, path: Path, max_bytes: int | No
     return total
 
 
-def extract_pdf_pages(source_path: Path, start_page: int, end_page: int) -> bytes:
+def get_pdf_page_count(source_path: Path) -> int:
+    """Read only the PDF cross-reference table to get page count. O(1) for most PDFs."""
+    from pypdf import PdfReader
+
+    reader = PdfReader(str(source_path))
+    try:
+        count = len(reader.pages)
+    finally:
+        if hasattr(reader, "stream"):
+            reader.stream.close()
+    return count
+
+
+def extract_pdf_pages(source_path: Path, start_page: int, end_page: int, output_path: Path | None = None) -> Path:
+    """Extract page range from source PDF.
+
+    If *output_path* is provided, writes to that file and returns it.
+    Otherwise writes to a temp file and returns the temp path.
+    Writing to a file avoids holding both input and output in memory.
+    """
     from pypdf import PdfReader, PdfWriter
 
     reader = PdfReader(str(source_path))
@@ -828,9 +1249,18 @@ def extract_pdf_pages(source_path: Path, start_page: int, end_page: int) -> byte
     for page_index in range(start_page - 1, end_page):
         writer.add_page(reader.pages[page_index])
 
-    output = io.BytesIO()
-    writer.write(output)
-    return output.getvalue()
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        with output_path.open("wb") as f:
+            writer.write(f)
+        return output_path
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            writer.write(tmp_file)
+            return Path(tmp_file.name)
+    except Exception:
+        raise
 
 
 @app.post("/api/tasks/{task_id}/source")
@@ -884,14 +1314,17 @@ async def get_task_source_pages(
         raise HTTPException(status_code=400, detail="end_page must be greater than or equal to start_page")
 
     try:
-        pdf_content = await run_in_threadpool(extract_pdf_pages, source_path, start_page, end_page)
+        batch_dir = task_dir_path(task_id) / "batches"
+        batch_dir.mkdir(parents=True, exist_ok=True)
+        output_path = batch_dir / f"pages_{start_page}_{end_page}.pdf"
+        result_path = await run_in_threadpool(extract_pdf_pages, source_path, start_page, end_page, output_path)
     except ValueError as err:
         raise HTTPException(status_code=400, detail=str(err)) from err
     except Exception as err:
         logger.exception("Failed to extract PDF pages")
         raise HTTPException(status_code=500, detail=f"Failed to extract PDF pages: {err}") from err
 
-    return Response(content=pdf_content, media_type="application/pdf")
+    return FileResponse(result_path, media_type="application/pdf", filename=f"pages_{start_page}_{end_page}.pdf")
 
 
 @app.get("/api/tasks")
@@ -939,11 +1372,427 @@ async def delete_task(task_id: str):
     return {"ok": True}
 
 
+# ---------------------------------------------------------------------------
+# Translation endpoint
+# ---------------------------------------------------------------------------
+
+class TranslateRequest(BaseModel):
+    targetLang: str = "zh-CN"  # Target language code
+    sourceLang: str | None = None  # Auto-detect if not specified
+    chunkIndex: int | None = None  # Translate specific batch chunk (0-based), None = all
+
+
+@app.post("/api/tasks/{task_id}/translate")
+async def translate_task(task_id: str, req: TranslateRequest):
+    """Translate the OCR markdown result while preserving formatting.
+
+    Streams the translation in SSE so the frontend can show progress.
+    Uses an OpenAI-compatible API (e.g., GPT-4o-mini, DeepSeek, Qwen).
+    """
+    safe_task_id(task_id)
+    if not TRANSLATE_API_URL:
+        raise HTTPException(status_code=501, detail="Translation API not configured. Set PANDOCR_TRANSLATE_API_URL and PANDOCR_TRANSLATE_API_KEY.")
+    if not TRANSLATE_API_KEY:
+        raise HTTPException(status_code=501, detail="Translation API key not configured. Set PANDOCR_TRANSLATE_API_KEY.")
+
+    task = read_task_file(task_file_path(task_id))
+    task = hydrate_task_detail(task_id, task)
+    markdown = task.get("markdown", "")
+
+    if not markdown or not markdown.strip():
+        raise HTTPException(status_code=400, detail="No markdown content to translate.")
+
+    # Split into chunks of ~2000 chars at paragraph boundaries
+    chunks = split_markdown_for_translation(markdown)
+    if req.chunkIndex is not None:
+        if req.chunkIndex < 0 or req.chunkIndex >= len(chunks):
+            raise HTTPException(status_code=400, detail=f"chunkIndex must be in [0, {len(chunks)})")
+        chunks = [chunks[req.chunkIndex]]
+
+    async def translate_stream():
+        translated_parts = []
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            progress = {"currentChunk": i, "totalChunks": total, "percent": int(i / total * 100)}
+            yield f"data: {json.dumps({'type': 'progress', **progress})}\n\n"
+
+            try:
+                translated = await translate_chunk(chunk, req.targetLang, req.sourceLang)
+                translated_parts.append(translated)
+                yield f"data: {json.dumps({'type': 'chunk', 'index': i, 'text': translated})}\n\n"
+            except Exception as err:
+                logger.error("Translation chunk %s failed: %s", i, err)
+                yield f"data: {json.dumps({'type': 'error', 'index': i, 'error': str(err)})}\n\n"
+                translated_parts.append(chunk)  # Keep original on error
+
+        # Merge and save
+        full_translation = "\n\n".join(translated_parts)
+        task["translation"] = full_translation
+        task["translationLang"] = req.targetLang
+        write_task_bundle(task_id, task)
+
+        yield f"data: {json.dumps({'type': 'done', 'percent': 100, 'lang': req.targetLang})}\n\n"
+
+    return StreamingResponse(translate_stream(), media_type="text/event-stream")
+
+
+def split_markdown_for_translation(markdown: str, max_chars: int = 3000) -> list[str]:
+    """Split markdown into chunks for translation.
+
+    Strategy:
+    1. Split at paragraph boundaries (double newline).
+    2. If a single paragraph exceeds max_chars, split at sentence boundaries.
+    3. Never break mid-sentence — always end at a sentence-ending punctuation
+       (. ! ? 。！？) followed by whitespace or end-of-string.
+    4. Each chunk includes enough context (the previous chunk's last sentence)
+       to maintain translation coherence across chunk boundaries.
+    """
+    if not markdown or not markdown.strip():
+        return [markdown] if markdown else []
+
+    paragraphs = markdown.split("\n\n")
+    chunks: list[str] = []
+    current = ""
+
+    for para in paragraphs:
+        if not para.strip():
+            # Preserve empty paragraphs for structure
+            if current:
+                current += "\n\n"
+            continue
+
+        # If adding this paragraph stays within limit, just append
+        if len(current) + len(para) + 2 <= max_chars:
+            current = current + "\n\n" + para if current else para
+            continue
+
+        # Current chunk is full — flush it
+        if current:
+            chunks.append(current)
+
+        # If the paragraph itself fits, start new chunk with it
+        if len(para) <= max_chars:
+            current = para
+            continue
+
+        # Single paragraph too long — split at sentence boundaries
+        sentences = _split_sentences(para)
+        current = ""
+        for sent in sentences:
+            if len(current) + len(sent) + 1 > max_chars and current:
+                chunks.append(current)
+                current = sent
+            else:
+                current = current + " " + sent if current else sent
+
+    if current:
+        chunks.append(current)
+
+    return chunks if chunks else [markdown]
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split text at sentence boundaries, preserving the delimiter.
+
+    Handles both CJK (。！？) and Latin (. ! ?) sentence endings.
+    Keeps the punctuation attached to the preceding sentence.
+    """
+    import re
+    # Split after sentence-ending punctuation followed by whitespace or end
+    parts = re.split(r'(?<=[。！？.!?])\s+', text)
+    # Filter empty parts but preserve structure
+    return [p for p in parts if p.strip()] if parts else [text]
+
+
+async def translate_chunk(text: str, target_lang: str, source_lang: str | None = None) -> str:
+    """Call an OpenAI-compatible API to translate text while preserving Markdown/HTML formatting."""
+    lang_name = LANG_CODE_TO_NAME.get(target_lang, target_lang)
+    lang_native = LANG_CODE_TO_NATIVE.get(target_lang, lang_name)
+    source_hint = (
+        f"The source language is {LANG_CODE_TO_NAME.get(source_lang, source_lang)}."
+        if source_lang else "Auto-detect the source language."
+    )
+
+    system_prompt = (
+        f"You are an expert academic and technical translator. Translate the following text into {lang_name}（{lang_native}）. "
+        f"{source_hint}\n\n"
+        "ABSOLUTE RULES — ANY VIOLATION IS UNACCEPTABLE:\n\n"
+        "1. OUTPUT: Return ONLY the translated text. No explanations, notes, commentary, alternatives, or hedging words. Nothing except the translation.\n\n"
+        "2. TRANSLATE EVERYTHING — including:\n"
+        "   - ALL headings and titles (## 三、 电吉他 → ## 3. Electric Guitar, # 绪论 → # Introduction)\n"
+        "   - Chinese numerals and ordinals in headings (一、→ 1., 三、→ 3., 第十二章 → Chapter 12)\n"
+        "   - Table headers, figure captions, footnotes, labels, annotations\n"
+        "   - Partial sentences at chunk boundaries — translate them fully even if the start/end seems cut off\n"
+        "   - Do NOT skip any line, heading, label, or annotation — everything readable must be translated\n\n"
+        "3. FIDELITY — translate accurately, do NOT add, omit, reinterpret, or embellish:\n"
+        "   - Every sentence in the source MUST appear in the translation — no skipping, no summarizing, no expanding\n"
+        "   - Do NOT add transitional phrases, explanatory asides, or 'helpful' context not present in the original\n"
+        "   - Do NOT soften, rephrase, or simplify the author's tone — preserve the original voice and register\n"
+        "   - If the source is ambiguous, preserve the ambiguity faithfully rather than resolving it\n\n"
+        "4. TECHNICAL & SCIENTIFIC PRECISION:\n"
+        "   - Use established terminology for the relevant field (mathematics, physics, chemistry, biology, engineering, medicine, law, etc.)\n"
+        "   - When a term has a standard translation in the target language, use that standard — do not invent alternatives\n"
+        "   - Preserve all numeric values exactly: 3.14 stays 3.14, 10^6 stays 10^6, 1/2 stays 1/2\n"
+        "   - Preserve unit symbols unchanged: kg, m/s, MHz, kJ/mol, etc.\n"
+        "   - Preserve chemical formulas and equations: H2O, CH3COOH, E=mc2, F=ma\n"
+        "   - Preserve variable names and symbols used in formulas: x, theta, alpha, etc.\n\n"
+        "5. MATH & CODE — copy verbatim, zero alteration:\n"
+        "   - LaTeX: $...$, $$...$$, \\[...\\], \\(...\\) — do NOT translate content inside math delimiters\n"
+        "   - Inline code (`...`) and code blocks (```...```) — copy verbatim\n"
+        "   - Equations, theorems, proofs, algorithms — preserve formatting exactly\n\n"
+        "6. FORMATTING PRESERVATION:\n"
+        "   - Markdown: # headers, **bold**, *italic*, [links](url), - lists, > blockquotes, | tables |, --- rules\n"
+        "   - HTML tags: keep all tags and attributes; only translate text content inside tags\n"
+        "   - Do NOT translate: URLs, file paths, image filenames, CSS class names, data: URIs\n"
+        "   - Keep the same paragraph count, heading hierarchy, list item count, table dimensions\n\n"
+        "7. QUALITY:\n"
+        "   - Natural, fluent target language — not stiff or machine-sounding\n"
+        "   - Same academic/professional register as the original\n"
+        "   - Proper nouns: use the established convention in the target language (e.g. Einstein → 爱因斯坦, Fourier → 傅里叶)"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {TRANSLATE_API_KEY}",
+        "Content-Type": "application/json",
+    }
+
+    payload = {
+        "model": TRANSLATE_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.1,
+    }
+
+    timeout = httpx.Timeout(60.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            TRANSLATE_API_URL,
+            headers=headers,
+            json=payload,
+        )
+        if resp.status_code != 200:
+            logger.error("Translation API error %s: %s", resp.status_code, resp.text[:500])
+            raise HTTPException(status_code=resp.status_code, detail=f"Translation API error: {resp.text[:200]}")
+
+        data = resp.json()
+        return data["choices"][0]["message"]["content"]
+
+
+# Language code to name mapping
+LANG_CODE_TO_NAME = {
+    "zh-CN": "Simplified Chinese", "zh-TW": "Traditional Chinese",
+    "en": "English", "ja": "Japanese", "ko": "Korean",
+    "fr": "French", "de": "German", "es": "Spanish",
+    "pt": "Portuguese", "ru": "Russian", "ar": "Arabic",
+    "it": "Italian", "nl": "Dutch", "pl": "Polish",
+    "tr": "Turkish", "vi": "Vietnamese", "th": "Thai",
+    "id": "Indonesian", "ms": "Malay", "hi": "Hindi",
+}
+
+LANG_CODE_TO_NATIVE = {
+    "zh-CN": "简体中文", "zh-TW": "繁體中文",
+    "en": "English", "ja": "日本語", "ko": "한국어",
+    "fr": "Français", "de": "Deutsch", "es": "Español",
+    "pt": "Português", "ru": "Русский", "ar": "العربية",
+    "it": "Italiano", "nl": "Nederlands", "pl": "Polski",
+    "tr": "Türkçe", "vi": "Tiếng Việt", "th": "ไทย",
+    "id": "Bahasa Indonesia", "ms": "Bahasa Melayu", "hi": "हिन्दी",
+}
+
+
+@app.get("/api/translate/config")
+async def get_translate_config():
+    """Check if translation is configured."""
+    return {
+        "available": bool(TRANSLATE_API_URL and TRANSLATE_API_KEY),
+        "model": TRANSLATE_MODEL if TRANSLATE_API_URL else None,
+    }
+
+
 @app.delete("/api/tasks")
 async def clear_tasks():
     """Delete all locally persisted tasks."""
     await run_in_threadpool(clear_task_dirs)
     return {"ok": True}
+
+
+@app.get("/api/tasks/{task_id}/source/info")
+async def get_task_source_info(task_id: str):
+    """Return PDF metadata (page count, size, mimeType) without loading full content."""
+    source_path = task_source_path(task_id)
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail="Task source not found")
+
+    size = source_path.stat().st_size
+    mime_type = "application/octet-stream"
+    source_kind = "unknown"
+    page_count = 0
+
+    task_path = task_file_path(task_id)
+    if task_path.exists():
+        try:
+            task = await run_in_threadpool(read_task_file, task_path)
+            mime_type = task.get("mimeType") or mime_type
+            source_kind = task.get("sourceKind") or source_kind
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+
+    # Detect PDF and get page count
+    try:
+        with source_path.open("rb") as f:
+            header = f.read(5)
+        if header == b"%PDF-":
+            mime_type = "application/pdf"
+            source_kind = "pdf"
+            page_count = await run_in_threadpool(get_pdf_page_count, source_path)
+    except Exception as err:
+        logger.warning("Failed to read source file header: %s", err)
+
+    return {
+        "pageCount": page_count,
+        "size": size,
+        "mimeType": mime_type,
+        "sourceKind": source_kind,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Chunked upload endpoints
+# ---------------------------------------------------------------------------
+
+@app.post("/api/uploads")
+async def create_upload_session(request: CreateUploadRequest):
+    """Create a chunked upload session. Returns upload_id and chunk plan."""
+    if request.totalSize <= 0:
+        raise HTTPException(status_code=400, detail="totalSize must be positive")
+    if request.totalSize > MAX_TOTAL_UPLOAD_BYTES:
+        max_mb = MAX_TOTAL_UPLOAD_BYTES / 1024 / 1024
+        raise HTTPException(status_code=413, detail=f"File too large. Max total upload size is {max_mb:.0f} MB.")
+    if request.chunkSize < 1024 * 1024:
+        raise HTTPException(status_code=400, detail="chunkSize must be at least 1 MB")
+    if request.chunkSize > 100 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="chunkSize must be at most 100 MB")
+
+    upload_id = secrets.token_urlsafe(12)
+    total_chunks = (request.totalSize + request.chunkSize - 1) // request.chunkSize
+
+    meta = {
+        "uploadId": upload_id,
+        "filename": request.filename,
+        "totalSize": request.totalSize,
+        "chunkSize": request.chunkSize,
+        "totalChunks": total_chunks,
+        "receivedChunks": [],
+        "taskId": request.taskId,
+        "createdAt": time.time(),
+        "completed": False,
+    }
+
+    session_dir = _upload_session_dir(upload_id)
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / "chunks").mkdir(parents=True, exist_ok=True)
+    _write_upload_meta(upload_id, meta)
+
+    return {
+        "uploadId": upload_id,
+        "chunkSize": request.chunkSize,
+        "totalChunks": total_chunks,
+        "receivedChunks": [],
+    }
+
+
+@app.put("/api/uploads/{upload_id}/chunks/{chunk_index}")
+async def upload_chunk(upload_id: str, chunk_index: int, file: UploadFile = File(...)):
+    """Upload a single chunk. Idempotent — re-uploading overwrites silently."""
+    lock = _upload_locks.setdefault(upload_id, asyncio.Lock())
+    async with lock:
+        meta = _read_upload_meta(upload_id)
+        if meta.get("completed"):
+            raise HTTPException(status_code=400, detail="Upload session already completed")
+
+        total_chunks = meta["totalChunks"]
+        if chunk_index < 0 or chunk_index >= total_chunks:
+            raise HTTPException(status_code=400, detail=f"chunk_index must be in [0, {total_chunks})")
+
+        chunk_dir = _upload_session_dir(upload_id) / "chunks"
+        chunk_path = chunk_dir / str(chunk_index)
+
+        # Write chunk to disk
+        size = await write_upload_to_path(file, chunk_path, meta["chunkSize"] + 1024 * 1024)
+
+        # Update metadata
+        received = set(meta.get("receivedChunks", []))
+        received.add(chunk_index)
+        meta["receivedChunks"] = sorted(received)
+        _write_upload_meta(upload_id, meta)
+
+    return {"ok": True, "receivedChunks": meta["receivedChunks"], "chunkSize": size}
+
+
+@app.get("/api/uploads/{upload_id}")
+async def get_upload_status(upload_id: str):
+    """Return upload session status, including which chunks are received (for resume)."""
+    meta = _read_upload_meta(upload_id)
+    return {
+        "uploadId": meta["uploadId"],
+        "totalSize": meta["totalSize"],
+        "chunkSize": meta["chunkSize"],
+        "totalChunks": meta["totalChunks"],
+        "receivedChunks": meta.get("receivedChunks", []),
+        "completed": meta.get("completed", False),
+    }
+
+
+@app.post("/api/uploads/{upload_id}/complete")
+async def complete_upload(upload_id: str):
+    """Verify all chunks received, reassemble into source.bin, clean up chunks."""
+    lock = _upload_locks.setdefault(upload_id, asyncio.Lock())
+    async with lock:
+        meta = _read_upload_meta(upload_id)
+        if meta.get("completed"):
+            raise HTTPException(status_code=400, detail="Upload session already completed")
+
+        total_chunks = meta["totalChunks"]
+        received = set(meta.get("receivedChunks", []))
+        missing = set(range(total_chunks)) - received
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Missing chunks: {sorted(missing)}. Upload {len(missing)} more chunk(s) to complete.",
+            )
+
+        # Determine target path
+        task_id = meta.get("taskId")
+        if task_id:
+            safe_task_id(task_id)  # validate
+            target_path = task_source_path(task_id)
+        else:
+            target_path = _upload_session_dir(upload_id) / "assembled.bin"
+
+        # Reassemble
+        try:
+            total_size = await run_in_threadpool(reassemble_chunks, upload_id, target_path)
+        except Exception as err:
+            raise HTTPException(status_code=500, detail=f"Failed to reassemble chunks: {err}") from err
+
+        # Mark completed and clean up chunk files
+        meta["completed"] = True
+        _write_upload_meta(upload_id, meta)
+
+        # Remove chunk files to free disk space
+        chunk_dir = _upload_session_dir(upload_id) / "chunks"
+        if chunk_dir.exists():
+            shutil.rmtree(chunk_dir, ignore_errors=True)
+
+    # Clean up lock entry — upload is done, no more chunks expected
+    _upload_locks.pop(upload_id, None)
+
+    result = {"ok": True, "size": total_size}
+    if task_id:
+        result["url"] = task_source_url(task_id)
+    return result
 
 
 @app.post("/api/convert/to-pdf")
@@ -1009,6 +1858,473 @@ async def convert_to_pdf(file: UploadFile = File(...)):
     except Exception as e:
         logger.exception("Error during conversion")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Background task manager for server-side OCR processing
+# ---------------------------------------------------------------------------
+
+class BackgroundTaskManager:
+    """Manage background OCR processing tasks with progress tracking."""
+
+    def __init__(self) -> None:
+        self._tasks: dict[str, asyncio.Task] = {}
+        self._cancel_flags: dict[str, asyncio.Event] = {}
+        self._progress: dict[str, dict] = {}
+        self._lock = asyncio.Lock()
+
+    async def start_processing(self, task_id: str, model_id: str, ocr_options: dict) -> None:
+        async with self._lock:
+            existing = self._tasks.get(task_id)
+            if existing and not existing.done():
+                raise HTTPException(status_code=409, detail="Task is already being processed")
+
+            # Clean up any previous done task state
+            if existing and existing.done():
+                self.clear(task_id)
+
+            cancel_flag = asyncio.Event()
+            self._cancel_flags[task_id] = cancel_flag
+            self._progress[task_id] = {
+                "status": "queued",
+                "currentBatchIndex": 0,
+                "totalBatches": 0,
+                "currentBatchLabel": "",
+                "percent": 0,
+                "startedAt": time.time(),
+                "updatedAt": time.time(),
+                "error": None,
+            }
+            self._tasks[task_id] = asyncio.create_task(
+                process_task_background(task_id, model_id, ocr_options, cancel_flag)
+            )
+
+    def cancel_processing(self, task_id: str) -> bool:
+        flag = self._cancel_flags.get(task_id)
+        if flag and task_id in self._tasks and not self._tasks[task_id].done():
+            flag.set()
+            # Replace progress dict entirely (immutable update) to avoid
+            # in-place mutation racing with SSE comparison
+            old = self._progress.get(task_id, {})
+            self._progress[task_id] = {**old, "status": "cancelling", "updatedAt": time.time()}
+            return True
+        return False
+
+    def get_progress(self, task_id: str) -> dict | None:
+        return self._progress.get(task_id)
+
+    def set_progress(self, task_id: str, progress: dict) -> None:
+        """Replace progress dict for a task (preferred over direct _progress access)."""
+        self._progress[task_id] = progress
+
+    def is_running(self, task_id: str) -> bool:
+        task = self._tasks.get(task_id)
+        return task is not None and not task.done()
+
+    def remove_done(self, task_id: str) -> None:
+        task = self._tasks.get(task_id)
+        if task and task.done():
+            del self._tasks[task_id]
+            self._cancel_flags.pop(task_id, None)
+            self._progress.pop(task_id, None)
+
+    def clear(self, task_id: str) -> None:
+        """Force-clear all state for a task, even if it's still running."""
+        self._tasks.pop(task_id, None)
+        self._cancel_flags.pop(task_id, None)
+        self._progress.pop(task_id, None)
+
+
+task_manager = BackgroundTaskManager()
+
+
+def _build_ocr_request_from_options(ocr_options: dict) -> "OCRRequest":
+    """Build an OCRRequest from the options dict sent by the frontend."""
+    return OCRRequest(
+        useLayoutDetection=ocr_options.get("useLayoutDetection", True),
+        useDocUnwarping=ocr_options.get("useDocUnwarping", False),
+        useDocOrientationClassify=ocr_options.get("useDocOrientationClassify", False),
+        useTextlineOrientation=ocr_options.get("useTextlineOrientation", False),
+        useChartRecognition=ocr_options.get("useChartRecognition", False),
+        useSealRecognition=ocr_options.get("useSealRecognition", True),
+        formatBlockContent=ocr_options.get("formatBlockContent", True),
+        showFormulaNumber=ocr_options.get("showFormulaNumber", True),
+        markdownIgnoreLabels=ocr_options.get("markdownIgnoreLabels", []),
+        layoutThreshold=ocr_options.get("layoutThreshold"),
+        layoutNms=ocr_options.get("layoutNms"),
+        layoutUnclipRatio=ocr_options.get("layoutUnclipRatio"),
+        layoutMergeBboxesMode=ocr_options.get("layoutMergeBboxesMode"),
+        repetitionPenalty=ocr_options.get("repetitionPenalty"),
+        temperature=ocr_options.get("temperature"),
+        topP=ocr_options.get("topP"),
+        minPixels=ocr_options.get("minPixels"),
+        maxPixels=ocr_options.get("maxPixels"),
+        visualize=ocr_options.get("visualize"),
+    )
+
+
+async def process_task_background(
+    task_id: str, model_id: str, ocr_options: dict, cancel_flag: asyncio.Event
+) -> None:
+    """Process all batches of a task sequentially in the background."""
+    try:
+        task_path = task_file_path(task_id)
+        if not task_path.exists():
+            logger.error("Task file not found: %s", task_path)
+            task_manager.set_progress(task_id, {
+                "status": "error", "error": "Task file not found",
+                "updatedAt": time.time(), "percent": 0,
+                "currentBatchIndex": 0, "totalBatches": 0, "currentBatchLabel": "",
+            })
+            return
+
+        task = await run_in_threadpool(read_task_file, task_path)
+        # Hydrate to load existing results from result.json
+        # Without this, resuming a partially-completed task would start from
+        # empty markdown, losing all previously-accumulated OCR data.
+        task = hydrate_task_detail(task_id, task)
+        batches = task.get("batches", [])
+        if not batches:
+            logger.warning("No batches found for task %s", task_id)
+            task_manager.set_progress(task_id, {
+                "status": "error", "error": "No batches to process",
+                "updatedAt": time.time(), "percent": 0,
+                "currentBatchIndex": 0, "totalBatches": 0, "currentBatchLabel": "",
+            })
+            return
+
+        # Keep existing results intact — only initialize if truly missing
+        if not task.get("markdown"):
+            task["markdown"] = ""
+        if not isinstance(task.get("images"), dict):
+            task["images"] = {}
+        if not isinstance(task.get("ocrResults"), list):
+            task["ocrResults"] = []
+
+        ocr_request = _build_ocr_request_from_options(ocr_options)
+        total_batches = len(batches)
+
+        task_manager.set_progress(task_id, {
+            "status": "running",
+            "currentBatchIndex": 0,
+            "totalBatches": total_batches,
+            "currentBatchLabel": batches[0].get("label", "") if batches else "",
+            "percent": 0,
+            "startedAt": time.time(),
+            "updatedAt": time.time(),
+            "error": None,
+        })
+        source_path = task_source_path(task_id)
+        has_source = source_path.exists()
+
+        for i, batch in enumerate(batches):
+            if cancel_flag.is_set():
+                task["status"] = "paused"
+                await run_in_threadpool(write_task_bundle, task_id, task)
+                task_manager.set_progress(task_id, {
+                    "status": "cancelled",
+                    "currentBatchIndex": i,
+                    "totalBatches": total_batches,
+                    "currentBatchLabel": batch.get("label", ""),
+                    "percent": round(i / total_batches * 100),
+                    "updatedAt": time.time(),
+                    "error": None,
+                })
+                return
+
+            if batch.get("status") == "completed":
+                continue
+
+            # Update progress
+            task_manager.set_progress(task_id, {
+                "status": "running",
+                "currentBatchIndex": i,
+                "totalBatches": total_batches,
+                "currentBatchLabel": batch.get("label", ""),
+                "percent": round(i / total_batches * 100),
+                "updatedAt": time.time(),
+                "error": None,
+            })
+            try:
+                # Extract page range from source PDF or use entire source
+                batch_file_path: Path | None = None
+                start_page = batch.get("startPage")
+                end_page = batch.get("endPage")
+
+                if has_source and batch.get("fileType") == 0 and start_page and end_page:
+                    batch_dir = task_dir_path(task_id) / "batches"
+                    batch_dir.mkdir(parents=True, exist_ok=True)
+                    output_path = batch_dir / f"batch_{i}_{start_page}_{end_page}.pdf"
+                    batch_file_path = await run_in_threadpool(
+                        extract_pdf_pages, source_path, start_page, end_page, output_path
+                    )
+                elif has_source and batch.get("fileType") == 1:
+                    batch_file_path = source_path
+
+                if batch_file_path is None or not batch_file_path.exists():
+                    raise RuntimeError(f"Cannot prepare batch payload for batch {i}")
+
+                # Check batch size for base64 services
+                batch_size = batch_file_path.stat().st_size
+                if model_id not in ("mineru", "glm-ocr") and batch_size > MAX_BATCH_BYTES:
+                    max_mb = MAX_BATCH_BYTES / 1024 / 1024
+                    raise RuntimeError(
+                        f"Batch {i} ({batch_size / 1024 / 1024:.1f} MB) exceeds max batch size "
+                        f"({max_mb:.0f} MB). Reduce pages per batch."
+                    )
+
+                # Call OCR service
+                # Set fileType from batch metadata so MinerU gets the correct filename
+                ocr_request.fileType = batch.get("fileType", 0)
+                if model_id == "mineru":
+                    result = await run_mineru_from_file(batch_file_path, ocr_request)
+                elif model_id == "glm-ocr":
+                    result = await run_glm_ocr_from_file(batch_file_path, ocr_request)
+                else:
+                    result = await run_ocr_from_file(batch_file_path, model_id, ocr_request)
+
+                # Accumulate results
+                batch_markdown = result.get("markdown", "")
+                batch_images = result.get("images", {})
+
+                batch["status"] = "completed"
+                batch["markdown"] = batch_markdown
+
+                # Append markdown
+                existing_md = task.get("markdown", "")
+                if existing_md and not existing_md.endswith("\n\n"):
+                    existing_md += "\n\n"
+                task["markdown"] = existing_md + batch_markdown + "\n\n"
+
+                # Merge images
+                task_images = task.get("images", {})
+                if isinstance(task_images, dict) and isinstance(batch_images, dict):
+                    task_images.update(batch_images)
+
+                # Accumulate OCR results
+                ocr_results = task.get("ocrResults", [])
+                if not isinstance(ocr_results, list):
+                    ocr_results = []
+                normalized = normalize_ocr_json_results(result)
+                for page_index, page_result in enumerate(normalized):
+                    ocr_results.append(compact_ocr_json_result(page_result, batch, page_index))
+                task["ocrResults"] = ocr_results
+
+                # Accumulate contentList
+                content_list = result.get("contentList")
+                if isinstance(content_list, list):
+                    if not isinstance(task.get("contentList"), list):
+                        task["contentList"] = []
+                    task["contentList"].extend(content_list)
+
+                task["status"] = "processing"
+                task["updatedAt"] = int(time.time() * 1000)
+                await run_in_threadpool(write_task_bundle, task_id, task)
+
+            except Exception as err:
+                logger.exception("Error processing batch %d for task %s", i, task_id)
+                batch["status"] = "error"
+                task["status"] = "error"
+                task["error"] = str(err)
+                await run_in_threadpool(write_task_bundle, task_id, task)
+                task_manager.set_progress(task_id, {
+                    "status": "error",
+                    "currentBatchIndex": i,
+                    "totalBatches": total_batches,
+                    "currentBatchLabel": batch.get("label", ""),
+                    "percent": round(i / total_batches * 100),
+                    "updatedAt": time.time(),
+                    "error": str(err),
+                })
+                return
+
+        # All batches done
+        task["status"] = "completed"
+        task["updatedAt"] = int(time.time() * 1000)
+        await run_in_threadpool(write_task_bundle, task_id, task)
+        task_manager.set_progress(task_id, {
+            "status": "completed",
+            "currentBatchIndex": total_batches,
+            "totalBatches": total_batches,
+            "currentBatchLabel": "",
+            "percent": 100,
+            "updatedAt": time.time(),
+            "error": None,
+        })
+    except Exception as err:
+        logger.exception("Fatal error in background processing for task %s", task_id)
+        task_manager.set_progress(task_id, {
+            "status": "error",
+            "currentBatchIndex": 0,
+            "totalBatches": 0,
+            "currentBatchLabel": "",
+            "percent": 0,
+            "updatedAt": time.time(),
+            "error": str(err),
+        })
+def normalize_ocr_json_results(result: dict) -> list:
+    """Normalize OCR results to a flat list of page results."""
+    layout_results = result.get("layoutParsingResults", [])
+    if isinstance(layout_results, list):
+        return layout_results
+    return [result]
+
+
+def compact_ocr_json_result(page_result: dict, batch: dict, page_index: int) -> dict:
+    """Compact a single OCR page result for storage.
+
+    Merges metadata into the top level so the frontend can access
+    parser, ocrLines, pageImage etc. directly (same shape as the
+    client-side compactOCRJsonResult in app.js).
+    """
+    compact = _strip_large_ocr_fields(page_result)
+    compact["batchId"] = batch.get("id")
+    compact["pageIndex"] = page_index
+    compact["label"] = batch.get("label", "")
+    if compact.get("parser") == "pp-ocrv6" and batch:
+        compact["sourcePage"] = int(batch.get("startPage", 1)) + page_index
+    return compact
+
+
+def _strip_large_ocr_fields(value):
+    """Recursively remove large image fields (inputImage, outputImages)
+    to keep stored JSON small — mirrors the frontend stripLargeOCRFields."""
+    if isinstance(value, list):
+        return [_strip_large_ocr_fields(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    return {
+        key: _strip_large_ocr_fields(nested)
+        for key, nested in value.items()
+        if key not in ("inputImage", "outputImages")
+    }
+
+
+async def run_ocr_from_file(file_path: Path, model_id: str, ocr_request: "OCRRequest") -> dict:
+    """Load a single batch file, base64-encode, and send to OCR service."""
+    file_bytes = await run_in_threadpool(file_path.read_bytes)
+    raw_input: RawOCRInput = file_bytes
+
+    if model_id == "paddleocr-vl-1.6":
+        return await run_ocr_request(ocr_request, raw_input)
+    elif model_id == "pp-ocrv6":
+        return await run_ppocrv6_request(ocr_request, raw_input)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown model_id: {model_id}")
+
+
+async def run_mineru_from_file(file_path: Path, ocr_request: "OCRRequest") -> dict:
+    """Stream a file from disk to MinerU without loading it all into memory."""
+    await acquire_ocr_slot("mineru", "MinerU service is not ready.")
+    try:
+        file_type = ocr_request.fileType
+        # Default to PDF (0) if fileType not set — most background batches are PDFs
+        if file_type is None:
+            file_type = 0
+        filename = "upload.pdf" if file_type == 0 else "upload.png"
+
+        data_payload = {
+            "return_md": "true",
+            "return_images": "true",
+            "return_content_list": "true",
+            "formula_enable": str(ocr_request.useChartRecognition).lower(),
+            "table_enable": "true",
+            "image_analysis": str(ocr_request.useChartRecognition).lower(),
+            "parse_method": "auto",
+        }
+        if ocr_request.useLayoutDetection:
+            data_payload["backend"] = "hybrid-engine"
+        else:
+            data_payload["backend"] = "pipeline"
+
+        logger.info("Streaming request to MinerU Service at %s/file_parse", MINERU_SERVICE_URL)
+        timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+
+        # Read file in thread pool to avoid blocking the event loop
+        file_bytes = await run_in_threadpool(file_path.read_bytes)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                f"{MINERU_SERVICE_URL}/file_parse",
+                files={"files": (filename, file_bytes, "application/octet-stream")},
+                data=data_payload,
+            )
+
+            if resp.status_code != 200:
+                logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                raise HTTPException(
+                    status_code=resp.status_code,
+                    detail=f"Upstream MinerU error: {resp.text}",
+                )
+
+            # Get dimensions to attach to MinerU response
+            dimensions = []
+            try:
+                import fitz, io
+                from PIL import Image
+                if file_type == 0:
+                    doc = fitz.open(stream=file_bytes, filetype="pdf")
+                    for page in doc:
+                        dimensions.append((page.rect.width, page.rect.height))
+                    doc.close()
+                else:
+                    img = Image.open(io.BytesIO(file_bytes))
+                    dimensions.append((img.width, img.height))
+            except Exception as e:
+                logger.warning("Failed to get MinerU page dimensions: %s", e)
+
+            return parse_mineru_response(resp.json(), dimensions)
+    finally:
+        await release_ocr_slot()
+
+
+@app.post("/api/tasks/{task_id}/process")
+async def start_task_processing(task_id: str, request: ProcessRequest):
+    """Start background OCR processing. Returns immediately."""
+    task_path = task_file_path(task_id)
+    if not task_path.exists():
+        raise HTTPException(status_code=404, detail="Task not found")
+    await task_manager.start_processing(task_id, request.modelId, request.ocrOptions)
+    return {"ok": True, "status": "started"}
+
+
+@app.post("/api/tasks/{task_id}/cancel")
+async def cancel_task_processing(task_id: str):
+    """Request cancellation of background processing."""
+    if not task_manager.cancel_processing(task_id):
+        raise HTTPException(status_code=404, detail="No running processing for this task")
+    return {"ok": True}
+
+
+@app.get("/api/tasks/{task_id}/progress")
+async def task_progress_sse(task_id: str):
+    """Server-Sent Events endpoint for real-time progress updates."""
+
+    async def event_generator():
+        last_progress_json = None
+        max_idle = 3600  # 1 hour max
+        last_send_time = time.time()
+        start = time.time()
+        while True:
+            progress = task_manager.get_progress(task_id)
+            progress_json = json.dumps(progress, sort_keys=True) if progress else None
+            if progress_json != last_progress_json:
+                yield f"data: {progress_json}\n\n"
+                last_progress_json = progress_json
+                last_send_time = time.time()
+            elif time.time() - last_send_time > 15:
+                # Keep-alive comment to prevent proxy/load-balancer timeout
+                yield ": keep-alive\n\n"
+                last_send_time = time.time()
+            if not progress or progress.get("status") in ("completed", "error", "cancelled"):
+                break
+            if time.time() - start > max_idle:
+                yield f"data: {json.dumps({'status': 'error', 'error': 'SSE connection timed out'})}\n\n"
+                break
+            await asyncio.sleep(0.5)
+        # Cleanup done tasks
+        task_manager.remove_done(task_id)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 class OCRRequest(BaseModel):
@@ -1458,7 +2774,11 @@ async def proxy_ppocrv6(request: Request):
 
 
 async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
-    """Proxy request to MinerU API Service (multipart /file_parse)."""
+    """Proxy request to MinerU API Service (multipart /file_parse).
+
+    Uses streaming upload when the input is raw bytes to avoid
+    holding the entire file in memory twice.
+    """
     await acquire_ocr_slot(
         "mineru",
         "MinerU service is not ready. Switch to this model and wait for it to become ready.",
@@ -1469,7 +2789,6 @@ async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) ->
 
         filename = "upload.pdf" if file_type == 0 else "upload.png"
 
-        files_payload = {"files": (filename, file_bytes)}
         data_payload = {
             "return_md": "true",
             "return_images": "true",
@@ -1486,23 +2805,49 @@ async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) ->
 
         logger.info("Sending request to MinerU Service at %s/file_parse", MINERU_SERVICE_URL)
         timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{MINERU_SERVICE_URL}/file_parse",
-                files=files_payload,
-                data=data_payload,
-            )
 
-            if resp.status_code != 200:
-                logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
-                raise HTTPException(status_code=resp.status_code, detail=f"Upstream MinerU error: {resp.text}")
+        # Write raw bytes to a temp file and stream from disk
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        try:
+            await run_in_threadpool(tmp_path.write_bytes, file_bytes)
 
-            return parse_mineru_response(resp.json())
+            with tmp_path.open("rb") as f:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    resp = await client.post(
+                        f"{MINERU_SERVICE_URL}/file_parse",
+                        files={"files": (filename, f, "application/octet-stream")},
+                        data=data_payload,
+                    )
+
+                    if resp.status_code != 200:
+                        logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                        raise HTTPException(status_code=resp.status_code, detail=f"Upstream MinerU error: {resp.text}")
+
+                    # Get dimensions
+                    dimensions = []
+                    try:
+                        import fitz, io
+                        from PIL import Image
+                        if file_type == 0:
+                            doc = fitz.open(stream=file_bytes, filetype="pdf")
+                            for page in doc:
+                                dimensions.append((page.rect.width, page.rect.height))
+                            doc.close()
+                        else:
+                            img = Image.open(io.BytesIO(file_bytes))
+                            dimensions.append((img.width, img.height))
+                    except Exception as e:
+                        logger.warning("Failed to get MinerU page dimensions: %s", e)
+
+                    return parse_mineru_response(resp.json(), dimensions)
+        finally:
+            tmp_path.unlink(missing_ok=True)
     finally:
         await release_ocr_slot()
 
 
-def parse_mineru_response(data: dict) -> dict:
+def parse_mineru_response(data: dict, dimensions: list = None) -> dict:
     """Convert MinerU /file_parse response to paddleocr-local format."""
     results = data.get("results") or {}
     full_markdown = ""
@@ -1539,10 +2884,49 @@ def parse_mineru_response(data: dict) -> dict:
             "document": doc_name,
         })
 
+    # Group content_list by page to create compatible layout structure
+    pages_dict = {}
+    for item in all_content_list:
+        p_idx = item.get("page_idx", 0)
+        if p_idx not in pages_dict:
+            pages_dict[p_idx] = []
+        
+        # MinerU bbox is [x0, y0, x1, y1]
+        bbox = item.get("bbox")
+        if not bbox and item.get("type") == "text":
+            # Just create a dummy bbox or skip if absolutely necessary, but we'll try to include it
+            bbox = [0, 0, 100, 100]
+            
+        pages_dict[p_idx].append({
+            "label": item.get("type", "text"),
+            "bbox": bbox,
+            "text": item.get("text", "")
+        })
+
+    pages = []
+    if dimensions:
+        for p_idx in range(len(dimensions)):
+            w, h = dimensions[p_idx]
+            pages.append({
+                "width": w,
+                "height": h,
+                "parsing_res_list": pages_dict.get(p_idx, []),
+                "parser": "mineru"
+            })
+    else:
+        for p_idx, p_list in pages_dict.items():
+            pages.append({
+                "width": 1000, # default if no dimensions
+                "height": 1000,
+                "parsing_res_list": p_list,
+                "parser": "mineru"
+            })
+
     response = {
         "markdown": full_markdown,
         "images": all_images,
         "layoutParsingResults": layout_results,
+        "pages": pages,
     }
     if all_content_list:
         response["contentList"] = all_content_list
@@ -1562,6 +2946,399 @@ async def proxy_mineru(request: Request):
     except Exception as e:
         logger.exception("MinerU Proxy Error")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# GLM-OCR (Ollama) Pipeline
+# PP-OCRv6 layout detection → GLM-OCR text recognition → Post-processing
+# ---------------------------------------------------------------------------
+
+GLM_OCR_PROMPT = (
+    "请只转写图片中清晰可见的文字，并输出 Markdown。"
+    "保留原有换行、列表和表格结构；表格请使用 Markdown 或 HTML 表格。"
+    "不要解释、总结、补全、翻译或编造图片中不存在的内容。"
+    "跳过页眉、页脚和页码；如果没有可识别文字，只输出空字符串。"
+)
+
+GLM_OCR_MAX_IMAGE_HEIGHT = 1600
+GLM_OCR_SEGMENT_OVERLAP = 80
+
+# Labels to skip in layout detection
+_LAYOUT_SKIP_LABELS = {"header", "footer", "footnote", "number"}
+# Labels that must stay as solo regions (not merged with neighbors)
+_LAYOUT_SOLO_LABELS = {"table", "figure", "figure_caption", "table_caption"}
+_LAYOUT_MERGE_LABELS = {"text", "title", "list"}
+
+
+def _image_to_b64(img: Image.Image) -> str:
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+
+def _split_tall_image(img: Image.Image) -> list[Image.Image]:
+    """Split a tall image into overlapping segments for GLM-OCR."""
+    w, h = img.size
+    step = GLM_OCR_MAX_IMAGE_HEIGHT - GLM_OCR_SEGMENT_OVERLAP
+    segments = []
+    y = 0
+    while y < h:
+        bottom = min(y + GLM_OCR_MAX_IMAGE_HEIGHT, h)
+        segments.append(img.crop((0, y, w, bottom)))
+        y += step
+        if bottom == h:
+            break
+    return segments
+
+
+async def _detect_layout_via_ppocrv6(img: Image.Image) -> list[dict]:
+    """Use PP-DocLayoutV3 layout detection service (running in paddleocr-ocr-api container).
+
+    Returns list of {label, bbox} for detected layout regions (title, text, table, figure, etc.)
+    """
+    # The layout detection service runs on port 8081 in the OCR API container
+    layout_url = os.getenv("PANDOCR_LAYOUT_DETECT_URL", "http://paddleocr-ocr-api:8081/layout-detect")
+
+    b64 = _image_to_b64(img)
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(layout_url, json={"image": b64})
+            if resp.status_code != 200:
+                logger.warning("[glm-ocr] Layout detection service returned %d", resp.status_code)
+                return []
+            data = resp.json()
+    except Exception as err:
+        logger.warning("[glm-ocr] Layout detection service unavailable: %s", err)
+        return []
+
+    regions = data.get("regions", [])
+    # Filter out skip labels and ensure valid bboxes
+    filtered = []
+    for r in regions:
+        label = r.get("label", "text")
+        if label in _LAYOUT_SKIP_LABELS:
+            continue
+        bbox = r.get("bbox")
+        if bbox and len(bbox) >= 4:
+            filtered.append({"label": label, "bbox": bbox})
+
+    # Sort top-to-bottom reading order
+    filtered.sort(key=lambda r: (r["bbox"][1], r["bbox"][0]))
+    logger.info("[glm-ocr] Layout detection: %d regions", len(filtered))
+    return filtered
+
+
+def _merge_layout_regions(raw_regions: list[dict]) -> list[list[dict]]:
+    """Group adjacent text regions; solo regions (table/figure) stay separate."""
+    groups: list[list[dict]] = []
+    current: list[dict] = []
+    for region in raw_regions:
+        if region["label"] in _LAYOUT_SOLO_LABELS:
+            if current:
+                groups.append(current)
+                current = []
+            groups.append([region])
+        elif region["label"] in _LAYOUT_MERGE_LABELS:
+            current.append(region)
+        else:
+            # Unknown label: treat as solo
+            if current:
+                groups.append(current)
+                current = []
+            groups.append([region])
+    if current:
+        groups.append(current)
+    return groups
+
+
+def _group_bbox(regions: list[dict]) -> list[int]:
+    x1 = min(r["bbox"][0] for r in regions)
+    y1 = min(r["bbox"][1] for r in regions)
+    x2 = max(r["bbox"][2] for r in regions)
+    y2 = max(r["bbox"][3] for r in regions)
+    return [x1, y1, x2, y2]
+
+
+def _ollama_chat_payload(content: str, image_b64: str | None = None) -> dict:
+    message = {"role": "user", "content": content}
+    if image_b64 is not None:
+        message["images"] = [image_b64]
+    return {
+        "model": OLLAMA_MODEL,
+        "messages": [message],
+        "stream": False,
+        "options": {
+            "num_ctx": OLLAMA_NUM_CTX,
+            "num_predict": OLLAMA_NUM_PREDICT,
+            "temperature": 0,
+        },
+    }
+
+
+async def _glm_ocr_single(image_b64: str) -> str:
+    """Send a single image to Ollama GLM-OCR."""
+    timeout = httpx.Timeout(PADDLE_REQUEST_TIMEOUT, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json=_ollama_chat_payload(GLM_OCR_PROMPT, image_b64),
+        )
+        if resp.status_code != 200:
+            detail = ""
+            try:
+                data = resp.json()
+                detail = data.get("error", resp.text[:200])
+            except Exception:
+                detail = resp.text[:200]
+            raise HTTPException(status_code=resp.status_code, detail=f"Ollama error: {detail}")
+        result = resp.json()
+        return result.get("message", {}).get("content", "")
+
+
+# ── GLM-OCR Post-processing ─────────────────────────────────────
+
+def _glm_postprocess(text: str) -> str:
+    """Strip markdown fences, remove empty tables, dedup math, dedup lines."""
+    text = re.sub(r'^```\w*\n?', '', text.strip())
+    text = re.sub(r'\n?```$', '', text.strip())
+    text = re.sub(r'(?m)^\s*```\w*\s*$', '', text)
+    text = _glm_remove_empty_html_tables(text)
+    text = _glm_remove_duplicate_display_math(text)
+    text = _glm_dedup_lines(text)
+    return text.strip()
+
+
+def _glm_remove_empty_html_tables(text: str) -> str:
+    empty_table = re.compile(
+        r'<table\b[^>]*>\s*'
+        r'(?:<tbody>\s*)?'
+        r'<tr>\s*(?:<t[dh]\b[^>]*>\s*</t[dh]>\s*)+</tr>'
+        r'\s*(?:</tbody>\s*)?'
+        r'</table>',
+        flags=re.IGNORECASE,
+    )
+    return empty_table.sub('', text)
+
+
+def _glm_remove_duplicate_display_math(text: str) -> str:
+    """Remove $$...$$ display math lines that duplicate $...$ inline math."""
+    lines = text.split('\n')
+    inline_contents = set()
+    for line in lines:
+        for m in re.finditer(r'\$([^$]+)\$', line):
+            normalized = re.sub(r'\s+', '', m.group(1))
+            inline_contents.add(normalized)
+    result = []
+    for line in lines:
+        stripped = line.strip()
+        m = re.match(r'^\$\$(.+)\$\$$', stripped)
+        if m:
+            normalized = re.sub(r'\s+', '', m.group(1))
+            if normalized in inline_contents:
+                continue
+        result.append(line)
+    return '\n'.join(result)
+
+
+def _glm_dedup_lines(text: str) -> str:
+    """Remove lines whose normalized content is a substring of any earlier line."""
+    lines = text.split('\n')
+    if len(lines) <= 1:
+        return text
+    result = [lines[0]]
+    seen_norms = [re.sub(r'\s+', '', lines[0])]
+    for line in lines[1:]:
+        curr_norm = re.sub(r'\s+', '', line)
+        if not curr_norm:
+            result.append(line)
+            continue
+        is_dup = False
+        for prev_norm in seen_norms:
+            if curr_norm == prev_norm:
+                is_dup = True
+                break
+            if len(curr_norm) > 2 and curr_norm in prev_norm:
+                is_dup = True
+                break
+        if is_dup:
+            continue
+        result.append(line)
+        seen_norms.append(curr_norm)
+    return '\n'.join(result)
+
+
+async def run_glm_ocr_from_file(file_path: Path, ocr_request: "OCRRequest") -> dict:
+    """Run GLM-OCR pipeline: PP-OCRv6 layout detection → GLM-OCR text recognition → post-processing.
+
+    PP-OCRv6 runs alongside GLM-OCR for layout detection (regions + coordinates).
+    If PP-OCRv6 is unavailable, falls back to whole-image OCR with tall-image splitting.
+    """
+    await acquire_ocr_slot(
+        "glm-ocr",
+        "GLM-OCR (Ollama) is not ready. Ensure Ollama is running and the model is loaded.",
+    )
+    try:
+        # Read the image/PDF
+        file_bytes = await run_in_threadpool(file_path.read_bytes)
+        file_type = ocr_request.fileType
+
+        # Convert to PIL Image(s)
+        images: list[Image.Image] = []
+        if file_type == 0 or file_bytes.startswith(b"%PDF-"):
+            # PDF → render pages to images
+            import fitz
+            doc = await run_in_threadpool(fitz.open, stream=file_bytes, filetype="pdf")
+            for page in doc:
+                pix = await run_in_threadpool(page.get_pixmap, matrix=fitz.Matrix(2.0, 2.0))
+                img = await run_in_threadpool(Image.frombytes, "RGB", [pix.width, pix.height], pix.samples)
+                images.append(img)
+            doc.close()
+        else:
+            # Single image
+            img = await run_in_threadpool(Image.open, io.BytesIO(file_bytes))
+            images.append(img.convert("RGB"))
+
+        all_markdown = ""
+        all_images = {}
+        pages = []
+        layout_results = []
+
+        for page_idx, img in enumerate(images):
+            w, h = img.size
+            page_markdown = ""
+            parsing_res_list = []
+
+            # Try layout detection via PP-OCRv6 API
+            raw_regions = []
+            if ocr_request.useLayoutDetection:
+                try:
+                    raw_regions = await _detect_layout_via_ppocrv6(img)
+                    if raw_regions:
+                        logger.info("[glm-ocr] Page %d: %d layout regions detected", page_idx + 1, len(raw_regions))
+                except Exception as err:
+                    logger.warning("[glm-ocr] Layout detection failed, falling back to whole-image: %s", err)
+                    raw_regions = []
+
+            if raw_regions:
+                # Layout detected: merge adjacent text regions, OCR each group
+                groups = _merge_layout_regions(raw_regions)
+                logger.info("[glm-ocr] Page %d: %d regions → %d groups", page_idx + 1, len(raw_regions), len(groups))
+
+                for gi, group in enumerate(groups):
+                    bbox = _group_bbox(group)
+                    # Clamp bbox to image bounds
+                    bbox = [
+                        max(0, bbox[0]),
+                        max(0, bbox[1]),
+                        min(w, bbox[2]),
+                        min(h, bbox[3]),
+                    ]
+                    if bbox[2] <= bbox[0] or bbox[3] <= bbox[1]:
+                        continue
+                    cropped = img.crop(bbox)
+                    seg_b64 = await run_in_threadpool(_image_to_b64, cropped)
+                    text = await _glm_ocr_single(seg_b64)
+                    text = _glm_postprocess(text)
+                    if text:
+                        page_markdown += text + "\n\n"
+                    label = group[0]["label"] if len(group) == 1 else "text"
+                    
+                    parsing_res_list.append({
+                        "label": label,
+                        "bbox": bbox,
+                        "text": text or "",
+                    })
+                    
+                    layout_results.append({
+                        "label": label,
+                        "bbox": bbox,
+                        "page_index": page_idx,
+                        "markdown": {"text": text or "", "images": {}},
+                    })
+            else:
+                # No layout detection: whole-image OCR with tall-image splitting
+                if h > GLM_OCR_MAX_IMAGE_HEIGHT:
+                    segments = await run_in_threadpool(_split_tall_image, img)
+                    logger.info("[glm-ocr] Page %d: tall image (%dx%d) → %d segments", page_idx + 1, w, h, len(segments))
+                else:
+                    segments = [img]
+
+                for seg in segments:
+                    seg_b64 = await run_in_threadpool(_image_to_b64, seg)
+                    text = await _glm_ocr_single(seg_b64)
+                    text = _glm_postprocess(text)
+                    if text:
+                        page_markdown += text + "\n\n"
+
+                parsing_res_list.append({
+                    "label": "full_page",
+                    "bbox": [0, 0, w, h],
+                    "text": page_markdown,
+                })
+
+                layout_results.append({
+                    "label": "full_page",
+                    "page_index": page_idx,
+                    "markdown": {"text": page_markdown, "images": {}},
+                })
+
+            all_markdown += page_markdown
+            pages.append({
+                "width": w,
+                "height": h,
+                "parsing_res_list": parsing_res_list,
+                "parser": "glm-ocr"
+            })
+
+        return {
+            "markdown": all_markdown,
+            "images": all_images,
+            "layoutParsingResults": layout_results,
+            "pages": pages,
+        }
+    finally:
+        await release_ocr_slot()
+
+
+@app.post("/api/glm-ocr")
+async def proxy_glm_ocr(request: Request):
+    """Proxy request to GLM-OCR (Ollama) Document Parsing Service."""
+    try:
+        ocr_request, raw_image = await parse_ocr_input(request)
+        base64_size = validate_proxy_input_size(raw_image)
+        logger.info("Received GLM-OCR request. Base64 input size: %s bytes", base64_size)
+        # For GLM-OCR, we work with the raw bytes directly, not base64
+        # We need to write to a temp file and use run_glm_ocr_from_file
+        file_bytes = raw_input_to_bytes(raw_image)
+        suffix = ".pdf" if (ocr_request.fileType == 0 or file_bytes.startswith(b"%PDF-")) else ".png"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp_file:
+            tmp_path = Path(tmp_file.name)
+        try:
+            await run_in_threadpool(tmp_path.write_bytes, file_bytes)
+            return await run_glm_ocr_from_file(tmp_path, ocr_request)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("GLM-OCR Proxy Error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/glm-ocr/status")
+async def glm_ocr_status():
+    """Check Ollama status and GLM-OCR model availability."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(f"{OLLAMA_BASE_URL}/api/tags")
+            resp.raise_for_status()
+            data = resp.json()
+            models = [m["name"] for m in data.get("models", [])]
+            has_model = any(OLLAMA_MODEL in m for m in models)
+            return {"online": True, "modelLoaded": has_model, "models": models}
+    except Exception:
+        return {"online": False, "modelLoaded": False, "models": []}
 
 
 if __name__ == "__main__":

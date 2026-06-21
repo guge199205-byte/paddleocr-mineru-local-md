@@ -88,6 +88,7 @@ services:
       - ./model_cache_ppocrv6:/home/paddleocr/.paddlex
       - ./model_cache_ppocrv6_ocr:/home/paddleocr/.paddleocr
       - ./pipeline_config_ocr_v6.yaml:/home/paddleocr/pipeline_config_ocr_v6.yaml:ro
+      - ./layout_detect_server.py:/home/paddleocr/layout_detect_server.py:ro
     command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_ocr_v6.yaml --host 0.0.0.0 --port 8080"
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
@@ -133,6 +134,29 @@ services:
     networks:
       - paddleocr-network
 
+  # ── Ollama (for GLM-OCR) ─────────────────────────────────────
+  # If you already have an Ollama container running, connect it to
+  # the paddleocr-network and set PANDOCR_OLLAMA_BASE_URL=http://ollama:11434
+  # To start Ollama with this compose: docker compose --profile glm-ocr up
+  ollama:
+    image: ollama/ollama
+    container_name: ollama
+    profiles: ["glm-ocr"]
+    ports:
+      - "0.0.0.0:11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PANDOCR_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - paddleocr-network
+
   pandocr-web:
     pull_policy: build
     build:
@@ -155,12 +179,24 @@ services:
       - PANDOCR_TASK_DATA_DIR=/app/data/tasks
       - PANDOCR_CORS_ORIGINS=${PANDOCR_CORS_ORIGINS:-http://localhost:8000,http://127.0.0.1:8000}
       - PANDOCR_MAX_UPLOAD_MB=${PANDOCR_MAX_UPLOAD_MB:-512}
+      - PANDOCR_MAX_TOTAL_UPLOAD_MB=${PANDOCR_MAX_TOTAL_UPLOAD_MB:-4096}
+      - PANDOCR_DEFAULT_CHUNK_SIZE_MB=${PANDOCR_DEFAULT_CHUNK_SIZE_MB:-10}
+      - PANDOCR_CHUNKED_UPLOAD_THRESHOLD_MB=${PANDOCR_CHUNKED_UPLOAD_THRESHOLD_MB:-100}
+      - PANDOCR_MAX_BATCH_MB=${PANDOCR_MAX_BATCH_MB:-200}
+      - PANDOCR_UPLOAD_TTL_HOURS=${PANDOCR_UPLOAD_TTL_HOURS:-24}
       - PANDOCR_MAX_CONCURRENT_OCR=${PANDOCR_MAX_CONCURRENT_OCR:-1}
       - PANDOCR_ENFORCE_ORIGIN_CHECK=${PANDOCR_ENFORCE_ORIGIN_CHECK:-1}
       - PANDOCR_API_TOKEN=${PANDOCR_API_TOKEN:-}
       - PANDOCR_ENABLE_API_DOCS=${PANDOCR_ENABLE_API_DOCS:-0}
       - MINERU_SERVICE_URL=${MINERU_SERVICE_URL:-http://mineru-api:8000}
       - MINERU_MODEL_NAME=${MINERU_MODEL_NAME:-MinerU2.5-Pro-2605-1.2B}
+      - PANDOCR_TRANSLATE_API_URL=${PANDOCR_TRANSLATE_API_URL:-}
+      - PANDOCR_TRANSLATE_API_KEY=${PANDOCR_TRANSLATE_API_KEY:-}
+      - PANDOCR_TRANSLATE_MODEL=${PANDOCR_TRANSLATE_MODEL:-gpt-4o-mini}
+      - PANDOCR_OLLAMA_BASE_URL=${PANDOCR_OLLAMA_BASE_URL:-http://ollama:11434}
+      - PANDOCR_OLLAMA_MODEL=${PANDOCR_OLLAMA_MODEL:-glm-ocr}
+      - PANDOCR_OLLAMA_NUM_CTX=${PANDOCR_OLLAMA_NUM_CTX:-8192}
+      - PANDOCR_OLLAMA_NUM_PREDICT=${PANDOCR_OLLAMA_NUM_PREDICT:-4096}
     volumes:
       - ./static:/app/static
       - ./server.py:/app/server.py
@@ -180,3 +216,6 @@ services:
 networks:
   paddleocr-network:
     driver: bridge
+
+volumes:
+  ollama_data:

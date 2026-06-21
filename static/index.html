@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>PaddleOCR Local - 本地 OCR 解析工作台</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Ctext x='32' y='42' text-anchor='middle' font-family='Arial,sans-serif' font-size='34' font-weight='700' fill='white'%3EP%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/static/style.css?v=42">
+    <link rel="stylesheet" href="/static/style.css?v=43">
     <script src="/static/vendor/pdfjs/pdf.min.js"></script>
     <script src="/static/vendor/pdf-lib/pdf-lib.min.js"></script>
     <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
@@ -30,7 +30,7 @@
                 <div class="brand-mark">P</div>
                 <div>
                     <div class="brand-name">PaddleOCR Local</div>
-                    <div class="brand-subtitle">本地 PaddleOCR 双模型解析</div>
+                    <div class="brand-subtitle">本地多模型 OCR 解析</div>
                 </div>
             </div>
             <div class="topbar-actions">
@@ -97,11 +97,26 @@
                             <input type="number" id="pdf-batch-size-input-mineru" min="1" max="400" step="1" value="1" inputmode="numeric">
                         </label>
                     </div>
+                    <div class="settings-grid hidden" id="glm-ocr-settings">
+                        <label><input type="checkbox" id="glm-ocr-layout-switch" checked> 版面检测（PP-OCRv6）</label>
+                        <label class="setting-number">
+                            <span>每批页数</span>
+                            <input type="number" id="pdf-batch-size-input-glm-ocr" min="1" max="400" step="1" value="1" inputmode="numeric">
+                        </label>
+                    </div>
                 </details>
 
                 <div class="task-tabs">
                     <button class="task-tab active" data-filter="all">最近上传</button>
                     <button class="task-tab" data-filter="done">已完成</button>
+                </div>
+                <div class="folder-bar">
+                    <button class="icon-button" id="new-folder-btn" title="新建文件夹">
+                        <svg viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/><path d="M12 11v4M10 13h4"/></svg>
+                    </button>
+                    <select id="folder-select" aria-label="文件夹">
+                        <option value="">全部文件</option>
+                    </select>
                 </div>
                 <div class="task-tools">
                     <div class="search-box">
@@ -170,6 +185,12 @@
                                 <button class="icon-button" id="download-btn" title="下载结果">
                                     <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg>
                                 </button>
+                                <button class="icon-button danger" id="clear-result-btn" title="清空解析结果" style="display:none;">
+                                    <svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"/></svg>
+                                </button>
+                                <button class="icon-button" id="translate-btn" title="翻译" style="display:none;">
+                                    <svg viewBox="0 0 24 24"><path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0014.07 6H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>
+                                </button>
                             </div>
                         </div>
                         <div class="view-tabs">
@@ -191,7 +212,7 @@
     </div>
 
     <template id="task-item-template">
-        <div class="task-item" role="button" tabindex="0">
+        <div class="task-item" role="button" tabindex="0" draggable="true">
             <span class="task-icon"></span>
             <span class="task-main">
                 <span class="task-name"></span>
@@ -205,6 +226,6 @@
     </template>
 
     <script charset="UTF-8" src="/static/i18n.js?v=2"></script>
-    <script charset="UTF-8" src="/static/app.js?v=100"></script>
+    <script charset="UTF-8" src="/static/app.js?v=101"></script>
 </body>
 </html>
