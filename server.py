@@ -81,6 +81,7 @@ TRANSLATE_API_KEY = os.getenv("PANDOCR_TRANSLATE_API_KEY", "").strip()
 TRANSLATE_MODEL = os.getenv("PANDOCR_TRANSLATE_MODEL", "gpt-4o-mini").strip()
 TASK_STORE_MARKER = ".pandocr-task-store"
 TASK_RESULT_FILE = "result.json"
+TASK_MARKDOWN_FILE = "markdown.md"
 TASK_SUMMARY_FILE = "summary.json"
 FOLDER_STORE_FILE = "folders.json"
 UPLOAD_CHUNK_SIZE = 1024 * 1024
@@ -775,6 +776,33 @@ def write_task_bundle(task_id: str, task: dict) -> dict:
     task_dir.mkdir(parents=True, exist_ok=True)
 
     result_path = task_result_path(task_id)
+
+    # Smart merge with existing result.json:
+    # When the task object was hydrated in lite mode (missing images/ocrResults),
+    # we must preserve the existing heavy data and only update what changed.
+    if result_payload is not None and result_path.exists():
+        try:
+            existing = read_json_file(result_path)
+            if isinstance(existing, dict):
+                # Merge images: new images override existing, but keep existing ones not in new
+                if isinstance(result_payload.get("images"), dict) and isinstance(existing.get("images"), dict):
+                    merged_images = dict(existing["images"])
+                    merged_images.update(result_payload["images"])
+                    result_payload["images"] = merged_images
+                elif not result_payload.get("images") and existing.get("images"):
+                    result_payload["images"] = existing["images"]
+
+                # Merge ocrResults: if new has fewer, keep existing
+                if isinstance(result_payload.get("ocrResults"), list) and isinstance(existing.get("ocrResults"), list):
+                    if len(result_payload["ocrResults"]) < len(existing["ocrResults"]):
+                        result_payload["ocrResults"] = existing["ocrResults"]
+
+                # Keep existing translation if not in new
+                if not result_payload.get("translation") and existing.get("translation"):
+                    result_payload["translation"] = existing["translation"]
+        except (OSError, ValueError, json.JSONDecodeError) as err:
+            logger.warning("Failed to merge existing result.json for task %s: %s", task_id, err)
+
     if result_payload is None:
         pass
     elif stored_task.get("_storage", {}).get("resultPath"):
@@ -789,10 +817,96 @@ def write_task_bundle(task_id: str, task: dict) -> dict:
             write_json_file(result_path, result_payload)
         # else: keep existing result.json intact
 
+    # Also save markdown to a standalone .md file for fast lite hydration.
+    # This allows the lite endpoint to load markdown without parsing the
+    # entire result.json (which can be hundreds of MB for large documents).
+    md_path = task_dir / TASK_MARKDOWN_FILE
+    markdown_text = task.get("markdown") if isinstance(task, dict) else None
+    if markdown_text:
+        try:
+            md_path.write_text(markdown_text, encoding="utf-8")
+        except OSError as err:
+            logger.warning("Failed to write markdown file for task %s: %s", task_id, err)
+    elif md_path.exists() and result_payload is None:
+        # Task was reset — remove stale markdown file
+        try:
+            md_path.unlink()
+        except OSError:
+            pass
+
     write_json_file(task_file_path(task_id), stored_task)
     summary = task_summary(stored_task)
     write_json_file(task_summary_path(task_id), summary)
     return stored_task
+
+
+def hydrate_task_detail_lite(task_id: str, task: dict) -> dict:
+    """Load lightweight task details — markdown and metadata only.
+
+    Omits `images` and `ocrResults` to avoid loading hundreds of MB
+    of base64 data into memory.  The frontend fetches these on demand
+    via the /api/tasks/{id}/result endpoint.
+
+    Markdown is loaded from a separate .md file when available,
+    avoiding the need to parse the entire result.json.
+    """
+    task_dir = task_dir_path(task_id)
+    md_path = task_dir / TASK_MARKDOWN_FILE
+
+    # Fast path: load markdown from standalone file (no JSON parsing needed)
+    if md_path.exists():
+        try:
+            task["markdown"] = md_path.read_text(encoding="utf-8")
+        except OSError as err:
+            logger.warning("Failed to read markdown file %s: %s", md_path, err)
+
+    # Determine _resultState without loading result.json
+    # Check file existence and first bytes to infer what data exists
+    storage = task.get("_storage") if isinstance(task.get("_storage"), dict) else {}
+    result_name = storage.get("resultPath") or TASK_RESULT_FILE
+    result_path = task_dir / result_name
+
+    result_state = task.get("_resultState") if isinstance(task.get("_resultState"), dict) else {}
+    if result_path.exists() and not result_state:
+        # Infer _resultState from file existence and size — avoid loading the JSON
+        try:
+            # Peek at the first few bytes to quickly determine if key fields exist
+            with result_path.open("r", encoding="utf-8") as f:
+                preview = f.read(4096)
+            task["_resultState"] = {
+                "hasMarkdown": bool(task.get("markdown")) or '"markdown"' in preview,
+                "hasImages": '"images"' in preview,
+                "hasOcrResults": '"ocrResults"' in preview or '"ocr_lines"' in preview.lower(),
+            }
+        except OSError:
+            task["_resultState"] = {"hasMarkdown": bool(task.get("markdown")), "hasImages": False, "hasOcrResults": False}
+
+    # Load translation data — it's typically small
+    if result_path.exists():
+        try:
+            # Only parse result.json if we need translation (usually small)
+            # or if markdown wasn't loaded from .md file
+            if not task.get("markdown") or not task.get("translation"):
+                result_payload = read_json_file(result_path)
+                if not task.get("markdown") and "markdown" in result_payload:
+                    task["markdown"] = result_payload["markdown"]
+                if "translation" in result_payload:
+                    task["translation"] = result_payload["translation"]
+                if "translationLang" in result_payload:
+                    task["translationLang"] = result_payload["translationLang"]
+                batch_markdown = result_payload.get("batchMarkdown")
+                if isinstance(batch_markdown, dict) and isinstance(task.get("batches"), list):
+                    for batch in task["batches"]:
+                        if isinstance(batch, dict) and batch.get("id") in batch_markdown:
+                            batch["markdown"] = batch_markdown[batch["id"]]
+        except (OSError, ValueError, json.JSONDecodeError) as err:
+            logger.warning("Failed to hydrate lite task result %s: %s", result_path, err)
+
+    task.setdefault("markdown", "")
+    task.setdefault("images", {})
+    task.setdefault("ocrResults", [])
+
+    return task
 
 
 def hydrate_task_detail(task_id: str, task: dict) -> dict:
@@ -1167,9 +1281,14 @@ def reassemble_chunks(upload_id: str, target_path: Path) -> int:
             chunk_path = session_dir / "chunks" / str(index)
             if not chunk_path.exists():
                 raise HTTPException(status_code=400, detail=f"Missing chunk {index}")
-            data = chunk_path.read_bytes()
-            out.write(data)
-            total += len(data)
+            # Stream-copy to avoid loading each chunk fully into memory
+            with chunk_path.open("rb") as inp:
+                while True:
+                    block = inp.read(UPLOAD_CHUNK_SIZE)
+                    if not block:
+                        break
+                    out.write(block)
+                    total += len(block)
     return total
 
 
@@ -1217,24 +1336,58 @@ async def write_upload_to_path(file: UploadFile, path: Path, max_bytes: int | No
 
 def get_pdf_page_count(source_path: Path) -> int:
     """Read only the PDF cross-reference table to get page count. O(1) for most PDFs."""
-    from pypdf import PdfReader
+    import fitz
 
-    reader = PdfReader(str(source_path))
+    doc = fitz.open(str(source_path))
     try:
-        count = len(reader.pages)
+        return doc.page_count
     finally:
-        if hasattr(reader, "stream"):
-            reader.stream.close()
-    return count
+        doc.close()
 
 
 def extract_pdf_pages(source_path: Path, start_page: int, end_page: int, output_path: Path | None = None) -> Path:
-    """Extract page range from source PDF.
+    """Extract page range from source PDF using PyMuPDF (fitz).
 
-    If *output_path* is provided, writes to that file and returns it.
-    Otherwise writes to a temp file and returns the temp path.
-    Writing to a file avoids holding both input and output in memory.
+    PyMuPDF streams pages from disk without loading the entire PDF into memory,
+    making it suitable for files >1 GB.  Falls back to pypdf if fitz is unavailable.
     """
+    try:
+        import fitz
+
+        doc = fitz.open(str(source_path))
+        total_pages = doc.page_count
+        if total_pages <= 0:
+            doc.close()
+            raise ValueError("Source PDF has no pages")
+        if start_page < 1 or end_page < start_page or start_page > total_pages:
+            doc.close()
+            raise ValueError(f"Invalid page range {start_page}-{end_page} for {total_pages} pages")
+
+        end_page = min(end_page, total_pages)
+
+        # Create a new PDF with only the selected pages
+        out_doc = fitz.open()
+        for page_index in range(start_page - 1, end_page):
+            out_doc.insert_pdf(doc, from_page=page_index, to_page=page_index)
+        doc.close()
+
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            out_doc.save(str(output_path), deflate=True, garbage=3)
+            out_doc.close()
+            return output_path
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
+                out_doc.save(tmp_file.name, deflate=True, garbage=3)
+                out_doc.close()
+                return Path(tmp_file.name)
+        except Exception:
+            raise
+    except ImportError:
+        pass
+
+    # Fallback: pypdf (loads entire PDF into memory — not ideal for large files)
     from pypdf import PdfReader, PdfWriter
 
     reader = PdfReader(str(source_path))
@@ -1280,8 +1433,12 @@ async def upload_task_source(task_id: str, file: UploadFile = File(...)):
 
 
 @app.get("/api/tasks/{task_id}/source")
-async def get_task_source(task_id: str):
-    """Return the original uploaded source file for previewing or resumable parsing."""
+async def get_task_source(task_id: str, request: Request):
+    """Return the original uploaded source file for previewing or resumable parsing.
+
+    Supports HTTP Range requests so that PDF.js can load individual pages
+    on demand without downloading the entire file — critical for files >1 GB.
+    """
     source_path = task_source_path(task_id)
     if not source_path.exists():
         raise HTTPException(status_code=404, detail="Task source not found")
@@ -1297,6 +1454,45 @@ async def get_task_source(task_id: str):
         except (OSError, ValueError, json.JSONDecodeError):
             pass
 
+    file_size = source_path.stat().st_size
+    range_header = request.headers.get("range")
+
+    # Handle Range request (for PDF.js lazy page loading)
+    if range_header:
+        import re as _re
+        match = _re.match(r"bytes=(\d+)-(\d*)", range_header)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2)) if match.group(2) else file_size - 1
+            if start >= file_size:
+                return Response(status_code=416, headers={"Content-Range": f"bytes */{file_size}"})
+            end = min(end, file_size - 1)
+            content_length = end - start + 1
+
+            async def _range_stream():
+                with source_path.open("rb") as f:
+                    f.seek(start)
+                    remaining = content_length
+                    while remaining > 0:
+                        chunk = f.read(min(UPLOAD_CHUNK_SIZE, remaining))
+                        if not chunk:
+                            break
+                        remaining -= len(chunk)
+                        yield chunk
+
+            return StreamingResponse(
+                _range_stream(),
+                status_code=206,
+                media_type=media_type,
+                headers={
+                    "Content-Range": f"bytes {start}-{end}/{file_size}",
+                    "Content-Length": str(content_length),
+                    "Accept-Ranges": "bytes",
+                    "Content-Disposition": f'inline; filename="{filename}"',
+                },
+            )
+
+    # Full file response
     return FileResponse(source_path, media_type=media_type, filename=filename)
 
 
@@ -1335,8 +1531,13 @@ async def list_tasks():
 
 
 @app.get("/api/tasks/{task_id}")
-async def get_task(task_id: str):
-    """Return one full locally persisted task."""
+async def get_task(task_id: str, lite: bool = Query(True)):
+    """Return one locally persisted task.
+
+    By default returns a lightweight response that omits heavy fields
+    (images, ocrResults) to avoid OOM on large results.  Set ?lite=false
+    to load the full result payload.
+    """
     path = task_file_path(task_id)
     if not path.exists():
         raise HTTPException(status_code=404, detail="Task not found")
@@ -1347,9 +1548,76 @@ async def get_task(task_id: str):
         raise HTTPException(status_code=500, detail="Failed to read task")
     if task_source_path(task_id).exists() and not task.get("sourceUrl"):
         task["sourceUrl"] = task_source_url(task_id)
-    task = hydrate_task_detail(task_id, task)
+
+    if lite:
+        task = hydrate_task_detail_lite(task_id, task)
+    else:
+        task = hydrate_task_detail(task_id, task)
+
     task["detailLoaded"] = True
     return task
+
+
+@app.get("/api/tasks/{task_id}/result")
+async def get_task_result(
+    task_id: str,
+    fields: str = Query("", description="Comma-separated fields to include: images,ocrResults,markdown,translation"),
+    image_offset: int = Query(0, ge=0),
+    image_limit: int = Query(200, ge=1, le=1000),
+    ocr_offset: int = Query(0, ge=0),
+    ocr_limit: int = Query(100, ge=1, le=1000),
+):
+    """Return heavy result data for a task, with pagination support.
+
+    This endpoint allows the frontend to lazily load images and ocrResults
+    on demand, avoiding OOM when a task has hundreds of pages of results.
+    """
+    result_path = task_result_path(task_id)
+    if not result_path.exists():
+        return {"images": {}, "ocrResults": []}
+
+    try:
+        result_payload = await run_in_threadpool(read_json_file, result_path)
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        logger.warning("Failed to read result file for task %s: %s", task_id, err)
+        raise HTTPException(status_code=500, detail="Failed to read task result")
+
+    requested = set(f.strip() for f in fields.split(",") if f.strip()) if fields else set()
+    # If no fields specified, return all
+    include_all = len(requested) == 0
+    response = {}
+
+    if include_all or "images" in requested:
+        all_images = result_payload.get("images", {})
+        if isinstance(all_images, dict):
+            image_keys = list(all_images.keys())
+            paginated_keys = image_keys[image_offset:image_offset + image_limit]
+            response["images"] = {k: all_images[k] for k in paginated_keys if k in all_images}
+            response["imageTotal"] = len(image_keys)
+        else:
+            response["images"] = {}
+            response["imageTotal"] = 0
+
+    if include_all or "ocrResults" in requested:
+        all_ocr = result_payload.get("ocrResults", [])
+        if isinstance(all_ocr, list):
+            response["ocrResults"] = all_ocr[ocr_offset:ocr_offset + ocr_limit]
+            response["ocrTotal"] = len(all_ocr)
+        else:
+            response["ocrResults"] = []
+            response["ocrTotal"] = 0
+
+    if include_all or "markdown" in requested:
+        response["markdown"] = result_payload.get("markdown", "")
+        bm = result_payload.get("batchMarkdown")
+        if isinstance(bm, dict):
+            response["batchMarkdown"] = bm
+
+    if include_all or "translation" in requested:
+        response["translation"] = result_payload.get("translation")
+        response["translationLang"] = result_payload.get("translationLang")
+
+    return response
 
 
 @app.put("/api/tasks/{task_id}")
@@ -1982,7 +2250,20 @@ async def process_task_background(
         # Hydrate to load existing results from result.json
         # Without this, resuming a partially-completed task would start from
         # empty markdown, losing all previously-accumulated OCR data.
-        task = hydrate_task_detail(task_id, task)
+        # Use lite hydration first (fast — reads standalone .md file),
+        # then load ocrResults on demand (needed for accumulation).
+        # Skip images — they are merged incrementally and not needed for resume.
+        task = hydrate_task_detail_lite(task_id, task)
+        # Load ocrResults for accumulation — needed by background processing
+        # but NOT images (those are huge and only merged at write time).
+        result_path = task_result_path(task_id)
+        if result_path.exists() and not task.get("ocrResults"):
+            try:
+                result_payload = read_json_file(result_path)
+                if "ocrResults" in result_payload:
+                    task["ocrResults"] = result_payload["ocrResults"]
+            except (OSError, ValueError, json.JSONDecodeError) as err:
+                logger.warning("Failed to load ocrResults for task %s: %s", task_id, err)
         batches = task.get("batches", [])
         if not batches:
             logger.warning("No batches found for task %s", task_id)
@@ -2214,7 +2495,12 @@ async def run_ocr_from_file(file_path: Path, model_id: str, ocr_request: "OCRReq
 
 
 async def run_mineru_from_file(file_path: Path, ocr_request: "OCRRequest") -> dict:
-    """Stream a file from disk to MinerU without loading it all into memory."""
+    """Stream a file from disk to MinerU without loading it all into memory.
+
+    Uses a file-stream for the multipart upload so that even multi-GB PDFs
+    are sent incrementally.  Page dimensions are obtained separately via
+    fitz.open(path) which also streams from disk.
+    """
     await acquire_ocr_slot("mineru", "MinerU service is not ready.")
     try:
         file_type = ocr_request.fileType
@@ -2240,39 +2526,45 @@ async def run_mineru_from_file(file_path: Path, ocr_request: "OCRRequest") -> di
         logger.info("Streaming request to MinerU Service at %s/file_parse", MINERU_SERVICE_URL)
         timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
 
-        # Read file in thread pool to avoid blocking the event loop
-        file_bytes = await run_in_threadpool(file_path.read_bytes)
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            resp = await client.post(
-                f"{MINERU_SERVICE_URL}/file_parse",
-                files={"files": (filename, file_bytes, "application/octet-stream")},
-                data=data_payload,
-            )
-
-            if resp.status_code != 200:
-                logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
-                raise HTTPException(
-                    status_code=resp.status_code,
-                    detail=f"Upstream MinerU error: {resp.text}",
+        # Stream the file from disk via a file handle — avoids loading the
+        # entire file into memory (critical for files >1 GB).
+        file_handle = await run_in_threadpool(file_path.open, "rb")
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                resp = await client.post(
+                    f"{MINERU_SERVICE_URL}/file_parse",
+                    files={"files": (filename, file_handle, "application/octet-stream")},
+                    data=data_payload,
                 )
 
-            # Get dimensions to attach to MinerU response
-            dimensions = []
-            try:
-                import fitz, io
-                from PIL import Image
-                if file_type == 0:
-                    doc = fitz.open(stream=file_bytes, filetype="pdf")
+                if resp.status_code != 200:
+                    logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail=f"Upstream MinerU error: {resp.text}",
+                    )
+        finally:
+            file_handle.close()
+
+        # Get dimensions from the file on disk (fitz.open streams from disk)
+        dimensions = []
+        try:
+            import fitz
+            if file_type == 0:
+                doc = await run_in_threadpool(fitz.open, str(file_path))
+                try:
                     for page in doc:
                         dimensions.append((page.rect.width, page.rect.height))
+                finally:
                     doc.close()
-                else:
-                    img = Image.open(io.BytesIO(file_bytes))
-                    dimensions.append((img.width, img.height))
-            except Exception as e:
-                logger.warning("Failed to get MinerU page dimensions: %s", e)
+            else:
+                from PIL import Image
+                img = await run_in_threadpool(Image.open, str(file_path))
+                dimensions.append((img.width, img.height))
+        except Exception as e:
+            logger.warning("Failed to get MinerU page dimensions: %s", e)
 
-            return parse_mineru_response(resp.json(), dimensions)
+        return parse_mineru_response(resp.json(), dimensions)
     finally:
         await release_ocr_slot()
 
@@ -2776,8 +3068,9 @@ async def proxy_ppocrv6(request: Request):
 async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
     """Proxy request to MinerU API Service (multipart /file_parse).
 
-    Uses streaming upload when the input is raw bytes to avoid
-    holding the entire file in memory twice.
+    Writes raw bytes to a temp file, then streams the upload from disk
+    to avoid holding the entire file in memory twice.  Page dimensions
+    are obtained via fitz.open(path) which also streams from disk.
     """
     await acquire_ocr_slot(
         "mineru",
@@ -2811,6 +3104,8 @@ async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) ->
             tmp_path = Path(tmp_file.name)
         try:
             await run_in_threadpool(tmp_path.write_bytes, file_bytes)
+            # Free the raw bytes as soon as they are on disk
+            del file_bytes
 
             with tmp_path.open("rb") as f:
                 async with httpx.AsyncClient(timeout=timeout) as client:
@@ -2824,23 +3119,25 @@ async def run_mineru_request(ocr_request: OCRRequest, raw_input: RawOCRInput) ->
                         logger.warning("MinerU Service Error (HTTP %s): %s", resp.status_code, resp.text)
                         raise HTTPException(status_code=resp.status_code, detail=f"Upstream MinerU error: {resp.text}")
 
-                    # Get dimensions
-                    dimensions = []
+            # Get dimensions from the temp file on disk (fitz.open streams from disk)
+            dimensions = []
+            try:
+                import fitz
+                if file_type == 0:
+                    doc = await run_in_threadpool(fitz.open, str(tmp_path))
                     try:
-                        import fitz, io
-                        from PIL import Image
-                        if file_type == 0:
-                            doc = fitz.open(stream=file_bytes, filetype="pdf")
-                            for page in doc:
-                                dimensions.append((page.rect.width, page.rect.height))
-                            doc.close()
-                        else:
-                            img = Image.open(io.BytesIO(file_bytes))
-                            dimensions.append((img.width, img.height))
-                    except Exception as e:
-                        logger.warning("Failed to get MinerU page dimensions: %s", e)
+                        for page in doc:
+                            dimensions.append((page.rect.width, page.rect.height))
+                    finally:
+                        doc.close()
+                else:
+                    from PIL import Image
+                    img = await run_in_threadpool(Image.open, str(tmp_path))
+                    dimensions.append((img.width, img.height))
+            except Exception as e:
+                logger.warning("Failed to get MinerU page dimensions: %s", e)
 
-                    return parse_mineru_response(resp.json(), dimensions)
+            return parse_mineru_response(resp.json(), dimensions)
         finally:
             tmp_path.unlink(missing_ok=True)
     finally:
@@ -3179,23 +3476,26 @@ async def run_glm_ocr_from_file(file_path: Path, ocr_request: "OCRRequest") -> d
         "GLM-OCR (Ollama) is not ready. Ensure Ollama is running and the model is loaded.",
     )
     try:
-        # Read the image/PDF
-        file_bytes = await run_in_threadpool(file_path.read_bytes)
+        # Read the image/PDF — use fitz.open(path) for PDFs to stream from disk
+        # instead of loading the entire file into memory.
         file_type = ocr_request.fileType
 
         # Convert to PIL Image(s)
         images: list[Image.Image] = []
-        if file_type == 0 or file_bytes.startswith(b"%PDF-"):
-            # PDF → render pages to images
+        if file_type == 0:
+            # PDF → render pages to images via fitz (streams from disk)
             import fitz
-            doc = await run_in_threadpool(fitz.open, stream=file_bytes, filetype="pdf")
-            for page in doc:
-                pix = await run_in_threadpool(page.get_pixmap, matrix=fitz.Matrix(2.0, 2.0))
-                img = await run_in_threadpool(Image.frombytes, "RGB", [pix.width, pix.height], pix.samples)
-                images.append(img)
-            doc.close()
+            doc = await run_in_threadpool(fitz.open, str(file_path))
+            try:
+                for page in doc:
+                    pix = await run_in_threadpool(page.get_pixmap, matrix=fitz.Matrix(2.0, 2.0))
+                    img = await run_in_threadpool(Image.frombytes, "RGB", [pix.width, pix.height], pix.samples)
+                    images.append(img)
+            finally:
+                doc.close()
         else:
-            # Single image
+            # Single image — need bytes for PIL, but images are typically small
+            file_bytes = await run_in_threadpool(file_path.read_bytes)
             img = await run_in_threadpool(Image.open, io.BytesIO(file_bytes))
             images.append(img.convert("RGB"))
 

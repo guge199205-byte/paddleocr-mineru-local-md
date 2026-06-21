@@ -937,11 +937,34 @@ async function loadServerTasks() {
 }
 
 async function loadTaskFromServer(taskId) {
-    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+    // Use lite mode by default to avoid loading hundreds of MB of
+    // base64 images and OCR results into the browser at once.
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}?lite=true`);
     if (!response.ok) {
         throw new Error(t('读取本地任务失败：{detail}', { detail: await responseErrorText(response) }));
     }
     return reconcileTaskStatus(await response.json());
+}
+
+async function loadTaskResult(taskId, options = {}) {
+    /** Lazily load heavy result data (images, ocrResults) with pagination.
+     *  options.fields — comma-separated: 'images,ocrResults,markdown,translation'
+     *  options.imageOffset / imageLimit — pagination for images
+     *  options.ocrOffset / ocrLimit — pagination for ocrResults
+     */
+    const params = new URLSearchParams();
+    if (options.fields) params.set('fields', options.fields);
+    if (options.imageOffset) params.set('image_offset', options.imageOffset);
+    if (options.imageLimit) params.set('image_limit', options.imageLimit);
+    if (options.ocrOffset) params.set('ocr_offset', options.ocrOffset);
+    if (options.ocrLimit) params.set('ocr_limit', options.ocrLimit);
+    const qs = params.toString();
+    const url = `${API_BASE}/tasks/${encodeURIComponent(taskId)}/result${qs ? '?' + qs : ''}`;
+    const response = await apiFetch(url);
+    if (!response.ok) {
+        throw new Error(t('读取任务结果失败：{detail}', { detail: await responseErrorText(response) }));
+    }
+    return response.json();
 }
 
 function isTaskDetailLoaded(task) {
@@ -1470,6 +1493,39 @@ async function selectTask(taskId) {
     }
     if (activeTaskId !== taskId) return;
     if (!task) return;
+
+    // Lazily load heavy result data (images, ocrResults) if available.
+    // The lite endpoint omits these to avoid OOM on large results.
+    // We load images first (needed for markdown rendering), then defer
+    // ocrResults until the user actually needs them.
+    const resultState = task._resultState;
+    if (!task._resultLoaded) {
+        if (resultState && (resultState.hasImages || resultState.hasOcrResults)) {
+            try {
+                // Load images in batches — they're needed for markdown rendering
+                const resultData = await loadTaskResult(taskId, {
+                    fields: 'images',
+                    imageLimit: 200,
+                });
+                if (resultData.images && typeof resultData.images === 'object') {
+                    task.images = { ...task.images, ...resultData.images };
+                }
+                task._imagesLoaded = true;
+                task._imageTotal = resultData.imageTotal || 0;
+                // Defer ocrResults — load on demand when user switches to JSON view
+                task._ocrLoaded = false;
+                task._ocrTotal = resultState.hasOcrResults ? -1 : 0; // -1 = unknown, needs loading
+            } catch (err) {
+                console.warn('Failed to lazy-load task images:', err);
+            }
+        } else {
+            // No heavy data to load or already present in lite response
+            task._imagesLoaded = true;
+            task._ocrLoaded = true;
+        }
+        task._resultLoaded = true;
+    }
+
     renderTaskList();
     updateActiveModelDisplay(task);
     els.sourceTitle.textContent = task.name;
@@ -1861,7 +1917,7 @@ function renderResultPane(task, { deferJson = false, preserveScroll = true } = {
         return;
     }
 
-    const isDocumentParser = ['mineru', 'glm-ocr'].includes(task.modelId) || task.ocrResults?.some(p => ['mineru', 'glm-ocr'].includes(p.parser));
+    const isDocumentParser = ['mineru', 'glm-ocr'].includes(task.modelId) || (task.ocrResults?.length && task.ocrResults.some(p => ['mineru', 'glm-ocr'].includes(p.parser)));
     
     if (!isDocumentParser) {
         const officialRender = renderOfficialLayoutResult(task);
@@ -1929,7 +1985,25 @@ function renderResultPane(task, { deferJson = false, preserveScroll = true } = {
     restoreResultScrollState(scrollState);
 }
 
-function renderJsonResult(task, { defer = false, scrollState = null } = {}) {
+async function renderJsonResult(task, { defer = false, scrollState = null } = {}) {
+    // Lazy-load ocrResults if not yet loaded
+    if (task._ocrLoaded === false && task._ocrTotal !== 0) {
+        try {
+            const resultData = await loadTaskResult(task.id, {
+                fields: 'ocrResults',
+                ocrLimit: 1000,
+            });
+            if (Array.isArray(resultData.ocrResults)) {
+                task.ocrResults = resultData.ocrResults;
+            }
+            task._ocrLoaded = true;
+            task._ocrTotal = resultData.ocrTotal || task.ocrResults.length;
+        } catch (err) {
+            console.warn('Failed to lazy-load ocrResults:', err);
+            task._ocrLoaded = true; // Don't retry on error
+        }
+    }
+
     const key = resultDataKey(task);
     if (renderedJsonKey === key) {
         renderVisibleJsonLines();
@@ -1962,7 +2036,8 @@ function renderJsonResult(task, { defer = false, scrollState = null } = {}) {
 
 function warmJsonResultCache(task) {
     const key = resultDataKey(task);
-    if (renderedJsonKey === key || !task?.ocrResults?.length) return;
+    // Skip if ocrResults not yet loaded (will be loaded on demand in renderJsonResult)
+    if (renderedJsonKey === key || !task?.ocrResults?.length || task._ocrLoaded === false) return;
 
     const warm = () => {
         if (renderedJsonKey === key || activeResultView === 'json' || getActiveTask()?.id !== task.id) return;
@@ -3010,18 +3085,61 @@ async function refreshServerResults(taskId) {
     lastResultRefreshTime = now;
 
     try {
-        const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+        const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}?lite=true`);
         if (!response.ok) return;
         const serverTask = await response.json();
 
-        // Update local task data
+        // Update local task data, preserving already-loaded heavy data
         const localIndex = tasks.findIndex((t) => t.id === taskId);
         if (localIndex >= 0) {
+            const localTask = tasks[localIndex];
+            if (localTask.images && Object.keys(localTask.images).length) {
+                serverTask.images = { ...serverTask.images, ...localTask.images };
+            }
+            if (localTask.ocrResults?.length) {
+                serverTask.ocrResults = localTask.ocrResults;
+            }
+            if (localTask._resultLoaded) serverTask._resultLoaded = true;
+            if (localTask._imagesLoaded) serverTask._imagesLoaded = true;
+            if (localTask._ocrLoaded) serverTask._ocrLoaded = true;
             tasks[localIndex] = serverTask;
         }
 
         // Refresh result pane if this task is active — with throttle
         if (activeTaskId === taskId) {
+            // During processing, new images may have been added — load them incrementally
+            if (serverTask._resultState?.hasImages && serverTask._imagesLoaded) {
+                const localImageCount = Object.keys(serverTask.images || {}).length;
+                const serverImageTotal = serverTask._imageTotal || 0;
+                if (serverImageTotal > localImageCount) {
+                    // More images available on server — fetch the new ones
+                    loadTaskResult(taskId, {
+                        fields: 'images',
+                        imageOffset: localImageCount,
+                        imageLimit: 200,
+                    }).then((newData) => {
+                        if (newData.images && typeof newData.images === 'object') {
+                            const t = tasks.find((x) => x.id === taskId);
+                            if (t) {
+                                t.images = { ...t.images, ...newData.images };
+                                t._imageTotal = newData.imageTotal || t._imageTotal;
+                            }
+                        }
+                    }).catch(() => {});
+                }
+            } else if (serverTask._resultState?.hasImages && !serverTask._imagesLoaded) {
+                // Images not loaded yet — load first batch
+                serverTask._imagesLoaded = true; // prevent re-trigger
+                loadTaskResult(taskId, {
+                    fields: 'images',
+                    imageLimit: 200,
+                }).then((newData) => {
+                    if (newData.images && typeof newData.images === 'object') {
+                        serverTask.images = { ...serverTask.images, ...newData.images };
+                        serverTask._imageTotal = newData.imageTotal || 0;
+                    }
+                }).catch(() => {});
+            }
             scheduleMdRender(serverTask);
         }
 
@@ -3050,12 +3168,22 @@ async function finishServerProcessing(taskId, status, error = null) {
     // Clean up SSE/polling listeners
     cleanupServerProcessingListeners();
     // Reload task from server to get updated results
-    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+    const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}?lite=true`);
     if (response.ok) {
         const serverTask = await response.json();
-        // Merge server results into local task
+        // Merge server results into local task, preserving already-loaded heavy data
         const localIndex = tasks.findIndex((t) => t.id === taskId);
         if (localIndex >= 0) {
+            const localTask = tasks[localIndex];
+            if (localTask.images && Object.keys(localTask.images).length) {
+                serverTask.images = { ...serverTask.images, ...localTask.images };
+            }
+            if (localTask.ocrResults?.length) {
+                serverTask.ocrResults = localTask.ocrResults;
+            }
+            if (localTask._resultLoaded) serverTask._resultLoaded = true;
+            if (localTask._imagesLoaded) serverTask._imagesLoaded = true;
+            if (localTask._ocrLoaded) serverTask._ocrLoaded = true;
             tasks[localIndex] = serverTask;
         }
         if (activeTaskId === taskId) {
@@ -3080,11 +3208,22 @@ function pollTaskProgress(taskId) {
     let lastPollRefresh = 0;
     activePollInterval = setInterval(async () => {
         try {
-            const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}`);
+            const response = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(taskId)}?lite=true`);
             if (!response.ok) return;
             const serverTask = await response.json();
             const localIndex = tasks.findIndex((t) => t.id === taskId);
             if (localIndex >= 0) {
+                // Merge: preserve already-loaded heavy data from local task
+                const localTask = tasks[localIndex];
+                if (localTask.images && Object.keys(localTask.images).length) {
+                    serverTask.images = { ...serverTask.images, ...localTask.images };
+                }
+                if (localTask.ocrResults?.length) {
+                    serverTask.ocrResults = localTask.ocrResults;
+                }
+                if (localTask._resultLoaded) serverTask._resultLoaded = true;
+                if (localTask._imagesLoaded) serverTask._imagesLoaded = true;
+                if (localTask._ocrLoaded) serverTask._ocrLoaded = true;
                 tasks[localIndex] = serverTask;
             }
             if (serverTask.status === 'completed' || serverTask.status === 'error' || serverTask.status === 'paused') {
@@ -3339,6 +3478,11 @@ function taskForPersistence(task, { includeResults = true } = {}) {
     delete persisted.detailLoaded;
     delete persisted._storage;
     delete persisted._resultState;
+    delete persisted._resultLoaded;
+    delete persisted._imagesLoaded;
+    delete persisted._ocrLoaded;
+    delete persisted._imageTotal;
+    delete persisted._ocrTotal;
     if (persisted.sourceUrl) {
         delete persisted.sourceDataUrl;
     }
