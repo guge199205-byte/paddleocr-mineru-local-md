@@ -3403,7 +3403,28 @@ def _glm_postprocess(text: str) -> str:
     text = _glm_remove_empty_html_tables(text)
     text = _glm_remove_duplicate_display_math(text)
     text = _glm_dedup_lines(text)
+    text = _glm_prevent_hr_from_dashes(text)
     return text.strip()
+
+
+def _glm_prevent_hr_from_dashes(text: str) -> str:
+    """Prevent OCR-emitted dashes from being parsed as Markdown horizontal rules.
+
+    OCR often misrecognizes tildes (～), em dashes (—), or range separators
+    as sequences of hyphens (---).  Markdown renderers treat 3+ hyphens on
+    their own line as an <hr> horizontal rule, which renders as a long line.
+
+    Fix: replace standalone dash-only lines (that look like accidental HRs)
+    with em dashes, and escape inline dash sequences that would trigger HR
+    parsing when re-flowed.
+    """
+    # 1. Replace lines that consist only of dashes/spaces (Markdown HR pattern)
+    #    with a single em dash, preserving the line context.
+    text = re.sub(r'(?m)^[ \t]*-{3,}[ \t]*$', '—', text)
+    # 2. Also handle *** and ___ HR variants from OCR artifacts
+    text = re.sub(r'(?m)^[ \t]*\*{3,}[ \t]*$', '—', text)
+    text = re.sub(r'(?m)^[ \t]*_{3,}[ \t]*$', '—', text)
+    return text
 
 
 def _glm_remove_empty_html_tables(text: str) -> str:
