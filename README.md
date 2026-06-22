@@ -138,18 +138,23 @@ docker compose --env-file env.txt start pandocr-web
 
 访问：
 
-- WebUI: http://localhost:8000
+- WebUI: http://localhost:18000（默认端口，可在 `env.txt` 中修改 `PANDOCR_PORT`）
 - PaddleOCR-VL API health: http://localhost:8081/health，仅在 `PaddleOCR-VL 1.6` 为活跃模型时可用。
 - PP-OCRv6 API health: http://localhost:8082/health，仅在 `PP-OCRv6` 为活跃模型时可用。
+- MinerU API health: http://localhost:8083/health，仅在 `MinerU` 为活跃模型时可用。
 
-Compose 默认只把 WebUI 和 OCR API 绑定到 `127.0.0.1`，避免局域网内未授权访问。`pandocr-web` 会挂载 `/var/run/docker.sock` 来启停本 compose 文件里的模型容器，这等同于具备 Docker 主机管理权限；不要在没有额外访问控制的情况下把 WebUI 暴露给不可信网络。
+**局域网访问：**
+
+默认端口绑定到 `0.0.0.0`，局域网其他设备可通过 `http://<你的IP>:18000` 访问。`PANDOCR_CORS_ORIGINS` 需包含局域网访问地址。
+
+`pandocr-web` 会挂载 `/var/run/docker.sock` 来启停本 compose 文件里的模型容器，这等同于具备 Docker 主机管理权限；不要在没有额外访问控制的情况下把 WebUI 暴露给不可信网络。
 
 查看状态：
 
 ```powershell
 docker compose --env-file env.txt ps
-curl http://localhost:8000/api/model-runtime
-curl http://localhost:8000/api/models
+curl http://localhost:18000/api/model-runtime
+curl http://localhost:18000/api/models
 ```
 
 常用环境变量：
@@ -167,7 +172,8 @@ PANDOCR_MODEL_CONTROL=docker
 PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
 PANDOCR_MODEL_SWITCH_TIMEOUT=1200
 PADDLE_REQUEST_TIMEOUT=3600
-PANDOCR_CORS_ORIGINS=http://localhost:8000,http://127.0.0.1:8000
+PANDOCR_CORS_ORIGINS=http://localhost:18000,http://127.0.0.1:18000
+PANDOCR_PORT=18000
 PANDOCR_MAX_UPLOAD_MB=512
 PANDOCR_MAX_CONCURRENT_OCR=1
 PANDOCR_ENFORCE_ORIGIN_CHECK=1
@@ -367,7 +373,7 @@ pip install -r requirements.txt
 python server.py
 ```
 
-然后打开 http://localhost:8000。
+然后打开 http://localhost:18000。
 
 本地质量检查：
 
