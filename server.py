@@ -52,7 +52,8 @@ PADDLE_OCR_SERVICE_URL = os.getenv("PADDLE_OCR_SERVICE_URL", "http://localhost:8
 PPOCR_V6_MODEL_NAME = os.getenv("PPOCR_V6_MODEL_NAME", "PP-OCRv6_medium")
 MINERU_SERVICE_URL = os.getenv("MINERU_SERVICE_URL", "http://localhost:8083")
 MINERU_MODEL_NAME = os.getenv("MINERU_MODEL_NAME", "MinerU2.5-Pro-2605-1.2B")
-OLLAMA_BASE_URL = os.getenv("PANDOCR_OLLAMA_BASE_URL", "http://localhost:11434").strip()
+_ollama_default_url = "http://ollama:11434" if os.getenv("PANDOCR_MODEL_CONTROL", "docker").strip().lower() == "docker" else "http://localhost:11434"
+OLLAMA_BASE_URL = os.getenv("PANDOCR_OLLAMA_BASE_URL", _ollama_default_url).strip()
 OLLAMA_MODEL = os.getenv("PANDOCR_OLLAMA_MODEL", "glm-ocr").strip()
 OLLAMA_NUM_CTX = int(os.getenv("PANDOCR_OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_PREDICT = int(os.getenv("PANDOCR_OLLAMA_NUM_PREDICT", "4096"))
