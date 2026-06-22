@@ -405,3 +405,18 @@ make check
 - [智谱 AI](https://www.zhipuai.cn/) — GLM-OCR 模型提供方
 - [KaTeX](https://github.com/KaTeX/KaTeX) — 数学公式渲染
 - [PDF.js](https://github.com/nicedoc/pdf.js) — PDF 预览渲染
+
+## 开源协议
+
+本项目基于 [Apache License 2.0](LICENSE) 开源。
+
+本项目集成了多个上游 OCR/模型服务，商用前请同时确认各上游项目的协议：
+
+| 项目 | 协议 | 商用 |
+|------|------|------|
+| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | Apache-2.0 | ✅ 可商用 |
+| [MinerU](https://github.com/opendatalab/MinerU) | AGPL-3.0（服务端） | ⚠️ 需注意：网络服务需开源 |
+| [Ollama](https://github.com/ollama/ollama) | MIT | ✅ 可商用 |
+| [GLM-OCR / 智谱 AI](https://www.zhipuai.cn/) | Apache-2.0（模型） | ✅ 可商用，需遵守模型协议 |
+
+> **注意**：MinerU 采用 AGPL-3.0 协议，如果你通过网络服务方式提供 MinerU 功能给第三方用户，需要开源你的服务端代码。仅内部使用不受此限制。详见 [MinerU 协议](https://github.com/opendatalab/MinerU/blob/master/LICENSE)。

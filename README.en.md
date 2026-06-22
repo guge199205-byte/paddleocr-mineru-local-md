@@ -429,3 +429,18 @@ This project is forked from [CHEN010325/paddleocr-local](https://github.com/CHEN
 - [Zhipu AI](https://www.zhipuai.cn/) — GLM-OCR model provider
 - [KaTeX](https://github.com/KaTeX/KaTeX) — Math formula rendering
 - [PDF.js](https://github.com/nicedoc/pdf.js) — PDF preview rendering
+
+## License
+
+This project is licensed under the [Apache License 2.0](LICENSE).
+
+This project integrates multiple upstream OCR/model services. Please verify their licenses before commercial use:
+
+| Project | License | Commercial use |
+|---------|---------|---------------|
+| [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) | Apache-2.0 | ✅ Allowed |
+| [MinerU](https://github.com/opendatalab/MinerU) | AGPL-3.0 (server-side) | ⚠️ Note: network services require source disclosure |
+| [Ollama](https://github.com/ollama/ollama) | MIT | ✅ Allowed |
+| [GLM-OCR / Zhipu AI](https://www.zhipuai.cn/) | Apache-2.0 (model) | ✅ Allowed, subject to model license |
+
+> **Note**: MinerU uses AGPL-3.0. If you provide MinerU functionality to third-party users via a network service, you must open-source your server-side code. Internal use is not subject to this restriction. See [MinerU License](https://github.com/opendatalab/MinerU/blob/master/LICENSE).
