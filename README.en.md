@@ -4,13 +4,14 @@
 
 PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL, PP-OCRv6, and MinerU. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate PaddleOCR services. The NVIDIA path uses official Docker services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
 
-**Three supported models:**
+**Four supported models:**
 
 | Model | Use case | Notes |
 |-------|----------|-------|
 | PaddleOCR-VL 1.6 | Document parsing | Layout analysis, tables, formulas, seal recognition |
 | PP-OCRv6 | Text recognition | Lightweight text-only OCR |
 | MinerU | Document parsing | MinerU2.5-Pro-2605-1.2B, hybrid engine |
+| GLM-OCR (Ollama) | Text recognition | Zhipu GLM-OCR model, requires Ollama |
 
 On single-GPU deployments, the WebUI model selector automatically manages container start/stop, so only one model occupies VRAM at a time.
 
@@ -51,35 +52,42 @@ Browser
        - PaddleOCR-VL request proxy
        - PP-OCRv6 OCR request proxy
        - MinerU request proxy
+       - GLM-OCR (Ollama) request proxy
+       - Translation proxy (OpenAI-compatible API)
   -> PaddleOCR services
        - NVIDIA: paddleocr-vl-api + paddleocr-ocr-api + paddleocr-vlm-server in docker compose
        - macOS: local paddlex --serve, optionally with mlx_vlm.server
   -> MinerU service
        - NVIDIA: mineru-api in docker compose (profile: mineru)
+  -> GLM-OCR (Ollama)
+       - Local or Docker Ollama service
 ```
 
-The NVIDIA Compose stack keeps five services:
+The NVIDIA Compose stack keeps five core services + two optional services:
 
 - `pandocr-web`
 - `paddleocr-vl-api`
 - `paddleocr-ocr-api`
 - `paddleocr-vlm-server`
 - `mineru-api` (Docker profile `mineru`, must be explicitly enabled)
+- `ollama` (Docker profile `glm-ocr`, must be explicitly enabled; or use an existing Ollama instance)
 
-For single-GPU machines, the Docker deployment keeps only one OCR model hot-loaded by default. `pandocr-web` stays online and controls the model containers through the Docker socket: selecting `PaddleOCR-VL 1.6` starts `paddleocr-vlm-server` + `paddleocr-vl-api` and stops other model containers; selecting `PP-OCRv6` or `MinerU` does the reverse. The top bar UI polls this runtime state in real time, showing whether the model is ready, starting, stopped, or failed.
+For single-GPU machines, the Docker deployment keeps only one OCR model hot-loaded by default. `pandocr-web` stays online and controls the model containers through the Docker socket: selecting `PaddleOCR-VL 1.6` starts `paddleocr-vlm-server` + `paddleocr-vl-api` and stops other model containers; selecting `PP-OCRv6` or `MinerU` does the reverse; selecting `GLM-OCR` does not require Docker container management — it connects directly to the Ollama service. The top bar UI polls this runtime state in real time, showing whether the model is ready, starting, stopped, or failed.
 
 ## Features
 
 - Supports image, PDF, PPT/PPTX, and DOC/DOCX uploads.
-- Supports model switching between `PaddleOCR-VL 1.6` document parsing, `PP-OCRv6` text OCR, and `MinerU` document parsing; Docker single-GPU deployments start and stop models on demand to avoid multiple models consuming VRAM simultaneously.
+- Supports model switching between `PaddleOCR-VL 1.6` document parsing, `PP-OCRv6` text OCR, `MinerU` document parsing, and `GLM-OCR` text recognition; Docker single-GPU deployments start and stop models on demand to avoid multiple models consuming VRAM simultaneously.
 - The left "Parsing Settings" panel automatically switches based on the currently selected model: PaddleOCR models show options for layout detection, chart recognition, document rectification, seal recognition, etc.; MinerU shows options for formula parsing, table parsing, image analysis, parsing method, etc.
 - The WebUI supports one-click Chinese/English switching, remembers the user's choice, and keeps translations centralized in `static/i18n.js` for future languages.
+- **OCR result translation**: Translate OCR Markdown results into 20 languages (Simplified Chinese, Traditional Chinese, English, Japanese, Korean, French, German, Spanish, Portuguese, Russian, Arabic, Italian, Dutch, Polish, Turkish, Vietnamese, Thai, Indonesian, Malay, Hindi). Requires `PANDOCR_TRANSLATE_API_URL` and `PANDOCR_TRANSLATE_API_KEY` (OpenAI API compatible).
 - Sends PDFs to PaddleOCR-VL page by page, making it easier to compare with the official online parsing result and reliably keep the raw JSON for each page.
 - Renders PP-OCRv6 results with an official-style visual OCR layer: source/result pages stay aligned, scrolling and zooming are synchronized, recognized text can be copied or corrected, and raw JSON remains available.
 - Persists parsing tasks locally under `data/tasks/`, so history remains available after refreshing the page. Deleting a task also removes the local record.
 - Markdown preview supports horizontally scrollable tables, KaTeX math rendering, and correction for literal `\n` line breaks in OCR output.
 - Supports parsing options including layout detection, chart recognition, document rectification, orientation recognition, seal recognition, formula numbering, and Markdown tag ignoring.
 - Downloads package both Markdown output and OCR-extracted images.
+- **Large file support**: Files over 1GB are processed in streaming batches to avoid OOM; supports resuming parsing from the last checkpoint after interruption.
 
 ## Deployment
 
@@ -336,13 +344,17 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 - `POST /api/paddleocr-vl-1.6`: Proxies OCR requests to the PaddleOCR-VL layout-parsing service.
 - `POST /api/pp-ocrv6`: Proxies OCR requests to the PP-OCRv6 service and returns page images, recognized text lines, boxes, scores, and raw JSON.
 - `POST /api/mineru`: Proxies OCR requests to the MinerU `/file_parse` service and returns Markdown and extracted images.
+- `POST /api/glm-ocr`: Proxies OCR requests to the GLM-OCR (Ollama) service, using PP-OCRv6 layout detection + GLM-OCR text recognition.
+- `POST /api/tasks/{task_id}/translate`: Translates the OCR Markdown result of a task into the target language, streaming translation progress.
+- `GET /api/translate/config`: Returns whether translation is configured and the model in use.
 - `GET /api/openapi.json`: OpenAPI JSON for this WebUI backend. `paddle-layout-openapi.json` in the repo documents the upstream Paddle layout-parsing service.
 
 ## Project Structure
 
 ```text
 .
-├── server.py                  # FastAPI backend (including MinerU proxy)
+├── server.py                  # FastAPI backend (including MinerU / GLM-OCR / translation proxy)
+├── layout_detect_server.py    # PP-OCRv6 layout detection helper service
 ├── requirements.txt
 ├── requirements-macos.txt
 ├── requirements-macos-mlx.txt
@@ -350,8 +362,9 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 ├── windows-one-click.bat
 ├── Dockerfile                 # pandocr-web image
 ├── Dockerfile.ocr             # paddleocr-ocr-api image
-├── docker-compose.yml         # includes mineru-api service (profile: mineru)
+├── docker-compose.yml         # includes mineru-api / ollama optional services
 ├── data/                      # Local task data directory, not committed by default
+├── model_cache_mineru/        # MinerU model cache, not committed by default
 ├── env.txt                    # RTX 50 / Blackwell environment variables
 ├── env.docker                 # RTX 30 / 40 environment variables
 ├── pipeline_config_ocr_v6.yaml
@@ -360,10 +373,14 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 ├── scripts/                   # Deployment helper scripts
 │   ├── windows-one-click.ps1
 ├── static/
-│   ├── index.html             # includes MinerU-specific settings panel
-│   ├── app.js                 # includes MinerU model switching and request logic
+│   ├── index.html             # includes MinerU / GLM-OCR settings panel
+│   ├── app.js                 # includes MinerU / GLM-OCR model switching and request logic
 │   ├── style.css
-│   └── vendor/katex/
+│   ├── i18n.js                # Chinese/English translations
+│   ├── latex_unicode.json     # LaTeX Unicode mapping
+│   └── vendor/
+│       ├── katex/             # KaTeX math formula rendering
+│       └── pdfjs/             # PDF.js preview (with CJK CMap support)
 ├── QUICKSTART.md
 ├── webui-openapi.json
 ├── paddle-layout-openapi.json
@@ -373,7 +390,7 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 
 ## Local Development
 
-When running `server.py` locally outside Docker, set `PANDOCR_MODEL_CONTROL=none` and start the model services yourself. You need an existing PaddleOCR-VL service listening at `http://localhost:8081/layout-parsing`. To use PP-OCRv6 locally, also start a PaddleX OCR service at `http://localhost:8082/ocr` or set `PADDLE_OCR_SERVICE_URL`. To use MinerU locally, start a MinerU API service at `http://localhost:8083` or set `MINERU_SERVICE_URL`.
+When running `server.py` locally outside Docker, set `PANDOCR_MODEL_CONTROL=none` and start the model services yourself. You need an existing PaddleOCR-VL service listening at `http://localhost:8081/layout-parsing`. To use PP-OCRv6 locally, also start a PaddleX OCR service at `http://localhost:8082/ocr` or set `PADDLE_OCR_SERVICE_URL`. To use MinerU locally, start a MinerU API service at `http://localhost:8083` or set `MINERU_SERVICE_URL`. To use GLM-OCR, start Ollama and pull the `glm-ocr` model, or set `PANDOCR_OLLAMA_BASE_URL` and `PANDOCR_OLLAMA_MODEL`.
 
 ```powershell
 pip install -r requirements.txt
@@ -387,3 +404,28 @@ Run the local quality gate:
 ```bash
 make check
 ```
+
+## Differences from Original
+
+This project is forked from [CHEN010325/paddleocr-local](https://github.com/CHEN010325/paddleocr-local) and adds the following features on top of the original:
+
+| Feature | Original | This Fork |
+|---------|----------|-----------|
+| OCR models | PaddleOCR-VL 1.6, PP-OCRv6 | + MinerU document parsing, GLM-OCR (Ollama) text recognition |
+| Translation | None | 20-language OCR result translation (requires OpenAI-compatible API) |
+| Large files | May OOM | >1GB files processed in streaming batches, supports resume after interruption |
+| PDF preview | Basic preview | Full CJK CMap support — Chinese/Japanese/Korean PDFs no longer garbled |
+| Model cache | Single directory | Separate cache directories (`model_cache_mineru/`, etc.) to avoid model conflicts |
+| Parsing settings | Fixed panel | Dynamically switches based on selected model |
+| LAN access | Binds to 127.0.0.1 only | Binds to 0.0.0.0 by default, supports LAN access |
+| Port | Fixed 8000 | Configurable via `PANDOCR_PORT` environment variable |
+
+## Acknowledgements
+
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — Baidu PaddlePaddle OCR open-source project, providing PaddleOCR-VL and PP-OCRv6 models
+- [CHEN010325/paddleocr-local](https://github.com/CHEN010325/paddleocr-local) — Upstream repository this project is forked from, providing the WebUI and Docker deployment framework
+- [MinerU](https://github.com/opendatalab/MinerU) — OpenDataLab open-source document parsing project, MinerU2.5-Pro model
+- [Ollama](https://github.com/ollama/ollama) — Local LLM inference framework, used to run GLM-OCR
+- [Zhipu AI](https://www.zhipuai.cn/) — GLM-OCR model provider
+- [KaTeX](https://github.com/KaTeX/KaTeX) — Math formula rendering
+- [PDF.js](https://github.com/nicedoc/pdf.js) — PDF preview rendering

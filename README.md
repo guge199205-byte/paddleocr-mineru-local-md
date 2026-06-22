@@ -1,8 +1,19 @@
-# PaddleOCR Local - PaddleOCR-VL & PP-OCRv6 WebUI
+# PaddleOCR Local - PaddleOCR-VL & PP-OCRv6 & MinerU WebUI
 
 **语言 / Language**: 简体中文 | [English](README.en.md)
 
-PaddleOCR Local 是一个面向 PaddleOCR-VL 和 PP-OCRv6 的轻量 Web 前端。前端负责文件上传、队列、预览、模型切换和下载，后端 FastAPI 做静态文件服务、Office 转 PDF 和请求代理；OCR 推理由独立 PaddleOCR 服务完成，NVIDIA 路线使用官方 Docker 服务，macOS Apple Silicon 路线使用本地 PaddleX/MLX 服务。
+PaddleOCR Local 是一个面向 PaddleOCR-VL、PP-OCRv6 和 MinerU 的轻量 Web 前端。前端负责文件上传、队列、预览、模型切换和下载，后端 FastAPI 做静态文件服务、Office 转 PDF 和请求代理；OCR 推理由独立服务完成，NVIDIA 路线使用官方 Docker 服务，macOS Apple Silicon 路线使用本地 PaddleX/MLX 服务。
+
+**支持四种模型：**
+
+| 模型 | 用途 | 说明 |
+|------|------|------|
+| PaddleOCR-VL 1.6 | 文档解析 | 版面分析、表格、公式、印章识别 |
+| PP-OCRv6 | 文字识别 | 轻量级纯文字 OCR |
+| MinerU | 文档解析 | MinerU2.5-Pro-2605-1.2B，hybrid engine |
+| GLM-OCR (Ollama) | 文字识别 | 智谱 GLM-OCR 模型，需配合 Ollama 运行 |
+
+单 GPU 部署下，WebUI 模型选择器会自动管理容器启停，同一时间只有一个模型占用显存。
 
 <img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/85a247a0-c796-4a20-b596-1cc4148df964" />
 
@@ -41,27 +52,39 @@ Browser
        - Office to PDF conversion
        - PaddleOCR-VL request proxy
        - PP-OCRv6 OCR request proxy
+       - MinerU request proxy
+       - GLM-OCR (Ollama) request proxy
+       - Translation proxy (OpenAI-compatible API)
   -> PaddleOCR services
        - NVIDIA: docker compose 中的 paddleocr-vl-api + paddleocr-ocr-api + paddleocr-vlm-server
        - macOS: 本地 paddlex --serve，可选 mlx_vlm.server
+  -> MinerU service
+       - NVIDIA: docker compose 中的 mineru-api (profile: mineru)
+  -> GLM-OCR (Ollama)
+       - 本地或 Docker 中的 Ollama 服务
 ```
 
-NVIDIA Compose 保留 4 个服务：
+NVIDIA Compose 保留 5 个核心服务 + 2 个可选服务：
 
 - `pandocr-web`
 - `paddleocr-vl-api`
 - `paddleocr-ocr-api`
 - `paddleocr-vlm-server`
+- `mineru-api`（Docker profile `mineru`，需显式启用）
+- `ollama`（Docker profile `glm-ocr`，需显式启用；也可使用已有的 Ollama 实例）
 
-单 GPU Docker 部署默认只热加载一个模型。`pandocr-web` 常驻运行，并通过 Docker socket 按需启停模型容器：选择 `PaddleOCR-VL 1.6` 会启动 `paddleocr-vlm-server` + `paddleocr-vl-api` 并停止 `paddleocr-ocr-api`；选择 `PP-OCRv6` 会反向切换。顶部 UI 会实时轮询显示模型就绪、启动中、待启动或失败状态。
+单 GPU Docker 部署默认只热加载一个模型。`pandocr-web` 常驻运行，并通过 Docker socket 按需启停模型容器：选择 `PaddleOCR-VL 1.6` 会启动 `paddleocr-vlm-server` + `paddleocr-vl-api` 并停止其他模型；选择 `PP-OCRv6` 或 `MinerU` 会反向切换；选择 `GLM-OCR` 不需要启停 Docker 容器，直接连接 Ollama 服务。顶部 UI 会实时轮询显示模型就绪、启动中、待启动或失败状态。
 
 ## 功能
 
 - 支持图片、PDF、PPT/PPTX、DOC/DOCX 上传。
-- 支持在 `PaddleOCR-VL 1.6` 文档解析和 `PP-OCRv6` 文字识别之间自由切换；Docker 单 GPU 部署会按需启停模型，避免两个模型同时占用显存。
+- 支持在 `PaddleOCR-VL 1.6` 文档解析、`PP-OCRv6` 文字识别、`MinerU` 文档解析和 `GLM-OCR` 文字识别之间自由切换；Docker 单 GPU 部署会按需启停模型，避免多个模型同时占用显存。
+- 左侧"解析设置"面板会根据当前选中模型自动切换：PaddleOCR 系列显示版面检测、图表识别、文档矫正、印章识别等选项；MinerU 显示公式解析、表格解析、图片分析、解析方式等选项。
 - WebUI 支持中文/英文一键切换并记住用户选择，翻译集中维护在 `static/i18n.js`，便于后续扩展更多语言。
+- **OCR 结果翻译**：支持将 OCR 解析后的 Markdown 结果翻译为 20 种语言（简体中文、繁体中文、英语、日语、韩语、法语、德语、西班牙语、葡萄牙语、俄语、阿拉伯语、意大利语、荷兰语、波兰语、土耳其语、越南语、泰语、印尼语、马来语、印地语），需配置 `PANDOCR_TRANSLATE_API_URL` 和 `PANDOCR_TRANSLATE_API_KEY`（兼容 OpenAI API 格式）。
 - PDF 按页发送给 PaddleOCR-VL，便于对齐官方在线解析结果并稳定保留每页原始 JSON。
 - PP-OCRv6 结果使用接近官方的可视化文字层展示：左右页面对齐，上下/左右滚动和缩放同步，识别文字支持复制和纠正，同时保留原始 JSON。
+- **大文件支持**：超过 1GB 的大文件采用流式分批处理，避免内存溢出（OOM）；支持解析中断后从上次位置恢复继续处理。
 - 解析任务会持久化到本机 `data/tasks/`，刷新页面后仍可查看历史任务，删除按钮会同步删除本地记录。
 - Markdown 预览支持表格横向滚动、KaTeX 数学公式渲染、OCR 结果中的字面量 `\n` 换行修正。
 - 支持解析选项：版面检测、图表识别、文档矫正、方向识别、印章识别、公式编号、Markdown 忽略标签等。
@@ -290,34 +313,44 @@ PANDOCR_PORT=18000 make mac-up
 - `POST /api/convert/to-pdf`：将 PPT/PPTX/DOC/DOCX 转为 PDF。
 - `POST /api/paddleocr-vl-1.6`：代理 OCR 请求到 PaddleOCR-VL layout-parsing 服务。
 - `POST /api/pp-ocrv6`：代理 OCR 请求到 PP-OCRv6 服务，返回页面图片、识别文字行、坐标框、置信度和原始 JSON。
+- `POST /api/mineru`：代理 OCR 请求到 MinerU `/file_parse` 服务，返回 Markdown 和提取图片。
+- `POST /api/glm-ocr`：代理 OCR 请求到 GLM-OCR (Ollama) 服务，使用 PP-OCRv6 版面检测 + GLM-OCR 文字识别。
+- `POST /api/tasks/{task_id}/translate`：将任务的 OCR Markdown 结果翻译为目标语言，流式返回翻译进度。
+- `GET /api/translate/config`：返回翻译功能是否已配置及使用的模型。
 - `GET /api/openapi.json`：当前 WebUI 后端的 OpenAPI JSON；仓库里的 `paddle-layout-openapi.json` 是上游 Paddle layout-parsing 服务接口。
 
 ## 项目结构
 
 ```text
 .
-├── server.py
+├── server.py                  # FastAPI 后端（含 MinerU / GLM-OCR / 翻译代理）
+├── layout_detect_server.py    # PP-OCRv6 版面检测辅助服务
 ├── requirements.txt
 ├── requirements-macos.txt
 ├── requirements-macos-mlx.txt
 ├── macos-one-click.command
 ├── windows-one-click.bat
-├── Dockerfile
-├── Dockerfile.ocr
-├── docker-compose.yml
-├── data/                  # 本地任务数据目录，默认不提交
-├── env.txt
-├── env.docker
+├── Dockerfile                 # pandocr-web 镜像
+├── Dockerfile.ocr             # paddleocr-ocr-api 镜像
+├── docker-compose.yml         # 含 mineru-api / ollama 可选服务
+├── data/                      # 本地任务数据目录，默认不提交
+├── model_cache_mineru/        # MinerU 模型缓存，默认不提交
+├── env.txt                    # RTX 50 / Blackwell 环境变量
+├── env.docker                 # RTX 30 / 40 环境变量
 ├── pipeline_config_ocr_v6.yaml
 ├── pipeline_config_vllm.yaml
 ├── pipeline_config_macos_mlx.template.yaml
-├── scripts/               # 部署辅助脚本
+├── scripts/                   # 部署辅助脚本
 │   ├── windows-one-click.ps1
 ├── static/
-│   ├── index.html
-│   ├── app.js
+│   ├── index.html             # 含 MinerU / GLM-OCR 专属设置面板
+│   ├── app.js                 # 含 MinerU / GLM-OCR 模型切换和请求逻辑
 │   ├── style.css
-│   └── vendor/katex/
+│   ├── i18n.js                # 中英文翻译
+│   ├── latex_unicode.json     # LaTeX Unicode 映射
+│   └── vendor/
+│       ├── katex/             # KaTeX 数学公式渲染
+│       └── pdfjs/             # PDF.js 预览（含 CJK CMap 支持）
 ├── QUICKSTART.md
 ├── webui-openapi.json
 ├── paddle-layout-openapi.json
@@ -327,7 +360,7 @@ PANDOCR_PORT=18000 make mac-up
 
 ## 本地开发
 
-本地在 Docker 外运行 `server.py` 时，请设置 `PANDOCR_MODEL_CONTROL=none`，并自行启动模型服务。需要已有 PaddleOCR-VL 服务监听在 `http://localhost:8081/layout-parsing`；如需使用 PP-OCRv6，也需要启动 PaddleX OCR 服务监听在 `http://localhost:8082/ocr`，或设置 `PADDLE_OCR_SERVICE_URL`。
+本地在 Docker 外运行 `server.py` 时，请设置 `PANDOCR_MODEL_CONTROL=none`，并自行启动模型服务。需要已有 PaddleOCR-VL 服务监听在 `http://localhost:8081/layout-parsing`；如需使用 PP-OCRv6，也需要启动 PaddleX OCR 服务监听在 `http://localhost:8082/ocr`，或设置 `PADDLE_OCR_SERVICE_URL`；如需使用 MinerU，需要启动 MinerU API 服务监听在 `http://localhost:8083`，或设置 `MINERU_SERVICE_URL`；如需使用 GLM-OCR，需要启动 Ollama 并拉取 `glm-ocr` 模型，或设置 `PANDOCR_OLLAMA_BASE_URL` 和 `PANDOCR_OLLAMA_MODEL`。
 
 ```powershell
 pip install -r requirements.txt
@@ -341,3 +374,28 @@ python server.py
 ```bash
 make check
 ```
+
+## 与原版区别
+
+本项目 Fork 自 [CHEN010325/paddleocr-local](https://github.com/CHEN010325/paddleocr-local)，在原版基础上增加了以下功能：
+
+| 特性 | 原版 | 本 Fork |
+|------|------|---------|
+| OCR 模型 | PaddleOCR-VL 1.6、PP-OCRv6 | + MinerU 文档解析、GLM-OCR (Ollama) 文字识别 |
+| 翻译 | 无 | 支持 20 种语言的 OCR 结果翻译（需配置 OpenAI 兼容 API） |
+| 大文件 | 可能 OOM | >1GB 文件流式分批处理，支持中断恢复 |
+| PDF 预览 | 基础预览 | 完整 CJK CMap 支持，中文/日文/韩文 PDF 不再乱码 |
+| 模型缓存 | 单一目录 | 独立缓存目录（`model_cache_mineru/` 等），避免模型冲突 |
+| 解析设置 | 固定面板 | 根据选中模型动态切换设置面板 |
+| 局域网访问 | 仅绑定 127.0.0.1 | 默认绑定 0.0.0.0，支持局域网访问 |
+| 端口 | 固定 8000 | 可通过 `PANDOCR_PORT` 环境变量自定义 |
+
+## 致谢
+
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — 百度飞桨 OCR 开源项目，提供了 PaddleOCR-VL 和 PP-OCRv6 模型
+- [CHEN010325/paddleocr-local](https://github.com/CHEN010325/paddleocr-local) — 本项目 Fork 的上游仓库，提供了 WebUI 和 Docker 部署框架
+- [MinerU](https://github.com/opendatalab/MinerU) — OpenDataLab 开源文档解析项目，MinerU2.5-Pro 模型
+- [Ollama](https://github.com/ollama/ollama) — 本地大模型推理框架，用于运行 GLM-OCR
+- [智谱 AI](https://www.zhipuai.cn/) — GLM-OCR 模型提供方
+- [KaTeX](https://github.com/KaTeX/KaTeX) — 数学公式渲染
+- [PDF.js](https://github.com/nicedoc/pdf.js) — PDF 预览渲染
