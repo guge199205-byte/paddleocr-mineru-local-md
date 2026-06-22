@@ -4333,6 +4333,14 @@ function escapeHtml(value) {
 
 function renderMarkdownHtml(markdown) {
     const { text, math } = stashMathSegments(markdown);
+    // Prevent standalone dash-only lines (---) from being parsed as <hr> by
+    // marked.js.  OCR often misrecognizes tildes (~) or em dashes (—) as
+    // sequences of hyphens, which then render as horizontal rules (long lines).
+    // This must run before marked.parse() so ALL render paths are covered
+    // (PaddleOCR layout blocks, GLM-OCR markdown, MinerU, translations).
+    let safeText = text.replace(/^[ \t]*-{3,}[ \t]*$/gm, '—');
+    safeText = safeText.replace(/^[ \t]*\*{3,}[ \t]*$/gm, '—');
+    safeText = safeText.replace(/^[ \t]*_{3,}[ \t]*$/gm, '—');
     if (!marked._pandocrConfigured) {
         marked.setOptions({
             breaks: true,
@@ -4340,7 +4348,7 @@ function renderMarkdownHtml(markdown) {
         });
         marked._pandocrConfigured = true;
     }
-    let html = marked.parse(text);
+    let html = marked.parse(safeText);
     math.forEach((value, index) => {
         html = html.split(mathToken(index)).join(value);
     });
