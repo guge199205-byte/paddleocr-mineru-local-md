@@ -125,6 +125,62 @@ Unlimited-OCR 走独立 `unlimited-ocr-api` 容器，`pandocr-web` 只代理 `/a
 
 首次使用 Transformers 或 SGLang 后端时都会下载并加载 `baidu/Unlimited-OCR` 权重；权重缓存持久化在 `model_cache_unlimited_ocr/`，容器重启后不会重新下载，但新 Python 进程仍需要把权重重新加载到显存。默认 `UNLIMITED_OCR_PRELOAD=1` 会在 `unlimited-ocr-api` 容器启动后后台预热 Transformers 模型，WebUI 会等 `modelLoaded=true` 后才显示 Transformers 就绪；切到 SGLang 时会卸载 Transformers 权重并启动 `unlimited-ocr-sglang`。本机默认 `UNLIMITED_OCR_ATTENTION_BACKEND=flashinfer`，如果换到官方 `fa3` 支持的卡，可以改回 `fa3` 再重建/重启 SGLang 容器。
 
+### 本机 TITAN V / CUDA 12.6 部署记录
+
+这次在 Windows + NVIDIA TITAN V 12GB、NVIDIA Driver `560.94`、Docker Desktop `28.3.0`、Docker Compose `v2.38.1` 上部署 `Unlimited-OCR` 时，官方 CUDA 12.9 路线会在容器启动前被 NVIDIA runtime 拦截：
+
+```text
+nvidia-container-cli: requirement error: unsatisfied condition: cuda>=12.9,
+please update your driver to a newer version, or use an earlier cuda container
+```
+
+原因是宿主机驱动当前只暴露 CUDA `12.6`，而原始 `Dockerfile.unlimited-ocr` 使用 `nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04`。为了不强制升级驱动，这里把 `Unlimited-OCR` 的 Transformers 镜像改成 CUDA 12.6 兼容构建：
+
+```dockerfile
+ARG CUDA_BASE_IMAGE=nvidia/cuda:12.6.3-cudnn-devel-ubuntu24.04
+FROM ${CUDA_BASE_IMAGE}
+
+RUN python -m venv /opt/venv && \
+    pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir \
+      --index-url https://download.pytorch.org/whl/cu126 \
+      torch==2.10.0+cu126 \
+      torchvision==0.25.0+cu126 && \
+    pip install --no-cache-dir \
+      transformers==4.57.1 \
+      matplotlib==3.10.8 \
+      einops==0.8.2 \
+      addict==2.4.0 \
+      easydict==1.13 \
+      psutil==7.2.2 \
+      pymupdf==1.27.2.2 \
+      fastapi==0.136.1 \
+      uvicorn==0.46.0 \
+      httpx==0.28.1 \
+      pydantic==2.11.10 \
+      python-multipart==0.0.27 \
+      Pillow==12.1.1
+```
+
+这只改了 `Dockerfile.unlimited-ocr`：保留官方 Unlimited-OCR 其余 Python 依赖版本，单独把 CUDA 基础镜像和 PyTorch wheel 切到 `cu126`。如果后续升级到支持 CUDA 12.9 的 NVIDIA 驱动，也可以把基础镜像和 PyTorch wheel 源改回官方测试组合后重建。
+
+本机使用的部署命令：
+
+```powershell
+.\windows-one-click.bat -EnvFile env.docker -Models unlimited-ocr -UnlimitedOcrBackend transformers -NoOpen
+```
+
+若一键脚本在等待阶段因为未部署的 PaddleOCR-VL 容器提示 `No such object: paddleocr-vlm-server`，先看真实容器状态；本次实际 `pandocr-web` 和 `unlimited-ocr-api` 已经创建并健康，可直接用同一个临时 env 文件检查和启动：
+
+```powershell
+docker compose --env-file tmp\windows-one-click.env ps -a
+docker compose --env-file tmp\windows-one-click.env start pandocr-web unlimited-ocr-api
+curl http://localhost:8000/api/model-runtime
+curl http://localhost:8083/health
+```
+
+模型预热完成的标志是 `/health` 中 `modelLoaded=true`、`modelLoading=false`，WebUI 的 `/api/model-runtime` 中 `unlimited-ocr.state=ready`。本次预热完成后显存占用约 `8.3GB / 12GB`。端到端 smoke test 可以用一张小图请求 `/api/unlimited-ocr`，返回 `# HELLO OCR 123` 即说明 WebUI 代理、adapter、Transformers 模型和 GPU 推理都已经打通。
+
 ## 部署方式
 
 本项目支持两条部署路径，二者互不混用：
