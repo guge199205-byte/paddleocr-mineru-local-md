@@ -18,7 +18,7 @@ step() {
 }
 
 step "Checking Python syntax"
-"$PYTHON" -m py_compile server.py
+"$PYTHON" -m py_compile server.py unlimited_ocr_adapter.py
 
 step "Running server unit tests"
 "$PYTHON" -m unittest tests.test_server -v

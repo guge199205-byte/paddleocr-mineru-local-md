@@ -41,19 +41,23 @@ Browser
        - Office to PDF conversion
        - PaddleOCR-VL request proxy
        - PP-OCRv6 OCR request proxy
+       - optional Unlimited-OCR request/stream proxy
   -> PaddleOCR services
        - NVIDIA: docker compose 中的 paddleocr-vl-api + paddleocr-ocr-api + paddleocr-vlm-server
+       - NVIDIA optional: unlimited-ocr-api + unlimited-ocr-sglang
        - macOS: 本地 paddlex --serve，可选 mlx_vlm.server
 ```
 
-NVIDIA Compose 保留 4 个服务：
+NVIDIA Compose 默认保留 4 个核心服务；启用 `unlimited-ocr` profile 后会额外创建 Unlimited-OCR 实验服务：
 
 - `pandocr-web`
 - `paddleocr-vl-api`
 - `paddleocr-ocr-api`
 - `paddleocr-vlm-server`
+- `unlimited-ocr-api`，可选实验服务
+- `unlimited-ocr-sglang`，仅 SGLang 后端需要
 
-单 GPU Docker 部署默认只热加载一个模型。`pandocr-web` 常驻运行，并通过 Docker socket 按需启停模型容器：选择 `PaddleOCR-VL 1.6` 会启动 `paddleocr-vlm-server` + `paddleocr-vl-api` 并停止 `paddleocr-ocr-api`；选择 `PP-OCRv6` 会反向切换。顶部 UI 会实时轮询显示模型就绪、启动中、待启动或失败状态。
+单 GPU Docker 部署默认只热加载一个模型。`pandocr-web` 常驻运行，并通过 Docker socket 按需启停模型容器：选择 `PaddleOCR-VL 1.6` 会启动 `paddleocr-vlm-server` + `paddleocr-vl-api` 并停止 `paddleocr-ocr-api`；选择 `PP-OCRv6` 会反向切换；启用并选择 `Unlimited-OCR` 后会启动 `unlimited-ocr-api`，并按 UI 里选择的 backend 决定是否启动 `unlimited-ocr-sglang`。顶部 UI 会实时轮询显示模型就绪、启动中、待启动或失败状态。
 
 ## 功能
 
@@ -62,10 +66,64 @@ NVIDIA Compose 保留 4 个服务：
 - WebUI 支持中文/英文一键切换并记住用户选择，翻译集中维护在 `static/i18n.js`，便于后续扩展更多语言。
 - PDF 按页发送给 PaddleOCR-VL，便于对齐官方在线解析结果并稳定保留每页原始 JSON。
 - PP-OCRv6 结果使用接近官方的可视化文字层展示：左右页面对齐，上下/左右滚动和缩放同步，识别文字支持复制和纠正，同时保留原始 JSON。
+- 可选接入 `Unlimited-OCR`，支持 Transformers / SGLang 后端切换、流式输出、左右同步滚动和 `<|det|>image/chart` 图片块回填。
 - 解析任务会持久化到本机 `data/tasks/`，刷新页面后仍可查看历史任务，删除按钮会同步删除本地记录。
 - Markdown 预览支持表格横向滚动、KaTeX 数学公式渲染、OCR 结果中的字面量 `\n` 换行修正。
 - 支持解析选项：版面检测、图表识别、文档矫正、方向识别、印章识别、公式编号、Markdown 忽略标签等。
 - 下载结果时会打包 Markdown 和 OCR 提取图片。
+
+### 可选实验模型：Unlimited-OCR
+
+项目预留了 `Unlimited-OCR` 的第三模型接入路径，但默认关闭，不影响现有 `PaddleOCR-VL 1.6` 和 `PP-OCRv6` 的一键部署、模型切换和接口行为。它适合研究/评测长文档一次性解析能力，启用后会作为模型下拉框里的 `Unlimited-OCR` 选项出现，并沿用同一套模型运行时切换逻辑。
+
+启用 NVIDIA Docker 版本：
+
+```powershell
+# 1. 在 env.txt 或 env.docker 中开启
+PANDOCR_ENABLE_UNLIMITED_OCR=1
+
+# 2. 创建可选 profile 下的 Unlimited-OCR 容器
+# 只使用 Transformers 时可以只 build unlimited-ocr-api；需要 UI 切 SGLang 时一起 build unlimited-ocr-sglang
+docker compose --env-file env.txt --profile unlimited-ocr build unlimited-ocr-api unlimited-ocr-sglang
+docker compose --env-file env.txt --profile unlimited-ocr up -d --no-start
+
+# 3. 启动 WebUI，之后可在右上角模型选择器切换到 Unlimited-OCR
+docker compose --env-file env.txt start pandocr-web
+```
+
+当前默认 `UNLIMITED_OCR_BACKEND=transformers`，对个人电脑更友好，也对齐官方 Transformers `model.infer` / `model.infer_multi` 路径。选择 `Unlimited-OCR` 后，顶部会出现只针对该模型的 Backend 下拉框，可直接在 `Transformers` 和 `SGLang` 间切换；上次选择会写入 `data/runtime-settings.json`，下次启动继续使用同一 backend。这个运行态文件已被 Git 忽略，不会污染提交。
+
+Backend 选择建议：
+
+| Backend | 是否优先尝试 | 更适合的机器/场景 | 代价和风险 |
+| --- | --- | --- | --- |
+| `Transformers` | 是，建议先用它验证 | 个人 NVIDIA 电脑、Windows Docker、RTX 30/40/50，以及希望少踩 kernel/runtime 环境坑的用户。 | 冷启动较慢，因为 Python 进程需要把模型加载进显存；吞吐/并发不是重点，但部署路径最可预期。 |
+| `SGLang` | Transformers 跑通后再试 | 常驻 NVIDIA 服务器、空闲显存更充足、希望对比 OpenAI-compatible streaming server 或吞吐能力的用户。 | 更挑环境：依赖官方定制 SGLang wheel、`kernels`、单独的 `unlimited-ocr-sglang` 服务、自定义 logit processor，以及必须和 GPU/CUDA 匹配的 attention backend。 |
+
+大多数用户建议先部署 Transformers：
+
+```powershell
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend transformers
+```
+
+确认 Transformers 可用后，再尝试 SGLang：
+
+```powershell
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend sglang
+```
+
+也可以后续直接从 WebUI 部署 SGLang：选择 `Unlimited-OCR`，在提示里输入 `sglang`，WebUI 会自动构建/创建缺失的 `unlimited-ocr-sglang` 容器。如果 SGLang 构建失败、启动卡住或健康检查不通过，直接在 Backend 下拉框切回 `Transformers`。
+
+SGLang 环境调参建议：
+
+- 本项目默认 `UNLIMITED_OCR_ATTENTION_BACKEND=flashinfer`，通常比官方示例里的 `fa3` 更适合消费级显卡和 RTX 50 / SM120 这类本地环境。
+- 官方 SGLang 示例使用 `--attention-backend fa3`。只有当你的 SGLang wheel、CUDA 版本和 GPU 架构都支持时再改成 `fa3`；否则保持 `flashinfer`。
+- 如果 SGLang 显存不足或长时间启动中，先关闭占显存程序、保持 PDF 每批页数为 `1`，或把 `UNLIMITED_OCR_MEM_FRACTION_STATIC` 从 `0.8` 降到 `0.7`；仍不稳定就回到 `Transformers`。
+- 如果 SGLang 报 context length 超限，先用单页请求验证。多页 one-shot 更适合研究压测，对上下文长度、显存和页序对齐都更敏感。
+
+Unlimited-OCR 走独立 `unlimited-ocr-api` 容器，`pandocr-web` 只代理 `/api/unlimited-ocr` 和 `/api/unlimited-ocr/stream`，不会把 Unlimited-OCR 的重依赖安装进 WebUI 容器。PDF 会先在 adapter 中按官方 300 DPI 转成页面图片；默认 PDF 每批页数为 1，单页走 `gundam + ngram_window=128`，`no_repeat_ngram_size=35`。如果手动把 PDF 每批页数调大，adapter 会按当前 batch 做多页 one-shot 请求，适合研究压测，但更容易受显存、上下文长度和页面对齐稳定性影响。最终结果会把官方 `<|det|>image/chart [bbox]<|/det|>` 块裁剪回填为 Markdown 图片。
+
+首次使用 Transformers 或 SGLang 后端时都会下载并加载 `baidu/Unlimited-OCR` 权重；权重缓存持久化在 `model_cache_unlimited_ocr/`，容器重启后不会重新下载，但新 Python 进程仍需要把权重重新加载到显存。默认 `UNLIMITED_OCR_PRELOAD=1` 会在 `unlimited-ocr-api` 容器启动后后台预热 Transformers 模型，WebUI 会等 `modelLoaded=true` 后才显示 Transformers 就绪；切到 SGLang 时会卸载 Transformers 权重并启动 `unlimited-ocr-sglang`。本机默认 `UNLIMITED_OCR_ATTENTION_BACKEND=flashinfer`，如果换到官方 `fa3` 支持的卡，可以改回 `fa3` 再重建/重启 SGLang 容器。
 
 ## 部署方式
 
@@ -82,7 +140,7 @@ Windows + NVIDIA 用户推荐直接使用一键部署脚本：
 .\windows-one-click.bat
 ```
 
-它会自动检查 Docker、识别 NVIDIA GPU、选择 `env.txt` 或 `env.docker`、拉取官方 PaddleOCR-VL 镜像、构建 `pandocr-web`、清理旧容器、创建所有模型容器但不会同时启动两个模型，然后启动 WebUI 并等待当前活跃模型健康检查。失败时会自动打印 `paddleocr-vlm-server`、`paddleocr-vl-api`、`paddleocr-ocr-api` 和 `pandocr-web` 的关键日志。
+它会自动检查 Docker、识别 NVIDIA GPU、选择 `env.txt` 或 `env.docker`，询问当前要部署的模型，只拉取/构建选中的模型服务和 `pandocr-web`，然后启动 WebUI 并等待当前活跃模型健康检查。未部署的模型仍会显示在 WebUI 中，后续可在页面上触发下载/构建和容器创建。失败时会自动打印相关模型服务和 `pandocr-web` 的关键日志。
 
 常用一键部署参数：
 
@@ -90,7 +148,14 @@ Windows + NVIDIA 用户推荐直接使用一键部署脚本：
 .\windows-one-click.bat -DryRun
 .\windows-one-click.bat -GpuId 1
 .\windows-one-click.bat -EnvFile env.docker
+.\windows-one-click.bat -Models paddleocr-vl-1.6
+.\windows-one-click.bat -Models pp-ocrv6
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend transformers
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend sglang
+.\windows-one-click.bat -Models all
 ```
+
+Windows 一键部署会先让用户选择当前要部署的模型，只拉取/构建选中的模型服务和 `pandocr-web`。未部署的模型仍会显示在 WebUI 的模型下拉框中，状态为“未部署”；用户后续在 UI 中选择该模型时，可以直接触发下载/构建并创建对应容器，不需要回到命令行操作。
 
 也可以继续使用手动部署流程：
 
@@ -140,6 +205,11 @@ VLM_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
 PANDOCR_GPU_DEVICE_ID=0
 PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B
 PPOCR_V6_MODEL_NAME=PP-OCRv6_medium
+UNLIMITED_OCR_MODEL_NAME=baidu/Unlimited-OCR
+UNLIMITED_OCR_BACKEND=transformers
+UNLIMITED_OCR_PRELOAD=1
+UNLIMITED_OCR_SGLANG_PORT=10001
+PANDOCR_ENABLE_UNLIMITED_OCR=0
 PANDOCR_MODEL_CONTROL=docker
 PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
 PANDOCR_MODEL_SWITCH_TIMEOUT=1200
@@ -282,6 +352,7 @@ PANDOCR_PORT=18000 make mac-up
 - `GET /api/models`：返回可用模型和对应代理入口。
 - `GET /api/model-runtime`：返回当前活跃模型、就绪状态、容器状态和切换任务。
 - `POST /api/model-runtime/switch`：Docker 模式下启动目标模型容器并停止非活跃模型容器。
+- `POST /api/model-runtime/deploy`：从 WebUI 触发缺失模型的镜像拉取/构建和容器创建，完成后切换到目标模型。
 - `GET /api/tasks`：读取本机持久化任务摘要列表，不返回大体积源文件和 OCR 结果。
 - `GET /api/tasks/{task_id}`：读取一个任务的完整详情。
 - `PUT /api/tasks/{task_id}`：保存一个任务到 `data/tasks/`；`task.json` 只保存轻量元数据，Markdown、OCR JSON、图片和 batch Markdown 拆到 `result.json`，摘要拆到 `summary.json`。
@@ -290,6 +361,9 @@ PANDOCR_PORT=18000 make mac-up
 - `POST /api/convert/to-pdf`：将 PPT/PPTX/DOC/DOCX 转为 PDF。
 - `POST /api/paddleocr-vl-1.6`：代理 OCR 请求到 PaddleOCR-VL layout-parsing 服务。
 - `POST /api/pp-ocrv6`：代理 OCR 请求到 PP-OCRv6 服务，返回页面图片、识别文字行、坐标框、置信度和原始 JSON。
+- `POST /api/unlimited-ocr`：可选代理到 Unlimited-OCR adapter，只有 `PANDOCR_ENABLE_UNLIMITED_OCR=1` 时可用。
+- `POST /api/unlimited-ocr/stream`：Unlimited-OCR 流式解析代理，响应类型为 `application/x-ndjson`。
+- `GET/POST /api/unlimited-ocr/backend`：读取或切换 Unlimited-OCR 的 `Transformers` / `SGLang` backend。
 - `GET /api/openapi.json`：当前 WebUI 后端的 OpenAPI JSON；仓库里的 `paddle-layout-openapi.json` 是上游 Paddle layout-parsing 服务接口。
 
 ## 项目结构
@@ -304,7 +378,10 @@ PANDOCR_PORT=18000 make mac-up
 ├── windows-one-click.bat
 ├── Dockerfile
 ├── Dockerfile.ocr
+├── Dockerfile.unlimited-ocr
+├── Dockerfile.unlimited-ocr-sglang
 ├── docker-compose.yml
+├── unlimited_ocr_adapter.py
 ├── data/                  # 本地任务数据目录，默认不提交
 ├── env.txt
 ├── env.docker

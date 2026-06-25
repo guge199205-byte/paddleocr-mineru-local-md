@@ -1,3 +1,19 @@
+x-unlimited-ocr-transformers-image: &unlimited-ocr-transformers-image
+  pull_policy: build
+  build:
+    context: .
+    dockerfile: Dockerfile.unlimited-ocr
+  image: pandocr-unlimited-ocr-transformers:latest
+
+x-unlimited-ocr-sglang-image: &unlimited-ocr-sglang-image
+  pull_policy: build
+  build:
+    context: .
+    dockerfile: Dockerfile.unlimited-ocr-sglang
+    args:
+      UNLIMITED_OCR_SGLANG_WHEEL_URL: ${UNLIMITED_OCR_SGLANG_WHEEL_URL:-https://github.com/baidu/Unlimited-OCR/raw/main/wheel/sglang-0.0.0.dev11416%2Bg92e8bb79e-py3-none-any.whl}
+  image: pandocr-unlimited-ocr-sglang:latest
+
 services:
   paddleocr-vlm-server:
     image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-${VLM_BACKEND:-vllm}-server:${VLM_IMAGE_TAG_SUFFIX:-latest-nvidia-gpu-offline}
@@ -98,6 +114,92 @@ services:
     networks:
       - paddleocr-network
 
+  unlimited-ocr-sglang:
+    <<: *unlimited-ocr-sglang-image
+    profiles: ["unlimited-ocr"]
+    container_name: unlimited-ocr-sglang
+    ports:
+      - "127.0.0.1:${UNLIMITED_OCR_SGLANG_PORT:-10000}:10000"
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - CUDA_VISIBLE_DEVICES=${PANDOCR_GPU_DEVICE_ID:-0}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PANDOCR_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    user: root
+    restart: unless-stopped
+    shm_size: "32gb"
+    volumes:
+      - ./model_cache_unlimited_ocr:/root/.cache/huggingface
+    command: >
+      python3 -m sglang.launch_server
+      --model ${UNLIMITED_OCR_MODEL_NAME:-baidu/Unlimited-OCR}
+      --served-model-name ${UNLIMITED_OCR_SERVED_MODEL_NAME:-Unlimited-OCR}
+      --attention-backend ${UNLIMITED_OCR_ATTENTION_BACKEND:-flashinfer}
+      --page-size ${UNLIMITED_OCR_PAGE_SIZE:-1}
+      --mem-fraction-static ${UNLIMITED_OCR_MEM_FRACTION_STATIC:-0.8}
+      --context-length ${UNLIMITED_OCR_CONTEXT_LENGTH:-32768}
+      --enable-custom-logit-processor
+      --disable-overlap-schedule
+      --skip-server-warmup
+      --host 0.0.0.0
+      --port 10000
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:10000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 900s
+    networks:
+      - paddleocr-network
+
+  unlimited-ocr-api:
+    <<: *unlimited-ocr-transformers-image
+    profiles: ["unlimited-ocr"]
+    container_name: unlimited-ocr-api
+    ports:
+      - "127.0.0.1:${UNLIMITED_OCR_API_PORT:-8083}:8080"
+    environment:
+      - HF_HOME=/root/.cache/huggingface
+      - UNLIMITED_OCR_BACKEND=${UNLIMITED_OCR_BACKEND:-transformers}
+      - UNLIMITED_OCR_PRELOAD=${UNLIMITED_OCR_PRELOAD:-1}
+      - UNLIMITED_OCR_SGLANG_URL=http://unlimited-ocr-sglang:10000
+      - UNLIMITED_OCR_MODEL_NAME=${UNLIMITED_OCR_MODEL_NAME:-baidu/Unlimited-OCR}
+      - UNLIMITED_OCR_SERVED_MODEL_NAME=${UNLIMITED_OCR_SERVED_MODEL_NAME:-Unlimited-OCR}
+      - UNLIMITED_OCR_REQUEST_TIMEOUT=${UNLIMITED_OCR_REQUEST_TIMEOUT:-1200}
+      - UNLIMITED_OCR_PDF_DPI=${UNLIMITED_OCR_PDF_DPI:-300}
+      - UNLIMITED_OCR_MAX_PAGES_PER_REQUEST=${UNLIMITED_OCR_MAX_PAGES_PER_REQUEST:-50}
+      - UNLIMITED_OCR_SINGLE_IMAGE_MODE=${UNLIMITED_OCR_SINGLE_IMAGE_MODE:-gundam}
+      - UNLIMITED_OCR_MULTI_IMAGE_MODE=${UNLIMITED_OCR_MULTI_IMAGE_MODE:-base}
+      - UNLIMITED_OCR_MAX_TOKENS=${UNLIMITED_OCR_MAX_TOKENS:-32768}
+      - UNLIMITED_OCR_SGLANG_MAX_TOKENS=${UNLIMITED_OCR_SGLANG_MAX_TOKENS:-28672}
+      - PANDOCR_RUNTIME_SETTINGS_FILE=/app/data/runtime-settings.json
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${PANDOCR_GPU_DEVICE_ID:-0}"]
+              capabilities: [gpu]
+    user: root
+    restart: unless-stopped
+    volumes:
+      - ./model_cache_unlimited_ocr:/root/.cache/huggingface
+      - ./data:/app/data
+    command: uvicorn unlimited_ocr_adapter:app --host 0.0.0.0 --port 8080
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - paddleocr-network
+
   pandocr-web:
     pull_policy: build
     build:
@@ -111,8 +213,22 @@ services:
     environment:
       - PADDLE_SERVICE_URL=http://paddleocr-vl-api:8080/layout-parsing
       - PADDLE_OCR_SERVICE_URL=http://paddleocr-ocr-api:8080/ocr
+      - UNLIMITED_OCR_SERVICE_URL=http://unlimited-ocr-api:8080/ocr
+      - VLM_BACKEND=${VLM_BACKEND:-vllm}
+      - VLM_IMAGE_TAG_SUFFIX=${VLM_IMAGE_TAG_SUFFIX:-latest-nvidia-gpu-offline}
+      - API_IMAGE_TAG_SUFFIX=${API_IMAGE_TAG_SUFFIX:-latest-nvidia-gpu-offline}
+      - PANDOCR_GPU_DEVICE_ID=${PANDOCR_GPU_DEVICE_ID:-0}
+      - UNLIMITED_OCR_BACKEND=${UNLIMITED_OCR_BACKEND:-transformers}
+      - UNLIMITED_OCR_PRELOAD=${UNLIMITED_OCR_PRELOAD:-1}
+      - UNLIMITED_OCR_API_PORT=${UNLIMITED_OCR_API_PORT:-8083}
+      - UNLIMITED_OCR_SGLANG_PORT=${UNLIMITED_OCR_SGLANG_PORT:-10000}
+      - UNLIMITED_OCR_ATTENTION_BACKEND=${UNLIMITED_OCR_ATTENTION_BACKEND:-flashinfer}
+      - UNLIMITED_OCR_SGLANG_WHEEL_URL=${UNLIMITED_OCR_SGLANG_WHEEL_URL:-https://github.com/baidu/Unlimited-OCR/raw/main/wheel/sglang-0.0.0.dev11416%2Bg92e8bb79e-py3-none-any.whl}
       - PADDLEOCR_VL_MODEL_NAME=${PADDLEOCR_VL_MODEL_NAME:-PaddleOCR-VL-1.6-0.9B}
       - PPOCR_V6_MODEL_NAME=${PPOCR_V6_MODEL_NAME:-PP-OCRv6_medium}
+      - UNLIMITED_OCR_MODEL_NAME=${UNLIMITED_OCR_MODEL_NAME:-baidu/Unlimited-OCR}
+      - PANDOCR_ENABLE_UNLIMITED_OCR=${PANDOCR_ENABLE_UNLIMITED_OCR:-0}
+      - PANDOCR_MODEL_CATALOG=${PANDOCR_MODEL_CATALOG:-}
       - PADDLE_REQUEST_TIMEOUT=${PADDLE_REQUEST_TIMEOUT:-3600}
       - PANDOCR_MODEL_CONTROL=${PANDOCR_MODEL_CONTROL:-docker}
       - PANDOCR_ACTIVE_MODEL_ON_START=${PANDOCR_ACTIVE_MODEL_ON_START:-paddleocr-vl-1.6}
@@ -127,6 +243,10 @@ services:
     volumes:
       - ./static:/app/static
       - ./server.py:/app/server.py
+      - ./unlimited_ocr_adapter.py:/app/unlimited_ocr_adapter.py:ro
+      - ./Dockerfile.ocr:/app/Dockerfile.ocr:ro
+      - ./Dockerfile.unlimited-ocr:/app/Dockerfile.unlimited-ocr:ro
+      - ./Dockerfile.unlimited-ocr-sglang:/app/Dockerfile.unlimited-ocr-sglang:ro
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
     security_opt:
