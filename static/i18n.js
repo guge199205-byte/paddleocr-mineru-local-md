@@ -11,7 +11,7 @@ window.PANDOCR_I18N = {
             '切换侧边栏': 'Toggle sidebar',
             '切换到中文': 'Switch to Chinese',
             '切换到英文': 'Switch to English',
-            '本地 PaddleOCR 双模型解析': 'Local PaddleOCR dual-model parsing',
+            '本地 PaddleOCR 多模型解析': 'Local PaddleOCR multi-model parsing',
             '连接模型中...': 'Connecting model...',
             '新解析': 'New parse',
             '解析设置': 'Parsing settings',

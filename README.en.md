@@ -1,8 +1,8 @@
-# PaddleOCR Local - PaddleOCR-VL & PP-OCRv6 WebUI
+# PaddleOCR Local - PaddleOCR-VL, PP-OCRv6 & Unlimited-OCR WebUI
 
 **Language / 语言**: [简体中文](README.md) | English
 
-PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL and PP-OCRv6. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate PaddleOCR services. The NVIDIA path uses official Docker services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
+PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL, PP-OCRv6, and optional Unlimited-OCR. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate model services. The NVIDIA path uses Docker Compose to manage PaddleOCR and Unlimited-OCR services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
 
 <img width="1920" height="945" alt="image" src="https://github.com/user-attachments/assets/85a247a0-c796-4a20-b596-1cc4148df964" />
 
@@ -61,7 +61,7 @@ For single-GPU machines, the Docker deployment keeps only one OCR model hot-load
 ## Features
 
 - Supports image, PDF, PPT/PPTX, and DOC/DOCX uploads.
-- Supports model switching between `PaddleOCR-VL 1.6` document parsing and `PP-OCRv6` text OCR, with Docker-based on-demand start/stop for single-GPU deployments.
+- Supports model switching between `PaddleOCR-VL 1.6` document parsing, `PP-OCRv6` text OCR, and optional `Unlimited-OCR` long-document parsing, with Docker-based on-demand start/stop for single-GPU deployments.
 - The WebUI supports one-click Chinese/English switching, remembers the user's choice, and keeps translations centralized in `static/i18n.js` for future languages.
 - Sends PDFs to PaddleOCR-VL page by page, making it easier to compare with the official online parsing result and reliably keep the raw JSON for each page.
 - Renders PP-OCRv6 results with an official-style visual OCR layer: source/result pages stay aligned, scrolling and zooming are synchronized, recognized text can be copied or corrected, and raw JSON remains available.
@@ -174,7 +174,7 @@ docker compose --env-file env.txt up -d --no-start
 docker compose --env-file env.txt start pandocr-web
 ```
 
-Keep this `up -d --no-start` then `start pandocr-web` order for single-GPU deployments. Starting the whole compose stack with a plain `docker compose up -d` can hot-load PaddleOCR-VL and PP-OCRv6 at the same time and waste VRAM. After the WebUI is online, use the top-right model selector to switch models; the UI calls `/api/model-runtime/switch`, starts only the selected model containers, stops the inactive model containers, and keeps the runtime badge synchronized with the real container state.
+Keep this `up -d --no-start` then `start pandocr-web` order for single-GPU deployments. Starting the whole compose stack with a plain `docker compose up -d` can hot-load multiple model services at the same time and waste VRAM. After the WebUI is online, use the top-right model selector to switch models; the UI calls `/api/model-runtime/switch`, starts only the selected model containers, stops the inactive model containers, and keeps the runtime badge synchronized with the real container state.
 
 Open:
 
