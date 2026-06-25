@@ -80,6 +80,7 @@ const JSON_OVERSCAN_LINES = 10;
 const els = {
     sidebar: document.getElementById('sidebar'),
     sidebarToggle: document.getElementById('sidebar-toggle'),
+    sidebarScrim: document.getElementById('sidebar-scrim'),
     fileInput: document.getElementById('file-input'),
     browseBtn: document.getElementById('browse-btn'),
     newTaskBtn: document.getElementById('new-task-btn'),
@@ -141,12 +142,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     applyLanguage(document.body);
 });
 
+// True when the viewport is narrow enough that the sidebar overlays
+// content as a drawer instead of taking up its own column.
+function isNarrowViewport() {
+    return window.matchMedia('(max-width: 900px)').matches;
+}
+
+function closeMobileSidebar() {
+    document.body.classList.remove('sidebar-open');
+}
+
+// Which mobile pane is visible: "source" or "result". Persisted on the
+// body so plain CSS can hide the inactive pane.
+function setMobilePane(pane) {
+    const next = pane === 'result' ? 'result' : 'source';
+    document.body.dataset.mobilePane = next;
+    document.querySelectorAll('.mobile-pane-tab').forEach((tab) => {
+        const isActive = tab.dataset.pane === next;
+        tab.classList.toggle('active', isActive);
+        tab.setAttribute('aria-selected', isActive ? 'true' : 'false');
+    });
+}
+
+// Initialize the default visible pane on first paint so CSS rules apply
+// even before the user taps a tab.
+setMobilePane('source');
+
 function setupEventListeners() {
     [els.browseBtn, els.newTaskBtn].forEach((button) => {
         button?.addEventListener('click', () => els.fileInput.click());
-    });
-
-    els.fileInput.addEventListener('change', async (event) => {
+    });    els.fileInput.addEventListener('change', async (event) => {
         await handleFiles(event.target.files);
         els.fileInput.value = '';
     });
@@ -170,7 +195,34 @@ function setupEventListeners() {
     });
 
     els.sidebarToggle.addEventListener('click', () => {
-        document.body.classList.toggle('sidebar-collapsed');
+        // On narrow viewports the sidebar is an overlay drawer toggled via
+        // `body.sidebar-open`; on wider screens it's a column toggled via
+        // `body.sidebar-collapsed`. Use the same icon for both.
+        if (isNarrowViewport()) {
+            document.body.classList.toggle('sidebar-open');
+        } else {
+            document.body.classList.toggle('sidebar-collapsed');
+        }
+    });
+
+    els.sidebarScrim?.addEventListener('click', closeMobileSidebar);
+
+    // Mobile-only pane switcher (source ↔ result). On narrow screens the
+    // two panes stack and the inactive one is hidden via CSS — this just
+    // flips the `data-mobile-pane` attribute that CSS keys off.
+    document.querySelectorAll('.mobile-pane-tab').forEach((tab) => {
+        tab.addEventListener('click', () => {
+            const pane = tab.dataset.pane === 'result' ? 'result' : 'source';
+            setMobilePane(pane);
+        });
+    });
+
+    // If the user resizes from phone to desktop while the drawer is open,
+    // drop the drawer state so the sidebar returns to its column layout.
+    window.addEventListener('resize', () => {
+        if (!isNarrowViewport()) {
+            document.body.classList.remove('sidebar-open');
+        }
     });
 
     els.taskSearch.addEventListener('input', renderTaskList);
@@ -179,6 +231,9 @@ function setupEventListeners() {
         // If server-side processing is active, cancel instead of starting new
         const task = getActiveTask();
         const isBackendProcessing = task?.status === 'processing' && task?.sourceUrl && !task?.sourceDataUrl;
+        // On phones the result is hidden behind the source pane — flip to it
+        // as soon as the user starts parsing so they can watch progress.
+        if (isNarrowViewport()) setMobilePane('result');
         if (isProcessing || isBackendProcessing) {
             cancelServerProcessing(task.id);
         } else if (shouldResumeTask(task)) {
@@ -1478,6 +1533,7 @@ async function deleteTask(taskId) {
 
 async function selectTask(taskId) {
     activeTaskId = taskId;
+    closeMobileSidebar();
     renderTaskList();
     let task;
     try {
@@ -2371,7 +2427,7 @@ async function copyPPOCRToolbarText(toolbar, button) {
 }
 
 async function writeClipboardText(text) {
-    if (navigator.clipboard?.writeText) {
+    if (navigator.clipboard?.writeText && window.isSecureContext) {
         try {
             await navigator.clipboard.writeText(text);
             return;
@@ -2379,14 +2435,32 @@ async function writeClipboardText(text) {
             console.warn('Clipboard API write failed, falling back to textarea copy.', error);
         }
     }
+    // iOS Safari refuses to copy from an off-screen / display:none element
+    // (it must be selectable, visible, and editable), so we render the
+    // textarea in-flow but visually inert before issuing execCommand.
     const textarea = document.createElement('textarea');
     textarea.value = text;
     textarea.setAttribute('readonly', '');
+    textarea.contentEditable = 'true';
     textarea.style.position = 'fixed';
-    textarea.style.left = '-9999px';
+    textarea.style.top = '0';
+    textarea.style.left = '0';
+    textarea.style.width = '1px';
+    textarea.style.height = '1px';
+    textarea.style.padding = '0';
+    textarea.style.border = '0';
+    textarea.style.opacity = '0';
+    textarea.style.pointerEvents = 'none';
     document.body.appendChild(textarea);
-    textarea.select();
+    // iOS needs an explicit selection range, not just .select().
+    const range = document.createRange();
+    range.selectNodeContents(textarea);
+    const selection = window.getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    textarea.setSelectionRange(0, text.length);
     const copied = document.execCommand('copy');
+    selection.removeAllRanges();
     textarea.remove();
     if (!copied) {
         throw new Error('copy command failed');

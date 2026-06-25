@@ -2,10 +2,14 @@
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#2563eb">
+    <meta name="mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>PaddleOCR Local - 本地 OCR 解析工作台</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Ctext x='32' y='42' text-anchor='middle' font-family='Arial,sans-serif' font-size='34' font-weight='700' fill='white'%3EP%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/static/style.css?v=43">
+    <link rel="stylesheet" href="/static/style.css?v=45">
     <script src="/static/vendor/pdfjs/pdf.min.js"></script>
     <script src="/static/vendor/pdf-lib/pdf-lib.min.js"></script>
     <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
@@ -13,9 +17,6 @@
     <script src="/static/vendor/katex/katex.min.js"></script>
     <script src="/static/vendor/katex/contrib/auto-render.min.js"></script>
     <script src="/static/vendor/dompurify/purify.min.js"></script>
-    <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
-    <script defer src="/static/vendor/katex/katex.min.js"></script>
-    <script defer src="/static/vendor/katex/contrib/auto-render.min.js"></script>
     <link rel="stylesheet" href="/static/vendor/highlight/github.min.css">
     <script src="/static/vendor/highlight/highlight.min.js"></script>
     <script src="/static/vendor/jszip/jszip.min.js"></script>
@@ -50,6 +51,7 @@
         </header>
 
         <div class="workspace">
+            <div class="sidebar-scrim" id="sidebar-scrim" aria-hidden="true"></div>
             <aside class="sidebar" id="sidebar">
                 <div class="sidebar-actions">
                     <button class="new-task-button" id="new-task-btn">
@@ -131,6 +133,17 @@
             </aside>
 
             <main class="document-workbench">
+                <div class="mobile-pane-switch" role="tablist" aria-label="切换源文件 / 解析结果">
+                    <button type="button" class="mobile-pane-tab active" data-pane="source" role="tab" aria-selected="true">
+                        <svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/></svg>
+                        <span>源文件</span>
+                    </button>
+                    <button type="button" class="mobile-pane-tab" data-pane="result" role="tab" aria-selected="false">
+                        <svg viewBox="0 0 24 24"><path d="M9 11h6M9 15h4M7 3h7l5 5v11a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2z"/><path d="M14 3v5h5"/></svg>
+                        <span>解析结果</span>
+                    </button>
+                </div>
+
                 <section class="source-pane">
                     <div class="pane-header">
                         <div>
@@ -179,17 +192,21 @@
                                     <svg viewBox="0 0 24 24"><path d="m8 5 11 7-11 7V5Z"/></svg>
                                     开始解析
                                 </button>
-                                <button class="icon-button" id="copy-btn" title="复制 Markdown">
+                                <button class="icon-button has-mobile-label" id="copy-btn" title="复制 Markdown" aria-label="复制 Markdown">
                                     <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>
+                                    <span class="btn-mobile-label">复制</span>
                                 </button>
-                                <button class="icon-button" id="download-btn" title="下载结果">
+                                <button class="icon-button has-mobile-label" id="download-btn" title="下载结果" aria-label="下载结果">
                                     <svg viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><path d="M7 10l5 5 5-5M12 15V3"/></svg>
+                                    <span class="btn-mobile-label">下载</span>
                                 </button>
-                                <button class="icon-button danger" id="clear-result-btn" title="清空解析结果" style="display:none;">
+                                <button class="icon-button danger has-mobile-label" id="clear-result-btn" title="清空解析结果" aria-label="清空解析结果" style="display:none;">
                                     <svg viewBox="0 0 24 24"><path d="M3 6h18M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2m3 0v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6h14"/></svg>
+                                    <span class="btn-mobile-label">清空</span>
                                 </button>
-                                <button class="icon-button" id="translate-btn" title="翻译" style="display:none;">
+                                <button class="icon-button has-mobile-label" id="translate-btn" title="翻译" aria-label="翻译" style="display:none;">
                                     <svg viewBox="0 0 24 24"><path d="M12.87 15.07l-2.54-2.51.03-.03A17.52 17.52 0 0014.07 6H17V4h-7V2H8v2H1v1.99h11.17C11.5 7.92 10.44 9.75 9 11.35 8.07 10.32 7.3 9.19 6.69 8h-2c.73 1.63 1.73 3.17 2.98 4.56l-5.09 5.02L4 19l5-5 3.11 3.11.76-2.04zM18.5 10h-2L12 22h2l1.12-3h4.75L21 22h2l-4.5-12zm-2.62 7l1.62-4.33L19.12 17h-3.24z"/></svg>
+                                    <span class="btn-mobile-label">翻译</span>
                                 </button>
                             </div>
                         </div>
@@ -226,6 +243,6 @@
     </template>
 
     <script charset="UTF-8" src="/static/i18n.js?v=2"></script>
-    <script charset="UTF-8" src="/static/app.js?v=101"></script>
+    <script charset="UTF-8" src="/static/app.js?v=103"></script>
 </body>
 </html>
