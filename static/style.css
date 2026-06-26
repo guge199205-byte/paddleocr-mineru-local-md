@@ -259,7 +259,26 @@ svg {
 }
 
 .sidebar-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
     padding: 0 2px;
+}
+
+.batch-task-button {
+    color: var(--brand);
+    background: var(--brand-soft);
+    border-color: var(--brand-soft);
+}
+
+.batch-task-button:hover {
+    color: #fff;
+    background: var(--brand);
+    border-color: var(--brand);
+}
+
+.batch-task-button svg {
+    color: inherit;
 }
 
 .new-task-button,
