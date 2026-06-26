@@ -97,6 +97,10 @@ const els = {
     batchSkipBtn: document.getElementById('batch-skip-btn'),
     batchRetryBtn: document.getElementById('batch-retry-btn'),
     batchStopBtn: document.getElementById('batch-stop-btn'),
+    batchStatPages: document.getElementById('batch-stat-pages'),
+    batchStatElapsed: document.getElementById('batch-stat-elapsed'),
+    batchStatEta: document.getElementById('batch-stat-eta'),
+    batchStatPerPage: document.getElementById('batch-stat-perpage'),
     taskSelectModeBtn: document.getElementById('task-select-mode-btn'),
     taskSelectBar: document.getElementById('task-select-bar'),
     taskSelectAllCb: document.getElementById('task-select-all-cb'),
@@ -1360,13 +1364,38 @@ const batchQueue = {
     completion: null,
     completionResolve: null,
     driverRunning: false,
+    // Aggregate stats across the run, recomputed in renderBatchQueueBar
+    // (so we can cheaply update them every progress tick):
+    // - startedAt: when the current run began (ms epoch)
+    // - totalPages: pages across every task enqueued in this run
+    // - completedPages: pages already finished (counted once per task as
+    //   soon as the task reaches a terminal state; falls back to
+    //   task.pageCount for client-side jobs)
+    startedAt: 0,
+    totalPages: 0,
+    completedPages: 0,
 };
 
 function enqueueTasks(taskIds, { autoStart = true } = {}) {
     if (!taskIds || !taskIds.length) return;
+    // If the run is fully idle (no in-flight, no queued), start a fresh
+    // stats window. Otherwise we keep the existing startedAt and just
+    // extend the totals — this is what "add another file mid-batch"
+    // does and we don't want to reset the elapsed-time clock.
+    const wasIdle = !batchQueue.running && batchQueue.queue.length === 0 && batchQueue.results.size === 0;
+    if (wasIdle) {
+        batchQueue.startedAt = Date.now();
+        batchQueue.completedPages = 0;
+        batchQueue.totalPages = 0;
+    }
     for (const id of taskIds) {
         if (id && !batchQueue.queue.includes(id) && batchQueue.running !== id) {
             batchQueue.queue.push(id);
+            // pageCount is set during createTaskFromFile() / the lite
+            // server response. Fall back to 1 so single-page tasks still
+            // contribute to ETA.
+            const task = tasks.find((t) => t.id === id);
+            batchQueue.totalPages += Number(task?.pageCount || 1);
         }
     }
     batchQueue.totalThisRun = countQueueTotal();
@@ -1388,6 +1417,9 @@ function countDoneStatus(status) {
 function resetBatchRunStats() {
     batchQueue.results.clear();
     batchQueue.totalThisRun = 0;
+    batchQueue.startedAt = 0;
+    batchQueue.completedPages = 0;
+    batchQueue.totalPages = 0;
 }
 
 async function startBatchDriver() {
@@ -1422,6 +1454,22 @@ async function startBatchDriver() {
                 console.error('Batch task failed', err);
                 batchQueue.results.set(nextId, 'error');
             } finally {
+                // Add the just-finished task's pages to the completed
+                // tally — even on error we count the pages that did get
+                // parsed (best-effort: pageCount or completedPages from
+                // the live task object). The driver keeps a running
+                // total so the ETA math stays correct across the run.
+                const doneTask = tasks.find((t) => t.id === nextId);
+                if (doneTask) {
+                    const pagesDone = Number(
+                        doneTask.completedPages
+                        || (Array.isArray(doneTask.batches) ? doneTask.batches.filter((b) => b.status === 'completed').length : 0)
+                        || doneTask.pageCount
+                        || 1
+                    );
+                    batchQueue.completedPages += pagesDone;
+                }
+                batchQueue.running = null;
                 batchQueue.running = null;
                 batchQueue.completion = null;
                 batchQueue.completionResolve = null;
@@ -1536,6 +1584,26 @@ function isBatchActive() {
     return Boolean(batchQueue.running) || batchQueue.queue.length > 0;
 }
 
+// 1-Hz ticker to keep the elapsed/ETA numbers honest even when the
+// active task's progress events slow down. Started lazily by render
+// and stopped when the bar hides itself.
+let batchStatsTicker = null;
+function startBatchStatsTicker() {
+    if (batchStatsTicker) return;
+    batchStatsTicker = setInterval(() => {
+        if (!batchQueue.running && batchQueue.queue.length === 0) {
+            stopBatchStatsTicker();
+        }
+        renderBatchQueueBar();
+    }, 1000);
+}
+function stopBatchStatsTicker() {
+    if (batchStatsTicker) {
+        clearInterval(batchStatsTicker);
+        batchStatsTicker = null;
+    }
+}
+
 function renderBatchQueueBar({ finished = false } = {}) {
     const bar = els.batchQueueBar;
     if (!bar) return;
@@ -1554,8 +1622,10 @@ function renderBatchQueueBar({ finished = false } = {}) {
     if (!shouldShow) {
         // Reset run stats when the user has dismissed/finished a batch
         resetBatchRunStats();
+        stopBatchStatsTicker();
         return;
     }
+    if (isBatchActive()) startBatchStatsTicker();
 
     bar.dataset.state = batchQueue.paused ? 'paused' : (isBatchActive() ? 'running' : 'idle');
     bar.classList.toggle('is-paused', batchQueue.paused);
@@ -1600,6 +1670,50 @@ function renderBatchQueueBar({ finished = false } = {}) {
         els.batchRetryBtn.hidden = !canRetry;
         els.batchRetryBtn.disabled = isBatchActive() && !batchQueue.paused;
     }
+
+    // ── Stats line: total pages / elapsed / ETA / per-page ─────────
+    const stats = computeBatchStats();
+    if (els.batchStatPages) {
+        els.batchStatPages.textContent = t('{done}/{total} 页', { done: stats.completedPages, total: stats.totalPages });
+    }
+    if (els.batchStatElapsed) {
+        els.batchStatElapsed.textContent = t('用时 {t}', { t: stats.elapsedLabel });
+    }
+    if (els.batchStatEta) {
+        els.batchStatEta.textContent = t('剩余 {t}', { t: stats.etaLabel });
+    }
+    if (els.batchStatPerPage) {
+        els.batchStatPerPage.textContent = t('{t}/页', { t: stats.perPageLabel });
+    }
+}
+
+// Build the numbers behind the stats line in one place. The driver
+// doesn't call this on every progress tick itself; renderBatchQueueBar
+// re-runs it cheaply.
+function computeBatchStats() {
+    const startedAt = batchQueue.startedAt || 0;
+    const elapsedMs = startedAt ? Date.now() - startedAt : 0;
+    const totalPages = Math.max(batchQueue.totalPages, 0);
+    const completedPages = Math.max(batchQueue.completedPages, 0);
+    const remainingPages = Math.max(0, totalPages - completedPages);
+    const perPageMs = completedPages > 0 ? elapsedMs / completedPages : 0;
+    const etaMs = perPageMs > 0 ? Math.round(perPageMs * remainingPages) : 0;
+    return {
+        totalPages,
+        completedPages,
+        elapsedLabel: formatHms(elapsedMs),
+        etaLabel: remainingPages > 0 && perPageMs > 0 ? formatHms(etaMs) : '--',
+        perPageLabel: completedPages > 0 && perPageMs > 0 ? formatHms(perPageMs) : '--',
+    };
+}
+
+function formatHms(ms) {
+    const totalSec = Math.max(0, Math.round(ms / 1000));
+    const h = Math.floor(totalSec / 3600);
+    const m = Math.floor((totalSec % 3600) / 60);
+    const s = totalSec % 60;
+    const pad = (n) => String(n).padStart(2, '0');
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${pad(m)}:${pad(s)}`;
 }
 
 async function ensureFolderByName(name) {
@@ -3816,6 +3930,28 @@ function updateProcessingProgress(taskId, progress) {
                 total: totalBatches,
                 label
             });
+        }
+        // Drive the batch-queue stats line: every running progress
+        // event advances the live page count by `currentBatchIndex`,
+        // which the server reports as the number of batches already
+        // finished. This is the only signal the stats bar has to stay
+        // moving while a long task is mid-flight.
+        if (batchQueue.running === taskId) {
+            // Use batches already done in the running task + 1 for the
+            // in-flight batch. We re-derive rather than increment so
+            // out-of-order progress events can't drift the counter up.
+            const runningTask = tasks.find((t) => t.id === taskId);
+            const liveBatches = Number(batchIndex) + 1;
+            const pagesFromRunning = Math.max(0, Math.min(liveBatches, totalBatches || liveBatches));
+            // Subtract whatever this task contributed before the
+            // running update so the run total stays consistent with
+            // what the driver set when the job started.
+            const taskContrib = Number(runningTask?.pageCount || 1);
+            batchQueue.completedPages = Math.max(
+                0,
+                batchQueue.completedPages - taskContrib + pagesFromRunning
+            );
+            renderBatchQueueBar();
         }
     } else if (progress.status === 'cancelling') {
         if (els.startBtn) {

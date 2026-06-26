@@ -9,7 +9,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="default">
     <title>PaddleOCR Local - 本地 OCR 解析工作台</title>
     <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%232f6df6'/%3E%3Ctext x='32' y='42' text-anchor='middle' font-family='Arial,sans-serif' font-size='34' font-weight='700' fill='white'%3EP%3C/text%3E%3C/svg%3E">
-    <link rel="stylesheet" href="/static/style.css?v=49">
+    <link rel="stylesheet" href="/static/style.css?v=50">
     <script src="/static/vendor/pdfjs/pdf.min.js"></script>
     <script src="/static/vendor/pdf-lib/pdf-lib.min.js"></script>
     <link rel="stylesheet" href="/static/vendor/katex/katex.min.css">
@@ -54,13 +54,11 @@
             <div class="sidebar-scrim" id="sidebar-scrim" aria-hidden="true"></div>
             <aside class="sidebar" id="sidebar">
                 <div class="sidebar-actions">
-                    <button class="new-task-button" id="new-task-btn">
+                    <button class="icon-button new-task-icon-button" id="new-task-btn" title="新解析（单文件）" aria-label="新解析">
                         <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
-                        新解析
                     </button>
-                    <button class="new-task-button batch-task-button" id="batch-folder-btn" title="一次选多个文件，自动归到同一个批次依次解析；也可以直接拖文件夹进来">
+                    <button class="icon-button batch-task-button" id="batch-folder-btn" title="批量解析文件（多选）" aria-label="批量解析文件">
                         <svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><path d="M14 3v6h6"/><path d="M9 13h6M9 17h4"/></svg>
-                        批量解析文件
                     </button>
                 </div>
 
@@ -73,6 +71,12 @@
                         <div class="batch-queue-progress-fill" id="batch-queue-progress-fill"></div>
                     </div>
                     <div class="batch-queue-current" id="batch-queue-current"></div>
+                    <div class="batch-queue-stats" id="batch-queue-stats">
+                        <span class="batch-stat" id="batch-stat-pages" title="已解析页数 / 总页数">0/0 页</span>
+                        <span class="batch-stat" id="batch-stat-elapsed" title="已用时间">用时 00:00</span>
+                        <span class="batch-stat" id="batch-stat-eta" title="预计剩余时间">剩余 --</span>
+                        <span class="batch-stat" id="batch-stat-perpage" title="每页平均时间">--/页</span>
+                    </div>
                     <div class="batch-queue-actions">
                         <button type="button" class="batch-queue-btn" id="batch-pause-btn" title="暂停后将不再启动下一个任务">暂停</button>
                         <button type="button" class="batch-queue-btn" id="batch-skip-btn" title="取消当前任务，继续下一个">跳过</button>
@@ -286,6 +290,6 @@
     </template>
 
     <script charset="UTF-8" src="/static/i18n.js?v=2"></script>
-    <script charset="UTF-8" src="/static/app.js?v=107"></script>
+    <script charset="UTF-8" src="/static/app.js?v=108"></script>
 </body>
 </html>
