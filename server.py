@@ -3398,6 +3398,8 @@ async def run_ocr_from_file(file_path: Path, model_id: str, ocr_request: "OCRReq
         return await run_ocr_request(ocr_request, raw_input)
     elif model_id == "pp-ocrv6":
         return await run_ppocrv6_request(ocr_request, raw_input)
+    elif model_id == "unlimited-ocr":
+        return await run_unlimited_ocr_request(ocr_request, raw_input)
     else:
         raise HTTPException(status_code=400, detail=f"Unknown model_id: {model_id}")
 
