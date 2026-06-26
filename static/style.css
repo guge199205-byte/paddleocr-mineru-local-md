@@ -266,19 +266,23 @@ svg {
 }
 
 .batch-task-button {
-    color: var(--brand);
-    background: var(--brand-soft);
-    border-color: var(--brand-soft);
+    color: #fff;
+    background: var(--brand);
+    border-color: var(--brand);
+    font-weight: 700;
+    box-shadow: 0 4px 12px rgba(37, 99, 235, .22);
 }
 
 .batch-task-button:hover {
     color: #fff;
-    background: var(--brand);
-    border-color: var(--brand);
+    background: var(--brand-strong);
+    border-color: var(--brand-strong);
+    box-shadow: 0 6px 16px rgba(37, 99, 235, .28);
 }
 
 .batch-task-button svg {
     color: inherit;
+    stroke: currentColor;
 }
 
 /* ── Batch queue bar (sidebar) ─────────────────────────────────── */
