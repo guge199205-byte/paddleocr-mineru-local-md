@@ -1441,7 +1441,8 @@ def _thumb_path(task_id: str, page: int, dpi: int) -> Path:
 # Bounded by _DOC_CACHE_MAX so a malicious/errant load pattern can't
 # leak all the docs.
 import time as _time
-_DOC_CACHE: dict[str, tuple[float, "object"]] = {}
+import fitz as _fitz
+_DOC_CACHE: dict[str, tuple[float, "object", float]] = {}
 _DOC_CACHE_MAX = 8
 _DOC_CACHE_TTL = 300       # 5 minutes idle → drop the doc
 
@@ -1450,7 +1451,6 @@ def _get_cached_doc(source_path: Path):
     """Return a fitz.Document for this path, opening a fresh one if
     the file's mtime changed or the cache slot is stale. Keeps at most
     _DOC_CACHE_MAX docs in memory, evicting the oldest."""
-    import fitz
     key = str(source_path)
     mtime = source_path.stat().st_mtime if source_path.exists() else 0
     cached = _DOC_CACHE.get(key)
@@ -1459,7 +1459,7 @@ def _get_cached_doc(source_path: Path):
         _DOC_CACHE[key] = (mtime, cached[1], _time.time())
         return cached[1]
     # Open fresh.
-    doc = fitz.open(str(source_path))
+    doc = _fitz.open(str(source_path))
     _DOC_CACHE[key] = (mtime, doc, _time.time())
     # Evict oldest if over capacity.
     if len(_DOC_CACHE) > _DOC_CACHE_MAX:
@@ -1487,12 +1487,15 @@ def _ensure_thumb(source_path: Path, output_path: Path, page: int, dpi: int) -> 
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     zoom = max(0.5, min(dpi / 72.0, 4.0))
-    matrix = fitz.Matrix(zoom, zoom)
     doc = _get_cached_doc(source_path)
     try:
         if page < 1 or page > doc.page_count:
             raise ValueError(f"Page {page} out of range (1..{doc.page_count})")
         page_obj = doc.load_page(page - 1)
+        # Use the module-scoped _fitz reference (set up at the top of
+        # the doc-cache section) to build the zoom matrix. All docs in
+        # _DOC_CACHE were opened with this same _fitz.
+        matrix = _fitz.Matrix(zoom, zoom)
         pix = page_obj.get_pixmap(matrix=matrix, alpha=False)
         from PIL import Image
         import io
