@@ -32,12 +32,12 @@ let activeTaskId = null;
 let activeFilter = 'all';
 let taskSelectionMode = false;
 const selectedTaskIds = new Set();
-let lastActiveTaskId = localStorage.getItem(ACTIVE_TASK_STORAGE_KEY) || null;
 
 // Persist the last selected task id so the workbench can come back to
 // the same place after a refresh, without auto-rendering the source.
 const ACTIVE_TASK_STORAGE_KEY = 'pandocr.lastActiveTaskId';
 const BATCH_QUEUE_STORAGE_KEY = 'pandocr.batchQueue';
+let lastActiveTaskId = localStorage.getItem(ACTIVE_TASK_STORAGE_KEY) || null;
 let activeResultView = 'markdown';
 let isProcessing = false;
 let currentPdf = null;
@@ -170,17 +170,17 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Don't auto-select a task on launch — picking one would force a
     // PDF render (or huge image load) before the user asked for it.
     // Big PDFs easily freeze the page for several seconds.
-    restoreBatchQueueFromStorage();
-    if (tasks.length > 0 && lastActiveTaskId && tasks.some((task) => task.id === lastActiveTaskId)) {
-        // Restore the previously selected task so the workbench isn't
-        // empty on a soft refresh, but skip the source-pane render
-        // (selectTaskWithDefer is non-PDF eager) and let the user open
-        // the file when they actually want to look at it.
-        await selectTaskLight(lastActiveTaskId);
-    } else {
-        // No previous selection — just show the empty state. Task list
-        // is visible, the workbench prompts the user to upload.
-        showEmptyWorkbench();
+    try { restoreBatchQueueFromStorage(); } catch (e) { console.warn('restoreBatchQueueFromStorage failed', e); clearPersistedBatchQueue(); }
+    try {
+        if (tasks.length > 0 && lastActiveTaskId && tasks.some((task) => task.id === lastActiveTaskId)) {
+            await selectTaskLight(lastActiveTaskId);
+        } else {
+            showEmptyWorkbench();
+        }
+    } catch (e) {
+        console.error('Initial workbench render failed', e);
+        // Don't let one bug take down the whole UI — show empty state.
+        try { showEmptyWorkbench(); } catch (_) {}
     }
     applyLanguage(document.body);
 });
