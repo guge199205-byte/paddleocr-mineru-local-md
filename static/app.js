@@ -82,8 +82,10 @@ const els = {
     sidebarToggle: document.getElementById('sidebar-toggle'),
     sidebarScrim: document.getElementById('sidebar-scrim'),
     fileInput: document.getElementById('file-input'),
+    folderInput: document.getElementById('folder-input'),
     browseBtn: document.getElementById('browse-btn'),
     newTaskBtn: document.getElementById('new-task-btn'),
+    batchFolderBtn: document.getElementById('batch-folder-btn'),
     dropZone: document.getElementById('drop-zone'),
     taskList: document.getElementById('task-list'),
     taskSearch: document.getElementById('task-search'),
@@ -171,9 +173,28 @@ setMobilePane('source');
 function setupEventListeners() {
     [els.browseBtn, els.newTaskBtn].forEach((button) => {
         button?.addEventListener('click', () => els.fileInput.click());
-    });    els.fileInput.addEventListener('change', async (event) => {
+    });
+    els.fileInput.addEventListener('change', async (event) => {
         await handleFiles(event.target.files);
         els.fileInput.value = '';
+    });
+
+    // Batch-parse-folder: open the directory picker, then route the
+    // selected files through handleFiles() under a folder named after
+    // the chosen directory so they're auto-grouped + auto-parsed.
+    els.batchFolderBtn?.addEventListener('click', () => {
+        if (!els.folderInput) return;
+        if (!('webkitdirectory' in els.folderInput)) {
+            alert(t('当前浏览器不支持选择文件夹，请改用最新版 Chrome / Edge / Safari，或者直接拖拽文件夹到上传区。'));
+            return;
+        }
+        els.folderInput.click();
+    });
+
+    els.folderInput?.addEventListener('change', async (event) => {
+        const files = event.target.files;
+        await handleFolderBatch(files);
+        els.folderInput.value = '';
     });
 
     ['dragenter', 'dragover'].forEach((name) => {
@@ -191,6 +212,17 @@ function setupEventListeners() {
     });
 
     document.addEventListener('drop', async (event) => {
+        // If the drag carries any directory entries, recurse through them
+        // and route everything through the batch flow so it lands in a
+        // folder named after the dropped directory. Plain file drops keep
+        // the existing single/multi-file behavior.
+        const items = event.dataTransfer?.items;
+        if (items && Array.from(items).some((it) => it.webkitGetAsEntry?.()?.isDirectory)) {
+            const { files, topDir } = await collectDroppedEntries(items);
+            if (!files.length) return;
+            await handleFolderBatch(filesToFakeListWithRelative(files, topDir));
+            return;
+        }
         await handleFiles(event.dataTransfer.files);
     });
 
@@ -1115,6 +1147,147 @@ async function handleFiles(files) {
 
     for (const task of newTasks) {
         await processTask(task, { confirmCompleted: false });
+    }
+}
+
+// Extensions accepted by the batch folder picker. Mirrors the
+// `accept` attribute on the single-file <input>.
+const BATCH_SUPPORTED_EXTS = new Set([
+    'pdf', 'png', 'jpg', 'jpeg', 'bmp', 'webp', 'tiff', 'tif', 'gif',
+    'ppt', 'pptx', 'doc', 'docx'
+]);
+
+// Walk a DataTransferItemList that came from a drag-drop and produce
+// { files, topDir }. Each File gets a synthetic `webkitRelativePath`
+// so the downstream batch handler can name the auto-folder.
+async function collectDroppedEntries(items) {
+    const collected = [];
+    let topDir = '';
+    const tasks = [];
+    for (const item of Array.from(items)) {
+        const entry = item.webkitGetAsEntry?.();
+        if (!entry) continue;
+        if (entry.isDirectory) topDir ||= entry.name;
+        tasks.push(walkEntry(entry, '', collected));
+    }
+    await Promise.all(tasks);
+    return { files: collected, topDir };
+}
+
+function walkEntry(entry, prefix, out) {
+    return new Promise((resolve) => {
+        if (entry.isFile) {
+            entry.file((file) => {
+                // Preserve the relative path for later display / folder naming.
+                file._batchRelativePath = prefix ? `${prefix}/${file.name}` : file.name;
+                out.push(file);
+                resolve();
+            }, () => resolve());
+            return;
+        }
+        if (entry.isDirectory) {
+            const reader = entry.createReader();
+            const nested = prefix ? `${prefix}/${entry.name}` : entry.name;
+            const readBatch = () => {
+                reader.readEntries(async (entries) => {
+                    if (!entries.length) return resolve();
+                    await Promise.all(entries.map((child) => walkEntry(child, nested, out)));
+                    readBatch();   // readEntries returns at most ~100 per call
+                }, () => resolve());
+            };
+            readBatch();
+            return;
+        }
+        resolve();
+    });
+}
+
+// handleFolderBatch reads `webkitRelativePath` from each File, but for
+// drag-dropped files we stored the path on `_batchRelativePath` instead
+// (the real property is read-only). Wrap them so both code paths agree.
+function filesToFakeListWithRelative(files, topDir) {
+    return files.map((f) => {
+        // If a real webkitRelativePath already exists (rare from drag),
+        // leave it alone. Otherwise expose our synthetic copy under the
+        // expected name via a Proxy-free property assignment.
+        if (!f.webkitRelativePath && f._batchRelativePath) {
+            try {
+                Object.defineProperty(f, 'webkitRelativePath', {
+                    value: f._batchRelativePath,
+                    configurable: true,
+                });
+            } catch (_) { /* some browsers refuse — fine, we still have the file */ }
+        }
+        return f;
+    });
+}
+
+// Pulled from a directory pick: filter to supported types, auto-create
+// a folder named after the picked directory, then reuse the existing
+// handleFiles() pipeline so every file is queued + parsed serially
+// just like a manual multi-file selection.
+async function handleFolderBatch(fileListLike) {
+    if (!fileListLike || fileListLike.length === 0) return;
+
+    const all = Array.from(fileListLike);
+    const supported = all.filter((file) => {
+        if (file.name?.startsWith('.')) return false;            // skip dotfiles
+        return BATCH_SUPPORTED_EXTS.has(getExtension(file.name));
+    });
+
+    if (supported.length === 0) {
+        alert(t('文件夹里没有可解析的文件（支持 PDF、图片、PPT/DOC）。'));
+        return;
+    }
+
+    // Derive the folder name from the first file's webkitRelativePath
+    // (e.g. "MyDocs/sub/a.pdf" → "MyDocs"). Fall back to a timestamped
+    // name if the browser didn't populate the relative path.
+    const firstRel = supported[0].webkitRelativePath || '';
+    const topDir = firstRel.split('/')[0] || `批量解析-${new Date().toLocaleString('zh-CN').replace(/[/: ]/g, '-')}`;
+
+    const skipped = all.length - supported.length;
+    const proceed = confirm(t('将把文件夹「{name}」中 {count} 个文件加入批量解析队列，跳过 {skipped} 个不支持的文件。确认继续？', {
+        name: topDir,
+        count: supported.length,
+        skipped
+    }));
+    if (!proceed) return;
+
+    // Make sure a folder with this name exists, then activate it so
+    // handleFiles() drops the new tasks into it automatically.
+    const folder = await ensureFolderByName(topDir);
+    if (folder) {
+        activeFolderId = folder.id;
+        if (els.folderSelect) els.folderSelect.value = folder.id;
+    }
+
+    await handleFiles(supported);
+}
+
+async function ensureFolderByName(name) {
+    const trimmed = (name || '').trim();
+    if (!trimmed) return null;
+
+    const existing = folders.find((f) => f.name === trimmed);
+    if (existing) return existing;
+
+    try {
+        const resp = await fetch('/api/folders', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name: trimmed }),
+        });
+        if (!resp.ok) {
+            console.warn('Failed to create folder for batch parse', await resp.text());
+            return null;
+        }
+        const created = await resp.json();
+        await loadFolders();
+        return folders.find((f) => f.id === created.id) || created;
+    } catch (err) {
+        console.error('ensureFolderByName error', err);
+        return null;
     }
 }
 
