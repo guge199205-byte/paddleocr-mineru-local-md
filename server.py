@@ -1436,9 +1436,47 @@ def _thumb_path(task_id: str, page: int, dpi: int) -> Path:
     return _thumbs_dir(task_id) / f"p{page:04d}_d{safe_dpi}.{THUMB_FORMAT}"
 
 
+# Reuse one fitz.Document per (source_path, source_mtime) so consecutive
+# thumb requests don't pay the multi-second open() cost on a 500 MB PDF.
+# Bounded by _DOC_CACHE_MAX so a malicious/errant load pattern can't
+# leak all the docs.
+import time as _time
+_DOC_CACHE: dict[str, tuple[float, "object"]] = {}
+_DOC_CACHE_MAX = 8
+_DOC_CACHE_TTL = 300       # 5 minutes idle → drop the doc
+
+
+def _get_cached_doc(source_path: Path):
+    """Return a fitz.Document for this path, opening a fresh one if
+    the file's mtime changed or the cache slot is stale. Keeps at most
+    _DOC_CACHE_MAX docs in memory, evicting the oldest."""
+    import fitz
+    key = str(source_path)
+    mtime = source_path.stat().st_mtime if source_path.exists() else 0
+    cached = _DOC_CACHE.get(key)
+    if cached and cached[0] == mtime and (_time.time() - cached[2] < _DOC_CACHE_TTL):
+        # Touch lru
+        _DOC_CACHE[key] = (mtime, cached[1], _time.time())
+        return cached[1]
+    # Open fresh.
+    doc = fitz.open(str(source_path))
+    _DOC_CACHE[key] = (mtime, doc, _time.time())
+    # Evict oldest if over capacity.
+    if len(_DOC_CACHE) > _DOC_CACHE_MAX:
+        oldest_key = min(_DOC_CACHE, key=lambda k: _DOC_CACHE[k][2])
+        try:
+            _DOC_CACHE[oldest_key][1].close()
+        except Exception:
+            pass
+        _DOC_CACHE.pop(oldest_key, None)
+    return doc
+
+
 def _ensure_thumb(source_path: Path, output_path: Path, page: int, dpi: int) -> None:
-    """Render one PDF page to WebP. Cached on disk. Skips work if the
-    cache file already exists with a newer mtime than the PDF itself.
+    """Render one PDF page to PNG. Cached on disk AND keeps a hot
+    fitz.Document per source PDF in memory so consecutive page
+    requests for the same task reuse the parsed cross-reference
+    table instead of re-parsing the file from scratch each time.
     """
     if output_path.exists():
         try:
@@ -1446,24 +1484,16 @@ def _ensure_thumb(source_path: Path, output_path: Path, page: int, dpi: int) -> 
                 return
         except OSError:
             pass
-    import fitz
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    # matrix=zoom scales in 72-DPI units: 1.0 = 72 DPI. So dpi/72 is the
-    # zoom factor. fitz renders a single page on demand without pulling
-    # the whole document into memory.
     zoom = max(0.5, min(dpi / 72.0, 4.0))
     matrix = fitz.Matrix(zoom, zoom)
-    doc = fitz.open(str(source_path))
+    doc = _get_cached_doc(source_path)
     try:
         if page < 1 or page > doc.page_count:
             raise ValueError(f"Page {page} out of range (1..{doc.page_count})")
         page_obj = doc.load_page(page - 1)
         pix = page_obj.get_pixmap(matrix=matrix, alpha=False)
-        # PyMuPDF supports tobytes() with output=png natively. We
-        # re-encode through PIL with optimize + 8-bit palette mode to
-        # get a much smaller file (a 110-DPI A4 page is ~250 KB
-        # instead of the 1+ MB raw fitz output).
         from PIL import Image
         import io
         raw = pix.tobytes(output=THUMB_FORMAT)
