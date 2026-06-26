@@ -2666,16 +2666,32 @@ async function renderThumbsDocument(task, meta, renderToken) {
     els.sourceViewer.appendChild(flow);
 
     const pages = meta.pages;
-    const A4_HEIGHT_PX = 1240;        // matches the default 90-DPI thumb
+    // Hard cap on placeholders we'll create at once. Past this many
+    // pages, building DOM nodes + observing them costs more than the
+    // browser can chew. We show the first N and a footer button to
+    // load the rest in chunks.
+    const PAGE_RENDER_CAP = 150;
+    const totalAvailable = pages.length;
+    const renderCount = Math.min(totalAvailable, PAGE_RENDER_CAP);
+    const visiblePages = pages.slice(0, renderCount);
+
+    // Place each placeholder at a smaller height than the full-resolution
+    // thumb. A 346-page PDF at 1750px each = 600,000px tall scroll
+    // container, which the browser can't smoothly scroll. We use
+    // ~500-600px and content-visibility:auto so off-screen pages
+    // aren't actually painted.
+    const placeholderWidth = Math.min(900, Math.max(400, els.sourceViewer.clientWidth - 40));
     const pageWrappers = [];
-    for (const page of pages) {
+    for (const page of visiblePages) {
         const wrap = document.createElement('div');
         wrap.className = 'pdf-page-wrap pdf-page-placeholder';
         wrap.dataset.page = String(page.page);
         // Use the page's actual aspect ratio so the placeholder is the
         // right height before the image arrives — no jumpy layout.
         const aspect = page.heightPt / Math.max(1, page.widthPt);
-        wrap.style.minHeight = `${Math.round(A4_HEIGHT_PX * aspect)}px`;
+        wrap.style.minHeight = `${Math.round(placeholderWidth * aspect)}px`;
+        wrap.style.maxWidth = `${placeholderWidth}px`;
+        wrap.style.margin = '0 auto';
         const canvasBox = document.createElement('div');
         canvasBox.className = 'pdf-canvas-box';
         const placeholderText = document.createElement('div');
@@ -2689,36 +2705,138 @@ async function renderThumbsDocument(task, meta, renderToken) {
         flow.appendChild(wrap);
         pageWrappers[page.page] = wrap;
     }
+    if (totalAvailable > renderCount) {
+        // Footer: explain we capped, offer to load more.
+        const more = document.createElement('div');
+        more.className = 'source-load-more';
+        more.innerHTML = `
+            <p>已加载 ${renderCount} / ${totalAvailable} 页</p>
+            <button type="button" class="secondary-button" id="source-load-more-btn">再加载 ${Math.min(PAGE_RENDER_CAP, totalAvailable - renderCount)} 页</button>
+        `;
+        flow.appendChild(more);
+        more.querySelector('#source-load-more-btn')?.addEventListener('click', () => {
+            const nextChunk = pages.slice(renderCount, renderCount + PAGE_RENDER_CAP);
+            more.remove();
+            const moreWrappers = [];
+            for (const page of nextChunk) {
+                const wrap = document.createElement('div');
+                wrap.className = 'pdf-page-wrap pdf-page-placeholder';
+                wrap.dataset.page = String(page.page);
+                const aspect = page.heightPt / Math.max(1, page.widthPt);
+                wrap.style.minHeight = `${Math.round(placeholderWidth * aspect)}px`;
+                wrap.style.maxWidth = `${placeholderWidth}px`;
+                wrap.style.margin = '0 auto';
+                const canvasBox = document.createElement('div');
+                canvasBox.className = 'pdf-canvas-box';
+                const ph = document.createElement('div');
+                ph.className = 'pdf-page-placeholder-text';
+                ph.textContent = `${page.page}`;
+                canvasBox.appendChild(ph);
+                wrap.appendChild(canvasBox);
+                flow.appendChild(wrap);
+                moreWrappers[page.page] = wrap;
+                pageWrappers[page.page] = wrap;
+            }
+            observeThumbPages(task, moreWrappers);
+            // Re-attach the footer if there are still more pages.
+            renderThumbsLoadMoreFooter(task, pages, pageWrappers, renderCount + nextChunk.length, totalAvailable, flow, placeholderWidth, PAGE_RENDER_CAP);
+        });
+    }
     observeThumbPages(task, pageWrappers);
     scrollPdfPageIntoView(currentPage, 'auto');
     resetSplitHorizontalScroll();
     updateCurrentPageFromScroll();
 }
 
+function renderThumbsLoadMoreFooter(task, pages, pageWrappers, loadedCount, totalAvailable, flow, placeholderWidth, chunkSize) {
+    if (loadedCount >= totalAvailable) return;
+    const more = document.createElement('div');
+    more.className = 'source-load-more';
+    const nextSize = Math.min(chunkSize, totalAvailable - loadedCount);
+    more.innerHTML = `
+        <p>已加载 ${loadedCount} / ${totalAvailable} 页</p>
+        <button type="button" class="secondary-button" id="source-load-more-btn">再加载 ${nextSize} 页</button>
+    `;
+    flow.appendChild(more);
+    more.querySelector('#source-load-more-btn')?.addEventListener('click', () => {
+        const nextChunk = pages.slice(loadedCount, loadedCount + chunkSize);
+        more.remove();
+        const moreWrappers = [];
+        for (const page of nextChunk) {
+            const wrap = document.createElement('div');
+            wrap.className = 'pdf-page-wrap pdf-page-placeholder';
+            wrap.dataset.page = String(page.page);
+            const aspect = page.heightPt / Math.max(1, page.widthPt);
+            wrap.style.minHeight = `${Math.round(placeholderWidth * aspect)}px`;
+            wrap.style.maxWidth = `${placeholderWidth}px`;
+            wrap.style.margin = '0 auto';
+            const canvasBox = document.createElement('div');
+            canvasBox.className = 'pdf-canvas-box';
+            const ph = document.createElement('div');
+            ph.className = 'pdf-page-placeholder-text';
+            ph.textContent = `${page.page}`;
+            canvasBox.appendChild(ph);
+            wrap.appendChild(canvasBox);
+            flow.appendChild(wrap);
+            moreWrappers[page.page] = wrap;
+            pageWrappers[page.page] = wrap;
+        }
+        observeThumbPages(task, moreWrappers);
+        renderThumbsLoadMoreFooter(task, pages, pageWrappers, loadedCount + nextChunk.length, totalAvailable, flow, placeholderWidth, chunkSize);
+    });
+}
+
 // Lazy-load thumbs as they enter the viewport. ~3-page buffer either
 // side keeps scrolling smooth without preloading the whole book.
 function observeThumbPages(task, pageWrappers) {
     if (thumbObserver) thumbObserver.disconnect();
+    // Tiny in-flight concurrency limit so a 300-page PDF doesn't
+    // blast 50 simultaneous requests at the server (which slow each
+    // other down because each cold worker thread pays the fitz.open
+    // cost). 4 is a sweet spot — browsers cap HTTP/1.1 same-origin
+    // at 6, and PaddleOCR's anyio threadpool can serve 4 in parallel
+    // before contention shows up.
+    const inFlight = new Set();
+    const waiting = [];
+    const MAX_INFLIGHT = 4;
+    const drainQueue = () => {
+        while (inFlight.size < MAX_INFLIGHT && waiting.length > 0) {
+            const fn = waiting.shift();
+            fn();
+        }
+    };
+    const fetchThumb = (wrap, pageNumber) => {
+        const tag = `${task.id}/${pageNumber}`;
+        inFlight.add(tag);
+        const img = document.createElement('img');
+        img.className = 'thumb-image';
+        img.alt = `${task.name} - page ${pageNumber}`;
+        img.loading = 'lazy';
+        img.src = `${API_BASE}/tasks/${encodeURIComponent(task.id)}/thumb/${pageNumber}`;
+        const cleanup = () => {
+            inFlight.delete(tag);
+            drainQueue();
+        };
+        img.onload = () => {
+            wrap.classList.remove('pdf-page-placeholder');
+            const text = wrap.querySelector('.pdf-page-placeholder-text');
+            if (text) text.remove();
+            cleanup();
+        };
+        img.onerror = cleanup;
+        const box = wrap.querySelector('.pdf-canvas-box');
+        if (box) box.appendChild(img);
+    };
     thumbObserver = new IntersectionObserver((entries) => {
         for (const entry of entries) {
-            if (entry.isIntersecting) {
-                const wrap = entry.target;
-                if (wrap.dataset.thumbLoaded === '1') continue;
-                wrap.dataset.thumbLoaded = '1';
-                const pageNumber = Number(wrap.dataset.page);
-                const img = document.createElement('img');
-                img.className = 'thumb-image';
-                img.alt = `${task.name} - page ${pageNumber}`;
-                img.loading = 'lazy';
-                img.src = `${API_BASE}/tasks/${encodeURIComponent(task.id)}/thumb/${pageNumber}`;
-                img.onload = () => {
-                    wrap.classList.remove('pdf-page-placeholder');
-                    const text = wrap.querySelector('.pdf-page-placeholder-text');
-                    if (text) text.remove();
-                };
-                const box = wrap.querySelector('.pdf-canvas-box');
-                if (box) box.appendChild(img);
-            }
+            if (!entry.isIntersecting) continue;
+            const wrap = entry.target;
+            if (wrap.dataset.thumbLoaded === '1') continue;
+            wrap.dataset.thumbLoaded = '1';
+            const pageNumber = Number(wrap.dataset.page);
+            const run = () => fetchThumb(wrap, pageNumber);
+            if (inFlight.size < MAX_INFLIGHT) run();
+            else waiting.push(run);
         }
     }, { root: els.sourceViewer, rootMargin: '300px 0px', threshold: 0.01 });
     Object.values(pageWrappers).forEach((wrap) => thumbObserver.observe(wrap));

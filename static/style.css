@@ -981,6 +981,11 @@ svg {
     max-width: none;
     min-width: 0;
     margin: 0 auto;
+    /* Skip rendering for off-screen pages — huge win for 300+ page
+       documents. The browser uses contain-intrinsic-size as a stand-in
+       so scroll position is correct even when content isn't rendered. */
+    content-visibility: auto;
+    contain-intrinsic-size: auto 600px;
 }
 
 .pdf-canvas-box {
@@ -2411,4 +2416,22 @@ body.task-select-mode .task-item.checked {
     height: auto;
     background: #fff;
     box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+}
+
+/* ── Source load-more footer (chunked thumbs) ──────────────────── */
+
+.source-load-more {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 10px;
+    padding: 24px 16px;
+    color: var(--muted);
+    font-size: 13px;
+    border-top: 1px dashed var(--line);
+    margin-top: 12px;
+}
+
+.source-load-more p {
+    margin: 0;
 }
