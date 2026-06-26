@@ -30,6 +30,8 @@ let selectedModelId = localStorage.getItem(MODEL_STORAGE_KEY) || DEFAULT_MODEL_I
 let tasks = [];
 let activeTaskId = null;
 let activeFilter = 'all';
+let taskSelectionMode = false;
+const selectedTaskIds = new Set();
 let activeResultView = 'markdown';
 let isProcessing = false;
 let currentPdf = null;
@@ -95,6 +97,14 @@ const els = {
     batchSkipBtn: document.getElementById('batch-skip-btn'),
     batchRetryBtn: document.getElementById('batch-retry-btn'),
     batchStopBtn: document.getElementById('batch-stop-btn'),
+    taskSelectModeBtn: document.getElementById('task-select-mode-btn'),
+    taskSelectBar: document.getElementById('task-select-bar'),
+    taskSelectAllCb: document.getElementById('task-select-all-cb'),
+    taskSelectCounter: document.getElementById('task-select-counter'),
+    taskSelectCancel: document.getElementById('task-select-cancel'),
+    taskSelectParse: document.getElementById('task-select-parse'),
+    taskSelectMove: document.getElementById('task-select-move'),
+    taskSelectDelete: document.getElementById('task-select-delete'),
     dropZone: document.getElementById('drop-zone'),
     taskList: document.getElementById('task-list'),
     taskSearch: document.getElementById('task-search'),
@@ -223,6 +233,19 @@ function setupEventListeners() {
     els.batchRetryBtn?.addEventListener('click', () => {
         retryFailedBatchJobs();
     });
+
+    // Multi-select mode (batch parse / move / delete existing tasks).
+    els.taskSelectModeBtn?.addEventListener('click', () => toggleTaskSelectionMode());
+    els.taskSelectCancel?.addEventListener('click', () => toggleTaskSelectionMode(false));
+    els.taskSelectAllCb?.addEventListener('change', () => {
+        if (els.taskSelectAllCb.checked) selectAllVisibleTasks();
+        else clearTaskSelection();
+        renderTaskList();
+        updateSelectionBar();
+    });
+    els.taskSelectParse?.addEventListener('click', () => batchParseSelected());
+    els.taskSelectMove?.addEventListener('click', () => batchMoveSelected());
+    els.taskSelectDelete?.addEventListener('click', () => batchDeleteSelected());
 
     ['dragenter', 'dragover'].forEach((name) => {
         document.addEventListener(name, (event) => {
@@ -1950,6 +1973,18 @@ function renderTaskList() {
         item.dataset.taskId = task.id;
         item.classList.toggle('active', task.id === activeTaskId);
         item.classList.add(`status-${taskVisualStatus(task)}`);
+        const checkbox = item.querySelector('.task-checkbox');
+        if (checkbox) {
+            checkbox.checked = selectedTaskIds.has(task.id);
+            if (checkbox.checked) item.classList.add('checked');
+            checkbox.addEventListener('click', (event) => event.stopPropagation());
+            checkbox.addEventListener('change', () => {
+                if (checkbox.checked) selectedTaskIds.add(task.id);
+                else selectedTaskIds.delete(task.id);
+                item.classList.toggle('checked', checkbox.checked);
+                updateSelectionBar();
+            });
+        }
         item.querySelector('.task-icon').innerHTML = taskIcon(task);
         item.querySelector('.task-name').textContent = task.name;
         const folderTag = task.folderName
@@ -1960,10 +1995,31 @@ function renderTaskList() {
         const deleteButton = item.querySelector('.task-delete');
         deleteButton.setAttribute('title', t('删除任务'));
         deleteButton.setAttribute('aria-label', t('删除任务'));
-        item.addEventListener('click', () => selectTask(task.id));
+        item.addEventListener('click', (event) => {
+            // In selection mode, clicking the row toggles the checkbox
+            // rather than opening the task — except clicks on the row's
+            // own controls (handled via stopPropagation above).
+            if (taskSelectionMode) {
+                const cb = item.querySelector('.task-checkbox');
+                if (cb) {
+                    cb.checked = !cb.checked;
+                    cb.dispatchEvent(new Event('change'));
+                }
+                return;
+            }
+            selectTask(task.id);
+        });
         item.addEventListener('keydown', (event) => {
             if (event.key === 'Enter' || event.key === ' ') {
                 event.preventDefault();
+                if (taskSelectionMode) {
+                    const cb = item.querySelector('.task-checkbox');
+                    if (cb) {
+                        cb.checked = !cb.checked;
+                        cb.dispatchEvent(new Event('change'));
+                    }
+                    return;
+                }
                 selectTask(task.id);
             }
         });
@@ -1971,8 +2027,9 @@ function renderTaskList() {
             event.stopPropagation();
             await deleteTask(task.id);
         });
-        // Drag support for moving task to folder
-        setupTaskDragDrop(item, task.id);
+        // Drag support for moving task to folder (disabled while
+        // multi-selecting so users don't accidentally drag a checked row).
+        if (!taskSelectionMode) setupTaskDragDrop(item, task.id);
         // Right-click context menu for folder assignment
         item.addEventListener('contextmenu', (e) => {
             e.preventDefault();
@@ -1980,6 +2037,121 @@ function renderTaskList() {
         });
         els.taskList.appendChild(item);
     }
+}
+
+// ── Task multi-selection ──────────────────────────────────────────
+//
+// Lets the user pick existing tasks from the sidebar and run them in a
+// single batch. Drives the same batchQueue used by the upload path so
+// pause / skip / retry all keep working.
+
+function getVisibleTasks() {
+    const keyword = els.taskSearch.value.trim().toLowerCase();
+    return tasks.filter((task) => {
+        if (activeFilter === 'done' && task.status !== 'completed') return false;
+        if (activeFolderId && task.folderId !== activeFolderId) return false;
+        return !keyword || task.name.toLowerCase().includes(keyword);
+    });
+}
+
+function toggleTaskSelectionMode(forceOn) {
+    const next = typeof forceOn === 'boolean' ? forceOn : !taskSelectionMode;
+    taskSelectionMode = next;
+    document.body.classList.toggle('task-select-mode', next);
+    if (!next) clearTaskSelection();
+    if (els.taskSelectBar) els.taskSelectBar.classList.toggle('hidden', !next);
+    if (els.taskSelectModeBtn) {
+        els.taskSelectModeBtn.classList.toggle('success', next);
+        els.taskSelectModeBtn.setAttribute(
+            'title',
+            next ? t('退出多选') : t('多选 / 批量解析现有文件')
+        );
+    }
+    renderTaskList();
+    updateSelectionBar();
+}
+
+function clearTaskSelection() {
+    selectedTaskIds.clear();
+}
+
+function selectAllVisibleTasks() {
+    selectedTaskIds.clear();
+    for (const task of getVisibleTasks()) selectedTaskIds.add(task.id);
+}
+
+function updateSelectionBar() {
+    if (!els.taskSelectBar) return;
+    const count = selectedTaskIds.size;
+    const visibleCount = getVisibleTasks().length;
+    if (els.taskSelectCounter) {
+        els.taskSelectCounter.textContent = t('已选 {n}', { n: count });
+    }
+    if (els.taskSelectAllCb) {
+        els.taskSelectAllCb.checked = count > 0 && count === visibleCount;
+        els.taskSelectAllCb.indeterminate = count > 0 && count < visibleCount;
+    }
+    const disabled = count === 0;
+    if (els.taskSelectParse) els.taskSelectParse.disabled = disabled;
+    if (els.taskSelectMove) els.taskSelectMove.disabled = disabled;
+    if (els.taskSelectDelete) els.taskSelectDelete.disabled = disabled;
+}
+
+function batchParseSelected() {
+    if (selectedTaskIds.size === 0) return;
+    const ids = Array.from(selectedTaskIds);
+    // enqueueTasks → processTask(confirmCompleted:false) — already-done
+    // tasks get re-parsed from scratch without an "are you sure?" prompt.
+    enqueueTasks(ids);
+    toggleTaskSelectionMode(false);
+}
+
+async function batchMoveSelected() {
+    if (selectedTaskIds.size === 0) return;
+    const choices = [t('（移到根目录 / 全部文件）'), ...folders.map((f) => f.name)];
+    const message = t('要把选中的 {n} 个文件移到哪个文件夹？\n输入序号：\n{list}', {
+        n: selectedTaskIds.size,
+        list: choices.map((label, idx) => `${idx}. ${label}`).join('\n'),
+    });
+    const raw = prompt(message, '0');
+    if (raw == null) return;
+    const idx = Number.parseInt(raw, 10);
+    if (Number.isNaN(idx) || idx < 0 || idx >= choices.length) {
+        alert(t('无效的序号。'));
+        return;
+    }
+    const targetFolderId = idx === 0 ? null : folders[idx - 1].id;
+    const ids = Array.from(selectedTaskIds);
+    for (const id of ids) {
+        try {
+            await moveTaskToFolder(id, targetFolderId);
+        } catch (err) {
+            console.error('Batch move failed for task', id, err);
+        }
+    }
+    await loadFolders();
+    renderTaskList();
+    toggleTaskSelectionMode(false);
+}
+
+async function batchDeleteSelected() {
+    if (selectedTaskIds.size === 0) return;
+    if (!confirm(t('确定删除选中的 {n} 个文件？此操作不可撤销。', { n: selectedTaskIds.size }))) return;
+    const ids = Array.from(selectedTaskIds);
+    for (const id of ids) {
+        try {
+            await deleteTaskById(id);
+        } catch (err) {
+            console.error('Batch delete failed for task', id, err);
+        }
+    }
+    tasks = tasks.filter((task) => !selectedTaskIds.has(task.id));
+    if (activeTaskId && selectedTaskIds.has(activeTaskId)) {
+        activeTaskId = tasks[0]?.id || null;
+        if (activeTaskId) await selectTask(activeTaskId);
+        else resetWorkbench();
+    }
+    toggleTaskSelectionMode(false);
 }
 
 async function deleteTask(taskId) {
