@@ -88,6 +88,10 @@ For single-GPU machines, the Docker deployment keeps only one OCR model hot-load
 - Supports parsing options including layout detection, chart recognition, document rectification, orientation recognition, seal recognition, formula numbering, and Markdown tag ignoring.
 - Downloads package both Markdown output and OCR-extracted images.
 - **Large file support**: Files over 1GB are processed in streaming batches to avoid OOM; supports resuming parsing from the last checkpoint after interruption.
+- **Mobile-responsive UI**: Phone/tablet views automatically collapse the sidebar into a drawer and switch between Source / Result panes via a sticky tab control. Buttons are at least 40×40px for comfortable touch targets, and the Copy button is compatible with iOS Safari.
+- **Batch parse queue**: Select multiple files (or drop an entire folder) at once and they are auto-grouped under a sidebar folder and parsed serially. The queue bar provides Pause, Skip, Retry-failed, and Stop controls. The queue persists across page refreshes and comes back in a paused state so the user can press Continue when ready.
+- **Bulk operations on existing tasks**: The task list supports a multi-select mode (checkmark icon next to the search box) for batch parsing, moving to folder, or deleting existing tasks.
+- **Deferred source render**: Launching the app no longer auto-renders the previously selected PDF — this avoids freezing the page on big files. A lightweight placeholder card is shown instead; press "Load source" to render the PDF on demand.
 
 ## Deployment
 
