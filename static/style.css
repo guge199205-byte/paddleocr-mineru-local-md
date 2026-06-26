@@ -2323,3 +2323,81 @@ body.task-select-mode .task-item.checked {
     width: 100%;
     max-width: 200px;
 }
+
+/* ── PDF load progress overlay (with cancel) ────────────────────── */
+
+.source-load-progress {
+    height: 100%;
+    min-height: 280px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    color: var(--text);
+}
+
+.source-load-spinner {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    border: 3px solid var(--brand-soft);
+    border-top-color: var(--brand);
+    animation: spin .9s linear infinite;
+}
+
+.source-load-label {
+    color: var(--muted);
+    font-size: 13px;
+    font-variant-numeric: tabular-nums;
+}
+
+.source-load-bar {
+    width: min(320px, 70%);
+    height: 6px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: var(--brand-soft);
+}
+
+.source-load-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--brand);
+    transition: width .2s ease;
+}
+
+.source-load-progress .secondary-button {
+    height: 32px;
+    padding: 0 18px;
+    font-size: 13px;
+}
+
+/* ── Source preview warning (large file) ────────────────────────── */
+
+.source-preview-warning {
+    margin: 4px 0 0;
+    color: var(--warning);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.source-preview-tips {
+    margin: 0 0 4px;
+    padding-left: 18px;
+    text-align: left;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+.source-preview-tips li {
+    margin-bottom: 2px;
+}
+
+.source-preview-actions {
+    display: flex;
+    gap: 8px;
+    width: 100%;
+    justify-content: center;
+}

@@ -2430,6 +2430,15 @@ function showSourcePreviewPlaceholder(task) {
     viewer.innerHTML = '';
     const pageCount = task.pageCount || 1;
     const sizeLabel = formatSize(task.size || 0);
+    // Thresholds tuned for the in-browser PDF.js path: rendering 200+
+    // pages of placeholder DIVs + IntersectionObservers locks the main
+    // thread for a noticeable amount of time, and the user gets little
+    // out of it (they're usually about to look at the parsed result).
+    // Anything past this size should be viewed via the result pane or
+    // downloaded, not rendered in the browser.
+    const SOFT_LIMIT_PAGES = 200;
+    const SOFT_LIMIT_BYTES = 80 * 1024 * 1024;     // 80 MB
+    const isLarge = pageCount > SOFT_LIMIT_PAGES || (task.size || 0) > SOFT_LIMIT_BYTES;
     const placeholder = document.createElement('div');
     placeholder.className = 'source-preview-placeholder';
     placeholder.innerHTML = `
@@ -2440,9 +2449,20 @@ function showSourcePreviewPlaceholder(task) {
             </svg>
             <div class="source-preview-meta">
                 <strong>${escapeHtml(task.name)}</strong>
-                <span>${pageCount} 页 · ${sizeLabel}</span>
+                <span>${formatPageCount(pageCount)} · ${sizeLabel}${isLarge ? ' · 大文件' : ''}</span>
             </div>
-            <button type="button" class="primary-button" id="source-preview-load">加载源文件</button>
+            ${isLarge
+                ? `<p class="source-preview-warning">此文件较大（${formatPageCount(pageCount)} / ${sizeLabel}），直接在浏览器中渲染可能卡顿。建议：</p>
+                   <ul class="source-preview-tips">
+                       <li>直接在右侧查看解析结果</li>
+                       <li>点上方「下载」保存 Markdown 后用外部阅读器查看</li>
+                       <li>如确需对照源文件，点击下方「仍要加载」</li>
+                   </ul>
+                   <div class="source-preview-actions">
+                       <button type="button" class="primary-button" id="source-preview-load">仍要加载源文件</button>
+                   </div>`
+                : `<button type="button" class="primary-button" id="source-preview-load">加载源文件</button>`
+            }
         </div>
     `;
     viewer.appendChild(placeholder);
@@ -2601,16 +2621,72 @@ async function renderSource(task) {
     }
 
     currentPage = Math.min(Math.max(currentPage, 1), task.pageCount || 1);
-    els.pdfControls.classList.remove('hidden');
-    const pdf = task.sourceDataUrl
-        ? await loadPdf(dataUrlToUint8Array(task.sourceDataUrl))
-        : await loadPdf(task.sourceUrl);
+    els.pdfControls.classList.add('hidden');
+    // Show a progress bar with a Cancel button so a slow render
+    // doesn't look like a frozen page.
+    const showProgress = (label) => {
+        els.sourceViewer.innerHTML = `
+            <div class="source-load-progress">
+                <div class="source-load-spinner"></div>
+                <div class="source-load-label">${escapeHtml(label)}</div>
+                <div class="source-load-bar"><div class="source-load-bar-fill"></div></div>
+                <button type="button" class="secondary-button" id="source-load-cancel">取消</button>
+            </div>
+        `;
+    };
+    showProgress(t('正在加载 PDF...'));
+    const cancelBtn = () => document.getElementById('source-load-cancel');
+    let cancelled = false;
+    const onCancel = () => { cancelled = true; sourceRenderToken++; };
+    cancelBtn()?.addEventListener('click', onCancel);
+
+    let pdf;
+    try {
+        if (task.sourceDataUrl) {
+            // dataUrl path: buffer is already in memory, no progress.
+            pdf = await loadPdf(dataUrlToUint8Array(task.sourceDataUrl));
+        } else {
+            // url path: use PDF.js streaming with a progress callback.
+            // onProgress fires repeatedly with {loaded, total} as bytes
+            // arrive. We bail out of the await loop if the user clicked
+            // cancel by checking `cancelled` after each chunk.
+            pdf = await loadPdfWithProgress(task.sourceUrl, ({ loaded, total }) => {
+                if (cancelled) throw new Error('cancelled');
+                if (total > 0) {
+                    const fill = els.sourceViewer.querySelector('.source-load-bar-fill');
+                    const label = els.sourceViewer.querySelector('.source-load-label');
+                    if (fill) fill.style.width = `${Math.min(100, Math.round(loaded / total * 100))}%`;
+                    if (label) {
+                        label.textContent = t('正在下载 {done} / {total}', {
+                            done: formatSize(loaded), total: formatSize(total)
+                        });
+                    }
+                } else {
+                    const label = els.sourceViewer.querySelector('.source-load-label');
+                    if (label) label.textContent = t('正在下载… {done}', { done: formatSize(loaded) });
+                }
+            });
+        }
+    } catch (err) {
+        if (cancelled) {
+            // User clicked cancel; fall back to the lightweight placeholder
+            // so the workbench still has a friendly state.
+            if (renderToken === sourceRenderToken) showSourcePreviewPlaceholder(task);
+            return;
+        }
+        console.error('PDF load failed', err);
+        if (renderToken === sourceRenderToken) {
+            els.sourceViewer.innerHTML = `<div class="empty-result">${escapeHtml(err.message || t('PDF 加载失败'))}</div>`;
+        }
+        return;
+    }
     if (renderToken !== sourceRenderToken) return;
     const firstPage = await pdf.getPage(1);
     if (renderToken !== sourceRenderToken) return;
     pdfDefaultPageWidth = firstPage.getViewport({ scale: 1 }).width || PDF_DEFAULT_PAGE_WIDTH;
     currentZoom = getDefaultPdfZoom();
     currentPdf = pdf;
+    els.pdfControls.classList.remove('hidden');
     await renderPdfDocument(renderToken);
 }
 
@@ -2874,6 +2950,19 @@ function showResultView(view) {
     const showJson = view === 'json';
     els.markdownView.classList.toggle('hidden', showJson);
     els.jsonView.classList.toggle('hidden', !showJson);
+    // Free up the source PDF memory when the user is clearly more
+    // interested in the parsed JSON. They can re-open the source via
+    // the task list whenever they want — PDF.js will re-stream it.
+    if (showJson && currentPdf) {
+        try { currentPdf.destroy(); } catch (_) {}
+        currentPdf = null;
+        if (els.sourceViewer && !els.sourceViewer.querySelector('.source-preview-placeholder')) {
+            // Re-render the preview placeholder so the workbench
+            // doesn't show a blank pane for the source viewer.
+            const task = getActiveTask();
+            if (task) showSourcePreviewPlaceholder(task);
+        }
+    }
 }
 
 function renderResultPane(task, { deferJson = false, preserveScroll = true } = {}) {
@@ -6309,6 +6398,24 @@ function loadPdf(source) {
     opts.standardFontDataUrl = '/static/vendor/pdfjs/standard_fonts/';
     opts.useSystemFonts = true;
     return pdfjsLib.getDocument(opts).promise;
+}
+
+// Streaming variant for large remote PDFs — onProgress fires as the
+// PDF.js worker pulls bytes over the network, so we can show a real
+// progress bar. Throwing from onProgress aborts the load (used by the
+// Cancel button).
+function loadPdfWithProgress(url, onProgress) {
+    return new Promise((resolve, reject) => {
+        const loadingTask = pdfjsLib.getDocument({
+            url,
+            cMapUrl: '/static/vendor/pdfjs/cmaps/',
+            cMapPacked: true,
+            standardFontDataUrl: '/static/vendor/pdfjs/standard_fonts/',
+            useSystemFonts: true,
+        });
+        loadingTask.onProgress = onProgress || (() => {});
+        loadingTask.promise.then(resolve, reject);
+    });
 }
 
 function createId() {
