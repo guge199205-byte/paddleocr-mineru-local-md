@@ -188,6 +188,10 @@ svg {
     cursor: not-allowed;
 }
 
+.unlimited-backend-wrap select {
+    width: 132px;
+}
+
 .model-pill {
     min-width: 220px;
     display: flex;
@@ -1074,6 +1078,17 @@ svg {
     outline: 2px solid #e8590c;
     outline-offset: 1px;
     cursor: text;
+}
+
+.source-highlight-box-streaming {
+    border-color: #315bff;
+    background: rgba(49, 91, 255, 0.18);
+    box-shadow: 0 0 0 1px rgba(49, 91, 255, 0.16);
+    transition: top 120ms linear, left 120ms linear, width 120ms linear, height 120ms linear;
+}
+
+.source-highlight-box-streaming .source-highlight-label {
+    background: #315bff;
 }
 
 .source-link-hotspot {

@@ -90,6 +90,92 @@
         }
       }
     },
+    "/api/model-runtime/deploy": {
+      "post": {
+        "summary": "Deploy Model Runtime",
+        "operationId": "deploy_model_runtime_api_model_runtime_deploy_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelDeployRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/unlimited-ocr/backend": {
+      "get": {
+        "summary": "Get Unlimited Ocr Backend",
+        "operationId": "get_unlimited_ocr_backend_api_unlimited_ocr_backend_get",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "summary": "Switch Unlimited Ocr Backend",
+        "operationId": "switch_unlimited_ocr_backend_api_unlimited_ocr_backend_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UnlimitedOcrBackendRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/tasks/{task_id}/source": {
       "post": {
         "summary": "Upload Task Source",
@@ -444,6 +530,39 @@
           }
         }
       }
+    },
+    "/api/unlimited-ocr": {
+      "post": {
+        "summary": "Proxy Unlimited Ocr",
+        "description": "Proxy request to the optional Unlimited-OCR adapter service.",
+        "operationId": "proxy_unlimited_ocr_api_unlimited_ocr_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/unlimited-ocr/stream": {
+      "post": {
+        "summary": "Proxy Unlimited Ocr Stream",
+        "operationId": "proxy_unlimited_ocr_stream_api_unlimited_ocr_stream_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -489,6 +608,30 @@
         "type": "object",
         "title": "HTTPValidationError"
       },
+      "ModelDeployRequest": {
+        "properties": {
+          "modelId": {
+            "type": "string",
+            "title": "Modelid"
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Backend"
+          }
+        },
+        "type": "object",
+        "required": [
+          "modelId"
+        ],
+        "title": "ModelDeployRequest"
+      },
       "ModelSwitchRequest": {
         "properties": {
           "modelId": {
@@ -501,6 +644,19 @@
           "modelId"
         ],
         "title": "ModelSwitchRequest"
+      },
+      "UnlimitedOcrBackendRequest": {
+        "properties": {
+          "backend": {
+            "type": "string",
+            "title": "Backend"
+          }
+        },
+        "type": "object",
+        "required": [
+          "backend"
+        ],
+        "title": "UnlimitedOcrBackendRequest"
       },
       "ValidationError": {
         "properties": {

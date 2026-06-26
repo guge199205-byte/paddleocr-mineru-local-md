@@ -1,7 +1,9 @@
+import asyncio
 import importlib
 import io
 import json
 import os
+import tarfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -95,9 +97,10 @@ class ServerTaskApiTests(unittest.TestCase):
         model_ids = [model["id"] for model in response.json()["data"]]
         self.assertIn("paddleocr-vl-1.6", model_ids)
         self.assertIn("pp-ocrv6", model_ids)
+        self.assertNotIn("unlimited-ocr", model_ids)
 
     def test_model_runtime_reports_both_models(self):
-        with patch.object(self.server, "check_http_health", new=AsyncMock(return_value=False)):
+        with patch.object(self.server, "fetch_http_health", new=AsyncMock(return_value=(False, {}))):
             response = self.client.get("/api/model-runtime")
         self.assertEqual(response.status_code, 200)
         payload = response.json()
@@ -112,6 +115,60 @@ class ServerTaskApiTests(unittest.TestCase):
         with patch.object(self.server, "model_control_available", return_value=False):
             response = self.client.post("/api/model-runtime/switch", json={"modelId": "pp-ocrv6"})
         self.assertEqual(response.status_code, 503)
+
+    def test_dynamic_docker_build_context_uses_project_dockerfiles(self):
+        context = self.server.make_docker_build_context("unlimited-ocr-sglang")
+        with tarfile.open(fileobj=io.BytesIO(context), mode="r") as tar:
+            self.assertIn("Dockerfile", tar.getnames())
+            self.assertIn("unlimited_ocr_adapter.py", tar.getnames())
+            dockerfile = tar.extractfile("Dockerfile").read().decode("utf-8")
+
+        expected = (self.server.PROJECT_ROOT / "Dockerfile.unlimited-ocr-sglang").read_text(encoding="utf-8")
+        self.assertEqual(dockerfile, expected)
+        self.assertEqual(
+            self.server.docker_build_args_for("unlimited-ocr-sglang"),
+            {"UNLIMITED_OCR_SGLANG_WHEEL_URL": self.server.UNLIMITED_OCR_SGLANG_WHEEL_URL},
+        )
+        self.assertEqual(
+            self.server.docker_build_args_for("paddleocr-ocr-api"),
+            {"API_IMAGE_TAG_SUFFIX": self.server.API_IMAGE_TAG_SUFFIX},
+        )
+
+    def test_runtime_settings_can_persist_unlimited_ocr_backend(self):
+        settings_path = self.server.RUNTIME_SETTINGS_FILE
+        previous = settings_path.read_text(encoding="utf-8") if settings_path.exists() else None
+        try:
+            self.server.save_runtime_settings({"unlimitedOcrBackend": "sglang"})
+
+            self.assertEqual(self.server.load_runtime_settings()["unlimitedOcrBackend"], "sglang")
+            self.assertEqual(self.server.initial_unlimited_ocr_backend(), "sglang")
+        finally:
+            if previous is None:
+                settings_path.unlink(missing_ok=True)
+            else:
+                settings_path.write_text(previous, encoding="utf-8")
+
+    def test_unlimited_ocr_backend_switch_restores_previous_backend_on_failure(self):
+        previous_backend = self.server.unlimited_ocr_runtime_backend
+        previous_lock = self.server.model_runtime_lock
+        self.server.unlimited_ocr_runtime_backend = "sglang"
+        self.server.model_runtime_lock = asyncio.Lock()
+        ensure_mock = AsyncMock(side_effect=[RuntimeError("preload failed"), None])
+        try:
+            with (
+                patch.object(self.server, "model_runtime_status", new=AsyncMock(return_value={"running": True})),
+                patch.object(self.server, "ensure_unlimited_ocr_backend_runtime", new=ensure_mock),
+                patch.object(self.server.logger, "exception"),
+            ):
+                asyncio.run(self.server.activate_unlimited_ocr_backend("transformers"))
+
+            self.assertEqual(self.server.unlimited_ocr_runtime_backend, "sglang")
+            self.assertEqual([call.args[0] for call in ensure_mock.await_args_list], ["transformers", "sglang"])
+            self.assertEqual(self.server.model_runtime_operation["state"], "error")
+        finally:
+            self.server.unlimited_ocr_runtime_backend = previous_backend
+            self.server.model_runtime_lock = previous_lock
+            self.server.set_model_runtime_operation("idle", "", "paddleocr-vl-1.6")
 
     def test_cross_origin_mutation_is_rejected_without_allowlisted_origin(self):
         response = self.client.post(
@@ -165,6 +222,188 @@ class ServerTaskApiTests(unittest.TestCase):
         self.assertEqual(page["pageImage"], "base64-page-image")
         self.assertEqual(page["ocrLines"][0]["text"], "Hello")
         self.assertEqual(page["ocrLines"][0]["box"], [1, 2, 30, 10])
+
+    def test_unlimited_ocr_response_is_normalized_for_existing_frontend(self):
+        response = self.server.parse_unlimited_ocr_response(
+            {
+                "markdown": "# Parsed\n\nBody",
+                "layoutParsingResults": [
+                    {
+                        "parser": "unlimited-ocr",
+                        "markdown": {"text": "# Parsed\n\nBody", "images": {}},
+                    }
+                ],
+            }
+        )
+
+        self.assertEqual(response["markdown"], "# Parsed\n\nBody")
+        self.assertEqual(response["images"], {})
+        self.assertEqual(response["layoutParsingResults"][0]["parser"], "unlimited-ocr")
+
+    def test_unlimited_ocr_layout_tags_are_converted_to_markdown(self):
+        raw = (
+            "<|det|>header [1, 2, 3, 4]<|/det|>Baidu "
+            "<|det|>title [10, 20, 30, 40]<|/det|>Unlimited OCR Works "
+            "<|det|>title [10, 50, 30, 70]<|/det|>Abstract "
+            "<|det|>text [10, 80, 90, 120]<|/det|>Body text. "
+            "<|det|>image_caption [10, 130, 90, 150]<|/det|>Figure 1. Caption."
+        )
+        response = self.server.parse_unlimited_ocr_response({"markdown": raw})
+
+        self.assertNotIn("<|det|>", response["markdown"])
+        self.assertNotIn("Baidu", response["markdown"])
+        self.assertIn("# Unlimited OCR Works", response["markdown"])
+        self.assertIn("## Abstract", response["markdown"])
+        self.assertIn("Body text.", response["markdown"])
+        self.assertIn("*Figure 1. Caption.*", response["markdown"])
+
+    def test_unlimited_ocr_stream_position_tracks_page_reset(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        raw = (
+            "<|det|>text [10, 850, 900, 930]<|/det|>End of page one. "
+            "<|det|>text [10, 30, 900, 90]<|/det|>Start of page two."
+        )
+        position = adapter.streaming_source_position(raw, 2)
+
+        self.assertEqual(position["pageIndex"], 1)
+        self.assertEqual(position["pageNumber"], 2)
+        self.assertLess(position["pageProgress"], 0.1)
+        self.assertEqual(position["bbox"], [10.0, 30.0, 900.0, 90.0])
+        self.assertEqual(position["pageWidth"], 1000)
+        self.assertEqual(position["pageHeight"], 1000)
+
+    def test_unlimited_ocr_stream_position_uses_pdf_text_anchor_for_batch_pages(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        raw = (
+            "<|det|>text [100, 700, 900, 760]<|/det|>"
+            "Traditional OCR models adopt a pipeline architecture. "
+            "<|det|>image [100, 100, 500, 400]<|/det|>"
+        )
+        page_texts = [
+            adapter.normalize_anchor_text("Introduction and summary text."),
+            adapter.normalize_anchor_text("Traditional OCR models adopt a pipeline architecture for document parsing."),
+        ]
+
+        position = adapter.streaming_source_position(raw, 2, page_texts)
+
+        self.assertEqual(position["pageIndex"], 1)
+        self.assertEqual(position["pageNumber"], 2)
+        self.assertEqual(position["pageConfidence"], "text")
+
+    def test_unlimited_ocr_adapter_exposes_layout_blocks_for_frontend_mapping(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        raw = (
+            "<|det|>title [10, 20, 300, 60]<|/det|>Unlimited OCR Works "
+            "<|det|>text [20, 100, 900, 180]<|/det|>Body text."
+        )
+        response = adapter.build_adapter_response(raw, 1, 0, {"backend": "test"})
+        page = response["layoutParsingResults"][0]
+
+        self.assertEqual(page["parser"], "unlimited-ocr")
+        self.assertEqual(page["width"], 1000)
+        self.assertEqual(page["height"], 1000)
+        self.assertEqual(page["parsing_res_list"][0]["block_label"], "title")
+        self.assertEqual(page["parsing_res_list"][0]["block_bbox"], [10.0, 20.0, 300.0, 60.0])
+
+    def test_unlimited_ocr_image_crop_uses_independent_normalized_axes(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        from PIL import Image
+
+        box = adapter.scaled_crop_box([100, 200, 500, 600], Image.new("RGB", (2000, 3000)))
+
+        self.assertEqual(box, (184, 576, 1016, 1824))
+
+    def test_unlimited_ocr_streaming_markdown_can_include_images_once(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        from PIL import Image
+
+        image_buffer = io.BytesIO()
+        Image.new("RGB", (1000, 1000), "white").save(image_buffer, format="PNG")
+        raw = (
+            "<|det|>image [100, 100, 500, 500]<|/det|>"
+            "<|det|>image_caption [100, 520, 500, 560]<|/det|>Figure 1. Caption."
+        )
+
+        markdown, images = adapter.render_streaming_markdown(raw, [image_buffer.getvalue()])
+        sent_images = {}
+
+        self.assertIn("![image](ocr_images/unlimited_p1_image_1.png)", markdown)
+        self.assertIn("ocr_images/unlimited_p1_image_1.png", images)
+        self.assertEqual(adapter.unsent_images(images, sent_images), images)
+        self.assertEqual(adapter.unsent_images(images, sent_images), {})
+
+    def test_unlimited_ocr_sglang_payload_reserves_context_for_input(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+
+        payload = adapter.build_sglang_payload([b"not-real-image"], 1)
+
+        self.assertEqual(payload["images_config"]["backend"], "sglang")
+        self.assertLess(payload["max_tokens"], adapter.MAX_TOKENS)
+        self.assertIn("custom_logit_processor", payload)
+        self.assertEqual(payload["custom_params"]["ngram_size"], adapter.NO_REPEAT_NGRAM_SIZE)
+
+    def test_unlimited_ocr_sglang_context_error_can_reduce_max_tokens(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        payload = {"max_tokens": 32768, "images_config": {"backend": "sglang"}}
+        error_body = (
+            "Requested token count exceeds the model's maximum context length of 32768 tokens. "
+            "You requested a total of 35505 tokens: 2737 tokens from the input messages "
+            "and 32768 tokens for the completion."
+        )
+
+        adjusted = adapter.adjust_sglang_payload_for_context_error(payload, error_body)
+
+        self.assertIsNotNone(adjusted)
+        self.assertEqual(adjusted["max_tokens"], 32768 - 2737 - adapter.SGLANG_CONTEXT_TOKEN_RESERVE)
+        self.assertEqual(adjusted["images_config"]["max_tokens_adjusted_from"], 32768)
+
+    def test_unlimited_ocr_repetition_guard_flags_degenerate_output(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        repeated = " ".join(["attention weight normalization"] * 20)
+
+        self.assertEqual(adapter.detect_degenerate_repetition(repeated), "attention weight normalization")
+
+    def test_unlimited_ocr_repetition_guard_flags_dense_numbered_loop(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        repeated = " ".join(f"attention weight normalization {index}" for index in range(20))
+
+        self.assertEqual(adapter.detect_degenerate_repetition(repeated), "attention weight normalization")
+
+    def test_unlimited_ocr_repetition_guard_allows_reference_arxiv_phrase(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        references = " ".join(
+            (
+                f"[{index}] A. Author, B. Researcher, and C. Writer. "
+                f"A useful method for document parsing and visual models. "
+                f"arXiv preprint arXiv:{2400 + index}.01234, 2025."
+            )
+            for index in range(20)
+        )
+
+        self.assertIsNone(adapter.detect_degenerate_repetition(references))
+
+    def test_unlimited_ocr_extracts_layout_from_transformers_stdout(self):
+        adapter = importlib.import_module("unlimited_ocr_adapter")
+        stdout = (
+            "INFO:     127.0.0.1:123 - \"GET /health HTTP/1.1\" 200 OK\n"
+            "image: 100%|##########| 1/1 [00:00<00:00, 10it/s]\n"
+            "<|det|>title [10, 20, 30, 40]<|/det|>Title\n"
+            "<|det|>image [40, 50, 80, 100]<|/det|>\n"
+            "===============save results:===============\n"
+        )
+        extracted = adapter.extract_layout_text_from_transformers_stdout(stdout)
+
+        self.assertIn("<|det|>title", extracted)
+        self.assertIn("<|det|>image", extracted)
+        self.assertNotIn("GET /health", extracted)
+        self.assertNotIn("save results", extracted)
+
+    def test_unlimited_ocr_endpoint_is_disabled_by_default(self):
+        response = self.client.post(
+            "/api/unlimited-ocr",
+            json={"image": "AA==", "fileType": 1},
+        )
+        self.assertEqual(response.status_code, 404)
 
     def test_task_source_is_stored_outside_task_json_and_page_ranges_can_be_read(self):
         writer = PdfWriter()

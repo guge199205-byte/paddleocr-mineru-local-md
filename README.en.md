@@ -2,9 +2,9 @@
 
 **Language / 语言**: [简体中文](README.md) | English
 
-PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL, PP-OCRv6, and MinerU. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate PaddleOCR services. The NVIDIA path uses official Docker services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
+PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL, PP-OCRv6, MinerU, and optional Unlimited-OCR. The frontend handles file upload, queueing, preview, model switching, and download, while the FastAPI backend serves static files, converts Office files to PDF, and proxies requests. OCR inference runs in separate model services. The NVIDIA path uses Docker Compose to manage PaddleOCR / MinerU / Unlimited-OCR services, and the macOS Apple Silicon path uses local PaddleX/MLX services.
 
-**Four supported models:**
+**Four supported core models + one optional experimental model:**
 
 | Model | Use case | Notes |
 |-------|----------|-------|
@@ -12,6 +12,7 @@ PaddleOCR Local is a lightweight Web frontend for PaddleOCR-VL, PP-OCRv6, and Mi
 | PP-OCRv6 | Text recognition | Lightweight text-only OCR |
 | MinerU | Document parsing | MinerU2.5-Pro-2605-1.2B, hybrid engine |
 | GLM-OCR (Ollama) | Text recognition | Zhipu GLM-OCR model, requires Ollama |
+| Unlimited-OCR (optional) | Long-document parsing | Experimental integration with Transformers / SGLang backends and streaming output |
 
 On single-GPU deployments, the WebUI model selector automatically manages container start/stop, so only one model occupies VRAM at a time.
 
@@ -54,8 +55,10 @@ Browser
        - MinerU request proxy
        - GLM-OCR (Ollama) request proxy
        - Translation proxy (OpenAI-compatible API)
+       - optional Unlimited-OCR request/stream proxy
   -> PaddleOCR services
        - NVIDIA: paddleocr-vl-api + paddleocr-ocr-api + paddleocr-vlm-server in docker compose
+       - NVIDIA optional: unlimited-ocr-api + unlimited-ocr-sglang
        - macOS: local paddlex --serve, optionally with mlx_vlm.server
   -> MinerU service
        - NVIDIA: mineru-api in docker compose (profile: mineru)
@@ -64,6 +67,7 @@ Browser
 ```
 
 The NVIDIA Compose stack keeps five core services + two optional services:
+The NVIDIA Compose stack keeps four core services by default. Enabling the `unlimited-ocr` profile adds the optional Unlimited-OCR services:
 
 - `pandocr-web`
 - `paddleocr-vl-api`
@@ -73,16 +77,22 @@ The NVIDIA Compose stack keeps five core services + two optional services:
 - `ollama` (Docker profile `glm-ocr`, must be explicitly enabled; or use an existing Ollama instance)
 
 For single-GPU machines, the Docker deployment keeps only one OCR model hot-loaded by default. `pandocr-web` stays online and controls the model containers through the Docker socket: selecting `PaddleOCR-VL 1.6` starts `paddleocr-vlm-server` + `paddleocr-vl-api` and stops other model containers; selecting `PP-OCRv6` or `MinerU` does the reverse; selecting `GLM-OCR` does not require Docker container management — it connects directly to the Ollama service. The top bar UI polls this runtime state in real time, showing whether the model is ready, starting, stopped, or failed.
+- `unlimited-ocr-api`, optional experimental service
+- `unlimited-ocr-sglang`, only needed for the SGLang backend
+
+For single-GPU machines, the Docker deployment keeps only one OCR model hot-loaded by default. `pandocr-web` stays online and controls the model containers through the Docker socket: selecting `PaddleOCR-VL 1.6` starts `paddleocr-vlm-server` + `paddleocr-vl-api` and stops `paddleocr-ocr-api`; selecting `PP-OCRv6` does the reverse; selecting enabled `Unlimited-OCR` starts `unlimited-ocr-api` and starts `unlimited-ocr-sglang` only when the UI-selected backend is SGLang. The UI polls this runtime state in real time.
 
 ## Features
 
 - Supports image, PDF, PPT/PPTX, and DOC/DOCX uploads.
 - Supports model switching between `PaddleOCR-VL 1.6` document parsing, `PP-OCRv6` text OCR, `MinerU` document parsing, and `GLM-OCR` text recognition; Docker single-GPU deployments start and stop models on demand to avoid multiple models consuming VRAM simultaneously.
 - The left "Parsing Settings" panel automatically switches based on the currently selected model: PaddleOCR models show options for layout detection, chart recognition, document rectification, seal recognition, etc.; MinerU shows options for formula parsing, table parsing, image analysis, parsing method, etc.
+- Supports model switching between `PaddleOCR-VL 1.6` document parsing, `PP-OCRv6` text OCR, and optional `Unlimited-OCR` long-document parsing, with Docker-based on-demand start/stop for single-GPU deployments.
 - The WebUI supports one-click Chinese/English switching, remembers the user's choice, and keeps translations centralized in `static/i18n.js` for future languages.
 - **OCR result translation**: Translate OCR Markdown results into 20 languages (Simplified Chinese, Traditional Chinese, English, Japanese, Korean, French, German, Spanish, Portuguese, Russian, Arabic, Italian, Dutch, Polish, Turkish, Vietnamese, Thai, Indonesian, Malay, Hindi). Requires `PANDOCR_TRANSLATE_API_URL` and `PANDOCR_TRANSLATE_API_KEY` (OpenAI API compatible).
 - Sends PDFs to PaddleOCR-VL page by page, making it easier to compare with the official online parsing result and reliably keep the raw JSON for each page.
 - Renders PP-OCRv6 results with an official-style visual OCR layer: source/result pages stay aligned, scrolling and zooming are synchronized, recognized text can be copied or corrected, and raw JSON remains available.
+- Optionally integrates `Unlimited-OCR` with Transformers / SGLang backend switching, streaming output, synchronized source/result scrolling, and Markdown image recovery for `<|det|>image/chart` blocks.
 - Persists parsing tasks locally under `data/tasks/`, so history remains available after refreshing the page. Deleting a task also removes the local record.
 - Markdown preview supports horizontally scrollable tables, KaTeX math rendering, and correction for literal `\n` line breaks in OCR output.
 - Supports parsing options including layout detection, chart recognition, document rectification, orientation recognition, seal recognition, formula numbering, and Markdown tag ignoring.
@@ -92,6 +102,60 @@ For single-GPU machines, the Docker deployment keeps only one OCR model hot-load
 - **Batch parse queue**: Select multiple files (or drop an entire folder) at once and they are auto-grouped under a sidebar folder and parsed serially. The queue bar provides Pause, Skip, Retry-failed, and Stop controls. The queue persists across page refreshes and comes back in a paused state so the user can press Continue when ready.
 - **Bulk operations on existing tasks**: The task list supports a multi-select mode (checkmark icon next to the search box) for batch parsing, moving to folder, or deleting existing tasks.
 - **Deferred source render**: Launching the app no longer auto-renders the previously selected PDF — this avoids freezing the page on big files. A lightweight placeholder card is shown instead; press "Load source" to render the PDF on demand.
+
+### Optional Experimental Model: Unlimited-OCR
+
+The project includes an optional third-model integration path for `Unlimited-OCR`. It is disabled by default, so existing `PaddleOCR-VL 1.6` and `PP-OCRv6` one-click deployment, model switching, and API behavior remain unchanged. After enabling it, `Unlimited-OCR` appears in the model selector and uses the same runtime switching flow.
+
+Enable it for the NVIDIA Docker deployment:
+
+```powershell
+# 1. Enable it in env.txt or env.docker
+PANDOCR_ENABLE_UNLIMITED_OCR=1
+
+# 2. Create the optional Unlimited-OCR profile containers
+# If you only need Transformers, building unlimited-ocr-api is enough.
+# Build unlimited-ocr-sglang too if you want the UI to switch to SGLang.
+docker compose --env-file env.txt --profile unlimited-ocr build unlimited-ocr-api unlimited-ocr-sglang
+docker compose --env-file env.txt --profile unlimited-ocr up -d --no-start
+
+# 3. Start the WebUI, then switch to Unlimited-OCR from the top-right model selector
+docker compose --env-file env.txt start pandocr-web
+```
+
+The default backend is `UNLIMITED_OCR_BACKEND=transformers`, which is friendlier for personal PCs and follows the official Transformers `model.infer` / `model.infer_multi` path. When `Unlimited-OCR` is selected, the top bar shows a Backend selector for `Transformers` and `SGLang`. The last selected backend is persisted in `data/runtime-settings.json` and reused on the next startup. This runtime settings file is ignored by Git.
+
+Backend guidance:
+
+| Backend | Try first? | Best fit | Trade-offs |
+| --- | --- | --- | --- |
+| `Transformers` | Yes, recommended first | Personal NVIDIA PCs, Windows Docker, RTX 30/40/50 cards, and cases where you want the fewest kernel/runtime variables. | Cold start is slower because a Python process loads the model into GPU memory. Throughput/concurrency is not the main goal, but it is the most predictable deployment path. |
+| `SGLang` | Try after Transformers works | Always-on NVIDIA server setups, enough free VRAM, and users who specifically want an OpenAI-compatible streaming server path. | More environment-sensitive: it uses the official custom SGLang wheel, `kernels`, a separate `unlimited-ocr-sglang` service, custom logit processing, and an attention backend that must match the GPU/CUDA stack. |
+
+For most users, deploy `Transformers` first:
+
+```powershell
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend transformers
+```
+
+Then try SGLang only if the Transformers path is already working and you want to compare server-style streaming or throughput:
+
+```powershell
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend sglang
+```
+
+You can also deploy SGLang later from the WebUI: select `Unlimited-OCR`, choose or enter `sglang` when prompted, and the WebUI will build/create the missing `unlimited-ocr-sglang` container. If SGLang fails to build or stays in startup, switch back to `Transformers` in the Backend selector.
+
+SGLang environment knobs:
+
+- `UNLIMITED_OCR_ATTENTION_BACKEND=flashinfer` is this project's default because it is usually more forgiving on consumer GPUs and RTX 50 / SM120-style local setups.
+- The official SGLang example uses `--attention-backend fa3`. Try `fa3` only when your SGLang wheel, CUDA version, and GPU architecture support it; otherwise keep `flashinfer`.
+- If SGLang runs out of memory or stalls, close other GPU apps, keep PDF batch size at `1`, lower `UNLIMITED_OCR_MEM_FRACTION_STATIC` from `0.8` to `0.7`, or use `Transformers`.
+- If SGLang reports context-length errors, keep one page per request first. Multi-page one-shot requests are useful for research tests but are much more sensitive to context length and page alignment.
+
+Unlimited-OCR runs in the separate `unlimited-ocr-api` container. `pandocr-web` only proxies `/api/unlimited-ocr` and `/api/unlimited-ocr/stream`, so the heavy Unlimited-OCR dependencies do not enter the WebUI container. PDFs are rendered to 300 DPI page images inside the adapter. The default PDF batch size is 1; single-page requests use `gundam + ngram_window=128` and `no_repeat_ngram_size=35`. Larger manual PDF batches are sent as multi-page one-shot requests for research and stress testing, but are more sensitive to GPU memory, context length, and page alignment stability. The adapter crops official `<|det|>image/chart [bbox]<|/det|>` blocks back into Markdown images.
+
+The first run of either Transformers or SGLang downloads and loads `baidu/Unlimited-OCR`. Weights are cached in `model_cache_unlimited_ocr/`, so container restarts do not re-download them, but each new Python process still needs to load the model into GPU memory. By default, `UNLIMITED_OCR_PRELOAD=1` preloads the Transformers model in the background after `unlimited-ocr-api` starts; switching to SGLang unloads the Transformers weights and starts `unlimited-ocr-sglang`. This local setup defaults to `UNLIMITED_OCR_ATTENTION_BACKEND=flashinfer`; on hardware supported by the official `fa3` path, you can switch it back and rebuild/restart the SGLang container.
 
 ## Deployment
 
@@ -109,6 +173,7 @@ For Windows NVIDIA users, the recommended path is the one-click script:
 ```
 
 It checks Docker, detects the NVIDIA GPU, selects `env.txt` or `env.docker`, pulls the official PaddleOCR-VL images, builds `pandocr-web`, clears old containers, creates all model containers without starting both models, starts the WebUI, and waits for the active model health check.
+It checks Docker, detects the NVIDIA GPU, selects `env.txt` or `env.docker`, asks which model(s) to deploy now, pulls/builds only the selected model services plus `pandocr-web`, starts the WebUI, and waits for the selected active model health check. Models that were not deployed still appear in the WebUI as "not deployed"; selecting one there can download/build and create its containers without returning to the command line.
 
 Useful one-click options:
 
@@ -116,6 +181,11 @@ Useful one-click options:
 .\windows-one-click.bat -DryRun
 .\windows-one-click.bat -GpuId 1
 .\windows-one-click.bat -EnvFile env.docker
+.\windows-one-click.bat -Models paddleocr-vl-1.6
+.\windows-one-click.bat -Models pp-ocrv6
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend transformers
+.\windows-one-click.bat -Models unlimited-ocr -UnlimitedOcrBackend sglang
+.\windows-one-click.bat -Models all
 ```
 
 Manual deployment is still available:
@@ -163,6 +233,7 @@ docker compose --env-file env.txt start pandocr-web
 ```
 
 Keep this `up -d --no-start` then `start pandocr-web` order for single-GPU deployments. Starting the whole compose stack with a plain `docker compose up -d` can hot-load multiple models at the same time and waste VRAM. After the WebUI is online, use the top-right model selector to switch models; the UI calls `/api/model-runtime/switch`, starts only the selected model containers, stops the inactive model containers, and keeps the top bar runtime badge synchronized with the real container state.
+Keep this `up -d --no-start` then `start pandocr-web` order for single-GPU deployments. Starting the whole compose stack with a plain `docker compose up -d` can hot-load multiple model services at the same time and waste VRAM. After the WebUI is online, use the top-right model selector to switch models; the UI calls `/api/model-runtime/switch`, starts only the selected model containers, stops the inactive model containers, and keeps the runtime badge synchronized with the real container state.
 
 Open:
 
@@ -196,6 +267,11 @@ VLM_IMAGE_TAG_SUFFIX=latest-nvidia-gpu-sm120-offline
 PANDOCR_GPU_DEVICE_ID=0
 PADDLEOCR_VL_MODEL_NAME=PaddleOCR-VL-1.6-0.9B
 PPOCR_V6_MODEL_NAME=PP-OCRv6_medium
+UNLIMITED_OCR_MODEL_NAME=baidu/Unlimited-OCR
+UNLIMITED_OCR_BACKEND=transformers
+UNLIMITED_OCR_PRELOAD=1
+UNLIMITED_OCR_SGLANG_PORT=10001
+PANDOCR_ENABLE_UNLIMITED_OCR=0
 PANDOCR_MODEL_CONTROL=docker
 PANDOCR_ACTIVE_MODEL_ON_START=paddleocr-vl-1.6
 PANDOCR_MODEL_SWITCH_TIMEOUT=1200
@@ -339,6 +415,7 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 - `GET /api/models`: Returns available models and their proxy endpoints.
 - `GET /api/model-runtime`: Returns active model, readiness, container state, and current switch operation.
 - `POST /api/model-runtime/switch`: Starts the selected model containers and stops the inactive model containers when Docker model control is enabled.
+- `POST /api/model-runtime/deploy`: Pulls/builds missing model services from the WebUI, creates their containers, then switches to the requested model.
 - `GET /api/tasks`: Reads the local persistent task summary list without returning large source files or OCR results.
 - `GET /api/tasks/{task_id}`: Reads the full details of one task.
 - `PUT /api/tasks/{task_id}`: Saves one task to `data/tasks/`; `task.json` stores lightweight metadata, while Markdown, OCR JSON, images, and batch Markdown are split into `result.json`, with summaries in `summary.json`.
@@ -351,6 +428,9 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 - `POST /api/glm-ocr`: Proxies OCR requests to the GLM-OCR (Ollama) service, using PP-OCRv6 layout detection + GLM-OCR text recognition.
 - `POST /api/tasks/{task_id}/translate`: Translates the OCR Markdown result of a task into the target language, streaming translation progress.
 - `GET /api/translate/config`: Returns whether translation is configured and the model in use.
+- `POST /api/unlimited-ocr`: Optional proxy to the Unlimited-OCR adapter. Available only when `PANDOCR_ENABLE_UNLIMITED_OCR=1`.
+- `POST /api/unlimited-ocr/stream`: Unlimited-OCR streaming proxy. The response media type is `application/x-ndjson`.
+- `GET/POST /api/unlimited-ocr/backend`: Reads or switches the Unlimited-OCR `Transformers` / `SGLang` backend.
 - `GET /api/openapi.json`: OpenAPI JSON for this WebUI backend. `paddle-layout-openapi.json` in the repo documents the upstream Paddle layout-parsing service.
 
 ## Project Structure
@@ -390,6 +470,36 @@ This project integrates the [MinerU](https://github.com/opendatalab/MinerU) docu
 ├── paddle-layout-openapi.json
 ├── DOCKER_DEPLOY.md
 └── PROJECT_SUMMARY.md
+|-- server.py
+|-- requirements.txt
+|-- requirements-macos.txt
+|-- requirements-macos-mlx.txt
+|-- macos-one-click.command
+|-- windows-one-click.bat
+|-- Dockerfile
+|-- Dockerfile.ocr
+|-- Dockerfile.unlimited-ocr
+|-- Dockerfile.unlimited-ocr-sglang
+|-- docker-compose.yml
+|-- unlimited_ocr_adapter.py
+|-- data/                  # Local task data directory, not committed by default
+|-- env.txt
+|-- env.docker
+|-- pipeline_config_ocr_v6.yaml
+|-- pipeline_config_vllm.yaml
+|-- pipeline_config_macos_mlx.template.yaml
+|-- scripts/               # Deployment helper scripts
+|   |-- windows-one-click.ps1
+|-- static/
+|   |-- index.html
+|   |-- app.js
+|   |-- style.css
+|   `-- vendor/katex/
+|-- QUICKSTART.md
+|-- webui-openapi.json
+|-- paddle-layout-openapi.json
+|-- DOCKER_DEPLOY.md
+`-- PROJECT_SUMMARY.md
 ```
 
 ## Local Development

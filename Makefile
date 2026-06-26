@@ -1,4 +1,4 @@
-.PHONY: help doctor check build deploy up down restart logs test clean mac-one-click mac-setup mac-setup-mlx mac-up mac-up-mlx mac-down mac-test mac-test-mlx mac-logs
+.PHONY: help doctor check build deploy up down restart logs test clean mac-one-click mac-setup mac-setup-mlx mac-setup-unlimited-ocr mac-up mac-up-mlx mac-up-unlimited-ocr mac-down mac-test mac-test-mlx mac-test-unlimited-ocr mac-logs
 
 # 默认目标
 help:
@@ -17,11 +17,14 @@ help:
 	@echo "  make mac-one-click - Apple Silicon 一键部署并打开 WebUI"
 	@echo "  make mac-setup  - 安装 Apple Silicon 本地环境"
 	@echo "  make mac-setup-mlx - 安装 Apple Silicon MLX-VLM 提速环境"
+	@echo "  make mac-setup-unlimited-ocr - 安装 Apple Silicon Unlimited-OCR 隔离环境"
 	@echo "  make mac-up     - 启动 Apple Silicon 本地服务"
 	@echo "  make mac-up-mlx - 启动 Apple Silicon MLX-VLM 提速服务"
+	@echo "  make mac-up-unlimited-ocr - 启动 Apple Silicon 服务并启用 Unlimited-OCR"
 	@echo "  make mac-down   - 停止 Apple Silicon 本地服务"
 	@echo "  make mac-test   - 测试 Apple Silicon 本地服务"
 	@echo "  make mac-test-mlx - 测试 Apple Silicon MLX-VLM 服务"
+	@echo "  make mac-test-unlimited-ocr - 测试 Apple Silicon Unlimited-OCR 接入"
 	@echo "  make mac-logs   - 查看 Apple Silicon 本地日志"
 	@echo ""
 
@@ -107,11 +110,17 @@ mac-setup:
 mac-setup-mlx:
 	INSTALL_MLX_VLM=1 bash scripts/setup-macos.sh
 
+mac-setup-unlimited-ocr:
+	bash scripts/setup-macos-unlimited-ocr.sh
+
 mac-up:
 	bash scripts/start-macos.sh
 
 mac-up-mlx:
 	PANDOCR_MACOS_BACKEND=mlx bash scripts/start-macos.sh
+
+mac-up-unlimited-ocr:
+	PANDOCR_ENABLE_UNLIMITED_OCR=1 PANDOCR_MACOS_BACKEND=mlx bash scripts/start-macos.sh
 
 mac-down:
 	bash scripts/stop-macos.sh
@@ -122,5 +131,8 @@ mac-test:
 mac-test-mlx:
 	PANDOCR_MACOS_BACKEND=mlx bash scripts/test-macos.sh
 
+mac-test-unlimited-ocr:
+	PANDOCR_ENABLE_UNLIMITED_OCR=1 PANDOCR_MACOS_BACKEND=mlx bash scripts/test-macos.sh
+
 mac-logs:
-	tail -f logs/paddlex.log logs/pandocr-web.log logs/mlx-vlm.log
+	tail -f logs/paddlex.log logs/pandocr-web.log logs/mlx-vlm.log logs/unlimited-ocr.log

@@ -43,6 +43,13 @@
                     <span>Model</span>
                     <select id="model-select" aria-label="Model"></select>
                 </label>
+                <label class="model-select-wrap unlimited-backend-wrap hidden" id="unlimited-backend-wrap" title="Unlimited-OCR backend">
+                    <span>Backend</span>
+                    <select id="unlimited-backend-select" aria-label="Unlimited-OCR backend">
+                        <option value="transformers">Transformers</option>
+                        <option value="sglang">SGLang</option>
+                    </select>
+                </label>
                 <div class="model-pill">
                     <span id="model-status-dot" class="dot connecting"></span>
                     <span id="model-status-text">连接模型中...</span>

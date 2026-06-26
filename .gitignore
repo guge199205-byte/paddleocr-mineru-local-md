@@ -7,6 +7,8 @@ __pycache__/
 env/
 venv/
 .venv-macos/
+.venv-unlimited-ocr-macos/
+.uv-cache-unlimited-ocr/
 ENV/
 env.bak/
 venv.bak/
@@ -44,6 +46,8 @@ model_cache_ocr/
 model_cache_ppocrv6/
 model_cache_ppocrv6_ocr/
 model_cache_mineru/
+model_cache_unlimited_ocr/
+model_cache_unlimited_ocr_macos/
 data/
 ocr_results_*.md
 ocr_results_*.zip

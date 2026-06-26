@@ -11,17 +11,18 @@ import re
 import logging
 import time
 import secrets
+import contextlib
+import tarfile
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from PIL import Image
 from typing import List, Optional, Union
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from fastapi import FastAPI, HTTPException, File, UploadFile, Query, Request
 from fastapi.concurrency import run_in_threadpool
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, Response, JSONResponse
-from starlette.responses import StreamingResponse
+from fastapi.responses import FileResponse, Response, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
 
@@ -39,6 +40,25 @@ def parse_bool_env(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+UNLIMITED_OCR_KNOWN_BACKENDS = {"transformers", "sglang"}
+UNLIMITED_OCR_SUPPORTED_BACKENDS = {
+    item.strip().lower()
+    for item in os.getenv("UNLIMITED_OCR_SUPPORTED_BACKENDS", "transformers,sglang").split(",")
+    if item.strip().lower() in UNLIMITED_OCR_KNOWN_BACKENDS
+} or {"transformers"}
+
+
+def normalize_unlimited_ocr_backend(value: str | None, fallback: str | None = None) -> str:
+    backend = str(value or fallback or "").strip().lower()
+    if backend in UNLIMITED_OCR_SUPPORTED_BACKENDS:
+        return backend
+    fallback_backend = str(fallback or "").strip().lower()
+    if fallback_backend in UNLIMITED_OCR_SUPPORTED_BACKENDS:
+        return fallback_backend
+    supported = ", ".join(sorted(UNLIMITED_OCR_SUPPORTED_BACKENDS))
+    raise HTTPException(status_code=400, detail=f"Unsupported Unlimited-OCR backend. Use one of: {supported}.")
+
+
 def parse_positive_int_env(name: str, default: str) -> int:
     try:
         return max(1, int(os.getenv(name, default)))
@@ -47,6 +67,10 @@ def parse_positive_int_env(name: str, default: str) -> int:
 
 
 PADDLE_SERVICE_URL = os.getenv("PADDLE_SERVICE_URL", "http://localhost:8081/layout-parsing")
+VLM_BACKEND = os.getenv("VLM_BACKEND", "vllm")
+VLM_IMAGE_TAG_SUFFIX = os.getenv("VLM_IMAGE_TAG_SUFFIX", "latest-nvidia-gpu-offline")
+API_IMAGE_TAG_SUFFIX = os.getenv("API_IMAGE_TAG_SUFFIX", "latest-nvidia-gpu-offline")
+PANDOCR_GPU_DEVICE_ID = os.getenv("PANDOCR_GPU_DEVICE_ID", "0")
 PADDLEOCR_VL_MODEL_NAME = os.getenv("PADDLEOCR_VL_MODEL_NAME", "PaddleOCR-VL-1.6-0.9B")
 PADDLE_OCR_SERVICE_URL = os.getenv("PADDLE_OCR_SERVICE_URL", "http://localhost:8082/ocr")
 PPOCR_V6_MODEL_NAME = os.getenv("PPOCR_V6_MODEL_NAME", "PP-OCRv6_medium")
@@ -57,8 +81,34 @@ OLLAMA_MODEL = os.getenv("PANDOCR_OLLAMA_MODEL", "glm-ocr").strip()
 OLLAMA_NUM_CTX = int(os.getenv("PANDOCR_OLLAMA_NUM_CTX", "8192"))
 OLLAMA_NUM_PREDICT = int(os.getenv("PANDOCR_OLLAMA_NUM_PREDICT", "4096"))
 PADDLE_REQUEST_TIMEOUT = float(os.getenv("PADDLE_REQUEST_TIMEOUT", "3600"))
+UNLIMITED_OCR_SERVICE_URL = os.getenv("UNLIMITED_OCR_SERVICE_URL", "http://localhost:8083/ocr")
+UNLIMITED_OCR_MODEL_NAME = os.getenv("UNLIMITED_OCR_MODEL_NAME", "baidu/Unlimited-OCR")
+UNLIMITED_OCR_SERVED_MODEL_NAME = os.getenv("UNLIMITED_OCR_SERVED_MODEL_NAME", "Unlimited-OCR")
+UNLIMITED_OCR_BACKEND = normalize_unlimited_ocr_backend(os.getenv("UNLIMITED_OCR_BACKEND"), "transformers")
+UNLIMITED_OCR_PRELOAD = os.getenv("UNLIMITED_OCR_PRELOAD", "1")
+UNLIMITED_OCR_API_PORT = os.getenv("UNLIMITED_OCR_API_PORT", "8083")
+UNLIMITED_OCR_SGLANG_PORT = os.getenv("UNLIMITED_OCR_SGLANG_PORT", "10000")
+UNLIMITED_OCR_ATTENTION_BACKEND = os.getenv("UNLIMITED_OCR_ATTENTION_BACKEND", "flashinfer")
+UNLIMITED_OCR_PAGE_SIZE = os.getenv("UNLIMITED_OCR_PAGE_SIZE", "1")
+UNLIMITED_OCR_MEM_FRACTION_STATIC = os.getenv("UNLIMITED_OCR_MEM_FRACTION_STATIC", "0.8")
+UNLIMITED_OCR_CONTEXT_LENGTH = os.getenv("UNLIMITED_OCR_CONTEXT_LENGTH", "32768")
+UNLIMITED_OCR_REQUEST_TIMEOUT = os.getenv("UNLIMITED_OCR_REQUEST_TIMEOUT", "1200")
+UNLIMITED_OCR_PDF_DPI = os.getenv("UNLIMITED_OCR_PDF_DPI", "300")
+UNLIMITED_OCR_MAX_PAGES_PER_REQUEST = os.getenv("UNLIMITED_OCR_MAX_PAGES_PER_REQUEST", "50")
+UNLIMITED_OCR_SINGLE_IMAGE_MODE = os.getenv("UNLIMITED_OCR_SINGLE_IMAGE_MODE", "gundam")
+UNLIMITED_OCR_MULTI_IMAGE_MODE = os.getenv("UNLIMITED_OCR_MULTI_IMAGE_MODE", "base")
+UNLIMITED_OCR_MAX_TOKENS = os.getenv("UNLIMITED_OCR_MAX_TOKENS", "32768")
+UNLIMITED_OCR_SGLANG_MAX_TOKENS = os.getenv("UNLIMITED_OCR_SGLANG_MAX_TOKENS", "28672")
+UNLIMITED_OCR_SGLANG_WHEEL_URL = os.getenv(
+    "UNLIMITED_OCR_SGLANG_WHEEL_URL",
+    "https://github.com/baidu/Unlimited-OCR/raw/main/wheel/sglang-0.0.0.dev11416%2Bg92e8bb79e-py3-none-any.whl",
+)
 PROJECT_ROOT = Path(__file__).resolve().parent
 TASK_DATA_DIR = Path(os.getenv("PANDOCR_TASK_DATA_DIR", "data/tasks")).resolve()
+DEFAULT_RUNTIME_SETTINGS_DIR = TASK_DATA_DIR.parent if TASK_DATA_DIR.name == "tasks" else TASK_DATA_DIR
+RUNTIME_SETTINGS_FILE = Path(
+    os.getenv("PANDOCR_RUNTIME_SETTINGS_FILE", str(DEFAULT_RUNTIME_SETTINGS_DIR / "runtime-settings.json"))
+).resolve()
 MAX_REQUEST_BYTES = int(float(os.getenv("PANDOCR_MAX_UPLOAD_MB", "512")) * 1024 * 1024)
 MAX_TOTAL_UPLOAD_BYTES = int(float(os.getenv("PANDOCR_MAX_TOTAL_UPLOAD_MB", "4096")) * 1024 * 1024)
 DEFAULT_CHUNK_SIZE = int(float(os.getenv("PANDOCR_DEFAULT_CHUNK_SIZE_MB", "10")) * 1024 * 1024)
@@ -75,6 +125,8 @@ MODEL_SWITCH_TIMEOUT = float(os.getenv("PANDOCR_MODEL_SWITCH_TIMEOUT", "1200"))
 API_TOKEN = os.getenv("PANDOCR_API_TOKEN", "").strip()
 ENABLE_API_DOCS = parse_bool_env("PANDOCR_ENABLE_API_DOCS", "0")
 ENFORCE_ORIGIN_CHECK = parse_bool_env("PANDOCR_ENFORCE_ORIGIN_CHECK", "1")
+ENABLE_UNLIMITED_OCR = parse_bool_env("PANDOCR_ENABLE_UNLIMITED_OCR", "0")
+MODEL_CATALOG_ENV = os.getenv("PANDOCR_MODEL_CATALOG", "").strip()
 MAX_CONCURRENT_OCR = parse_positive_int_env("PANDOCR_MAX_CONCURRENT_OCR", "1")
 TRANSLATE_API_URL = os.getenv("PANDOCR_TRANSLATE_API_URL", "").strip()
 TRANSLATE_API_KEY = os.getenv("PANDOCR_TRANSLATE_API_KEY", "").strip()
@@ -89,6 +141,55 @@ CORS_ORIGINS = parse_csv_env(
     "PANDOCR_CORS_ORIGINS",
     "http://localhost:8000,http://127.0.0.1:8000",
 )
+
+
+def load_runtime_settings() -> dict:
+    try:
+        if not RUNTIME_SETTINGS_FILE.exists():
+            return {}
+        data = json.loads(RUNTIME_SETTINGS_FILE.read_text(encoding="utf-8-sig"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        logger.warning("Failed to read runtime settings: %s", RUNTIME_SETTINGS_FILE, exc_info=True)
+        return {}
+
+
+def save_runtime_settings(updates: dict) -> None:
+    try:
+        settings = load_runtime_settings()
+        settings.update(updates)
+        RUNTIME_SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = RUNTIME_SETTINGS_FILE.with_suffix(".tmp")
+        temp_path.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+        temp_path.replace(RUNTIME_SETTINGS_FILE)
+    except Exception:
+        logger.warning("Failed to write runtime settings: %s", RUNTIME_SETTINGS_FILE, exc_info=True)
+
+
+def initial_unlimited_ocr_backend() -> str:
+    settings = load_runtime_settings()
+    persisted_backend = settings.get("unlimitedOcrBackend")
+    return normalize_unlimited_ocr_backend(persisted_backend, UNLIMITED_OCR_BACKEND)
+
+
+def parse_model_catalog() -> list[str]:
+    supported = {"paddleocr-vl-1.6", "pp-ocrv6", "mineru", "glm-ocr", "unlimited-ocr"}
+    if MODEL_CATALOG_ENV:
+        ids = [model_id for model_id in parse_csv_env("PANDOCR_MODEL_CATALOG", "") if model_id in supported]
+    else:
+        ids = ["paddleocr-vl-1.6", "pp-ocrv6", "mineru", "glm-ocr"]
+        if ENABLE_UNLIMITED_OCR:
+            ids.append("unlimited-ocr")
+
+    unique_ids = []
+    for model_id in ids:
+        if model_id not in unique_ids:
+            unique_ids.append(model_id)
+    return unique_ids or ["paddleocr-vl-1.6"]
+
+
+MODEL_CATALOG_IDS = parse_model_catalog()
+ENABLE_UNLIMITED_OCR = ENABLE_UNLIMITED_OCR or "unlimited-ocr" in MODEL_CATALOG_IDS
 
 MODEL_RUNTIME_CONFIG = {
     "paddleocr-vl-1.6": {
@@ -116,7 +217,24 @@ MODEL_RUNTIME_CONFIG = {
         "health_url": f"{OLLAMA_BASE_URL}/api/tags",
     },
 }
-DEFAULT_RUNTIME_MODEL_ID = MODEL_RUNTIME_STARTUP if MODEL_RUNTIME_STARTUP in MODEL_RUNTIME_CONFIG else "paddleocr-vl-1.6"
+
+if ENABLE_UNLIMITED_OCR:
+    MODEL_RUNTIME_CONFIG["unlimited-ocr"] = {
+        "containers": ["unlimited-ocr-api"],
+        "start_order": ["unlimited-ocr-api"],
+        "stop_order": ["unlimited-ocr-sglang", "unlimited-ocr-api"],
+        "health_url": UNLIMITED_OCR_SERVICE_URL.rsplit("/", 1)[0] + "/health",
+    }
+
+DEFAULT_RUNTIME_FALLBACK_MODEL_ID = next(
+    (model_id for model_id in MODEL_CATALOG_IDS if model_id in MODEL_RUNTIME_CONFIG),
+    next(iter(MODEL_RUNTIME_CONFIG)),
+)
+DEFAULT_RUNTIME_MODEL_ID = (
+    MODEL_RUNTIME_STARTUP
+    if MODEL_RUNTIME_STARTUP in MODEL_RUNTIME_CONFIG and MODEL_RUNTIME_STARTUP in MODEL_CATALOG_IDS
+    else DEFAULT_RUNTIME_FALLBACK_MODEL_ID
+)
 
 model_runtime_lock = asyncio.Lock()
 ocr_semaphore = asyncio.Semaphore(MAX_CONCURRENT_OCR)
@@ -128,6 +246,8 @@ model_runtime_operation = {
     "updatedAt": None,
 }
 model_runtime_task: asyncio.Task | None = None
+unlimited_ocr_backend_task: asyncio.Task | None = None
+unlimited_ocr_runtime_backend = initial_unlimited_ocr_backend()
 ocr_active_count = 0
 
 
@@ -156,36 +276,57 @@ class ProcessRequest(BaseModel):
     ocrOptions: dict = Field(default_factory=dict)
 
 
+class ModelDeployRequest(BaseModel):
+    modelId: str
+    backend: str | None = None
+
+
+class UnlimitedOcrBackendRequest(BaseModel):
+    backend: str
+
+
 def model_catalog() -> list[dict]:
-    return [
-        {
+    models_by_id = {
+        "paddleocr-vl-1.6": {
             "id": "paddleocr-vl-1.6",
             "name": PADDLEOCR_VL_MODEL_NAME,
             "label": "PaddleOCR-VL 1.6",
             "kind": "document_parsing",
             "endpoint": "/api/paddleocr-vl-1.6",
         },
-        {
+        "pp-ocrv6": {
             "id": "pp-ocrv6",
             "name": PPOCR_V6_MODEL_NAME,
             "label": "PP-OCRv6",
             "kind": "text_ocr",
             "endpoint": "/api/pp-ocrv6",
         },
-        {
+        "mineru": {
             "id": "mineru",
             "name": MINERU_MODEL_NAME,
             "label": "MinerU",
             "kind": "document_parsing",
             "endpoint": "/api/mineru",
         },
-        {
+        "glm-ocr": {
             "id": "glm-ocr",
             "name": OLLAMA_MODEL,
             "label": "GLM-OCR (Ollama)",
             "kind": "document_parsing",
             "endpoint": "/api/glm-ocr",
         },
+        "unlimited-ocr": {
+            "id": "unlimited-ocr",
+            "name": UNLIMITED_OCR_MODEL_NAME,
+            "label": "Unlimited-OCR",
+            "kind": "document_parsing",
+            "endpoint": "/api/unlimited-ocr",
+        },
+    }
+    return [
+        models_by_id[model_id]
+        for model_id in MODEL_CATALOG_IDS
+        if model_id in models_by_id and model_id in MODEL_RUNTIME_CONFIG
     ]
 
 
@@ -193,10 +334,10 @@ def model_control_available() -> bool:
     return MODEL_CONTROL_MODE == "docker" and Path(DOCKER_SOCKET_PATH).exists()
 
 
-async def docker_api_request(method: str, path: str, *, timeout: float = 30) -> httpx.Response:
+async def docker_api_request(method: str, path: str, *, timeout: float = 30, **request_kwargs) -> httpx.Response:
     transport = httpx.AsyncHTTPTransport(uds=DOCKER_SOCKET_PATH)
     async with httpx.AsyncClient(transport=transport, base_url="http://docker", timeout=timeout) as client:
-        return await client.request(method, path)
+        return await client.request(method, path, **request_kwargs)
 
 
 async def inspect_container(name: str) -> dict:
@@ -248,13 +389,423 @@ async def docker_container_action(name: str, action: str) -> None:
         raise RuntimeError(f"Docker {action} failed for {name}: {response.text}")
 
 
-async def check_http_health(url: str) -> bool:
+def docker_image_name_for(service_name: str) -> str:
+    if service_name == "paddleocr-vlm-server":
+        return f"ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-{VLM_BACKEND}-server:{VLM_IMAGE_TAG_SUFFIX}"
+    if service_name == "paddleocr-vl-api":
+        return f"ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl:{API_IMAGE_TAG_SUFFIX}"
+    if service_name == "paddleocr-ocr-api":
+        return "pandocr-ocr-api:latest"
+    if service_name == "unlimited-ocr-api":
+        return "pandocr-unlimited-ocr-transformers:latest"
+    if service_name == "unlimited-ocr-sglang":
+        return "pandocr-unlimited-ocr-sglang:latest"
+    raise ValueError(f"Unknown service image: {service_name}")
+
+
+def split_docker_image_ref(image: str) -> tuple[str, str]:
+    last_slash = image.rfind("/")
+    last_colon = image.rfind(":")
+    if last_colon > last_slash:
+        return image[:last_colon], image[last_colon + 1 :]
+    return image, "latest"
+
+
+async def docker_image_exists(image: str) -> bool:
+    if not model_control_available():
+        return False
+    response = await docker_api_request("GET", f"/images/{quote(image, safe='')}/json")
+    if response.status_code == 404:
+        return False
+    response.raise_for_status()
+    return True
+
+
+async def docker_pull_image(image: str) -> None:
+    if await docker_image_exists(image):
+        return
+    repository, tag = split_docker_image_ref(image)
+    path = f"/images/create?fromImage={quote(repository, safe='')}&tag={quote(tag, safe='')}"
+    response = await docker_api_request("POST", path, timeout=3600)
+    if response.status_code >= 400:
+        raise RuntimeError(f"Docker pull failed for {image}: {response.text}")
+
+
+def dockerfile_path_for(service_name: str) -> Path:
+    dockerfile_names = {
+        "paddleocr-ocr-api": "Dockerfile.ocr",
+        "unlimited-ocr-api": "Dockerfile.unlimited-ocr",
+        "unlimited-ocr-sglang": "Dockerfile.unlimited-ocr-sglang",
+    }
+    dockerfile_name = dockerfile_names.get(service_name)
+    if not dockerfile_name:
+        raise ValueError(f"No Dockerfile for {service_name}")
+    dockerfile_path = PROJECT_ROOT / dockerfile_name
+    if not dockerfile_path.is_file():
+        raise RuntimeError(f"Missing {dockerfile_name}; cannot build {service_name} from the WebUI.")
+    return dockerfile_path
+
+
+def docker_build_args_for(service_name: str) -> dict[str, str]:
+    if service_name == "paddleocr-ocr-api":
+        return {"API_IMAGE_TAG_SUFFIX": API_IMAGE_TAG_SUFFIX}
+    if service_name == "unlimited-ocr-sglang":
+        return {"UNLIMITED_OCR_SGLANG_WHEEL_URL": UNLIMITED_OCR_SGLANG_WHEEL_URL}
+    return {}
+
+
+def make_docker_build_context(service_name: str) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
+        dockerfile_data = dockerfile_path_for(service_name).read_bytes()
+        dockerfile_info = tarfile.TarInfo("Dockerfile")
+        dockerfile_info.size = len(dockerfile_data)
+        tar.addfile(dockerfile_info, io.BytesIO(dockerfile_data))
+
+        if service_name.startswith("unlimited-ocr"):
+            adapter_path = PROJECT_ROOT / "unlimited_ocr_adapter.py"
+            adapter_data = adapter_path.read_bytes()
+            adapter_info = tarfile.TarInfo("unlimited_ocr_adapter.py")
+            adapter_info.size = len(adapter_data)
+            tar.addfile(adapter_info, io.BytesIO(adapter_data))
+
+    return buffer.getvalue()
+
+
+async def docker_build_image(service_name: str) -> None:
+    image = docker_image_name_for(service_name)
+    if await docker_image_exists(image):
+        return
+    context = make_docker_build_context(service_name)
+    query = f"/build?t={quote(image, safe='')}&pull=1&rm=1"
+    build_args = docker_build_args_for(service_name)
+    if build_args:
+        query += f"&buildargs={quote(json.dumps(build_args), safe='')}"
+    response = await docker_api_request(
+        "POST",
+        query,
+        timeout=7200,
+        content=context,
+        headers={"Content-Type": "application/x-tar"},
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Docker build failed for {image}: {response.text}")
+    for line in response.text.splitlines():
+        try:
+            event = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(event, dict) and event.get("error"):
+            raise RuntimeError(f"Docker build failed for {image}: {event.get('error')}")
+
+
+async def docker_inspect_self() -> dict:
+    response = await docker_api_request("GET", "/containers/pandocr-web/json")
+    if response.status_code == 404:
+        return {}
+    response.raise_for_status()
+    data = response.json()
+    return data if isinstance(data, dict) else {}
+
+
+async def docker_network_name() -> str:
+    data = await docker_inspect_self()
+    networks = ((data.get("NetworkSettings") or {}).get("Networks") or {})
+    if not isinstance(networks, dict) or not networks:
+        return "paddleocr-vl-webui_paddleocr-network"
+    for name in networks:
+        if "paddleocr-network" in name:
+            return name
+    return next(iter(networks))
+
+
+async def docker_host_repo_root() -> str:
+    data = await docker_inspect_self()
+    mounts = data.get("Mounts") or []
+    for mount in mounts:
+        if mount.get("Destination") == "/app/static" and mount.get("Source"):
+            return str(Path(mount["Source"]).parent)
+        if mount.get("Destination") == "/app/server.py" and mount.get("Source"):
+            return str(Path(mount["Source"]).parent)
+    return str(PROJECT_ROOT)
+
+
+def bind_path(host_root: str, name: str, target: str, readonly: bool = False) -> str:
+    suffix = ":ro" if readonly else ""
+    return f"{host_root}/{name}:{target}{suffix}"
+
+
+def model_device_requests() -> list[dict]:
+    return [
+        {
+            "Driver": "nvidia",
+            "DeviceIDs": [PANDOCR_GPU_DEVICE_ID],
+            "Capabilities": [["gpu"]],
+        }
+    ]
+
+
+def healthcheck(test: str, start_period_seconds: int) -> dict:
+    return {
+        "Test": ["CMD-SHELL", test],
+        "Interval": 30_000_000_000,
+        "Timeout": 10_000_000_000,
+        "Retries": 5,
+        "StartPeriod": start_period_seconds * 1_000_000_000,
+    }
+
+
+def host_config(
+    *,
+    network_name: str,
+    binds: list[str],
+    port_bindings: dict | None = None,
+    shm_size: int | None = None,
+) -> dict:
+    config = {
+        "Binds": binds,
+        "NetworkMode": network_name,
+        "RestartPolicy": {"Name": "unless-stopped"},
+        "DeviceRequests": model_device_requests(),
+    }
+    if port_bindings:
+        config["PortBindings"] = port_bindings
+    if shm_size:
+        config["ShmSize"] = shm_size
+    return config
+
+
+async def docker_create_container(name: str, payload: dict) -> None:
+    existing = await inspect_container(name)
+    if existing["exists"]:
+        return
+    response = await docker_api_request(
+        "POST",
+        f"/containers/create?name={quote(name, safe='')}",
+        timeout=120,
+        json=payload,
+    )
+    if response.status_code >= 400:
+        raise RuntimeError(f"Docker create failed for {name}: {response.text}")
+
+
+def container_payload_for(service_name: str, *, host_root: str, network_name: str) -> dict:
+    image = docker_image_name_for(service_name)
+    if service_name == "paddleocr-vlm-server":
+        return {
+            "Image": image,
+            "Cmd": ["/bin/bash", "/home/paddleocr/start-vlm.sh"],
+            "Env": [
+                "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True",
+                f"PADDLEOCR_VL_MODEL_NAME={PADDLEOCR_VL_MODEL_NAME}",
+                f"PANDOCR_GPU_DEVICE_ID={PANDOCR_GPU_DEVICE_ID}",
+            ],
+            "User": "root",
+            "HostConfig": host_config(
+                network_name=network_name,
+                binds=[
+                    bind_path(host_root, "model_cache", "/home/paddleocr/.paddlex"),
+                    bind_path(host_root, "model_cache_ocr", "/home/paddleocr/.paddleocr"),
+                    bind_path(host_root, "start-vlm.sh", "/home/paddleocr/start-vlm.sh", readonly=True),
+                ],
+            ),
+            "Healthcheck": healthcheck("curl -f http://localhost:8080/health || exit 1", 900),
+        }
+    if service_name == "paddleocr-vl-api":
+        return {
+            "Image": image,
+            "Cmd": ["/bin/bash", "-c", f"paddlex --serve --pipeline /home/paddleocr/pipeline_config_{VLM_BACKEND}.yaml"],
+            "Env": [
+                f"VLM_BACKEND={VLM_BACKEND}",
+                "PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True",
+            ],
+            "User": "root",
+            "ExposedPorts": {"8080/tcp": {}},
+            "HostConfig": host_config(
+                network_name=network_name,
+                binds=[
+                    bind_path(host_root, "model_cache", "/home/paddleocr/.paddlex"),
+                    bind_path(host_root, "model_cache_ocr", "/home/paddleocr/.paddleocr"),
+                    bind_path(host_root, "pipeline_config_vllm.yaml", "/home/paddleocr/pipeline_config_vllm.yaml", readonly=True),
+                ],
+                port_bindings={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8081"}]},
+            ),
+            "Healthcheck": healthcheck("curl -f http://localhost:8080/health || exit 1", 300),
+        }
+    if service_name == "paddleocr-ocr-api":
+        return {
+            "Image": image,
+            "Cmd": ["/bin/bash", "-c", "paddlex --serve --pipeline /home/paddleocr/pipeline_config_ocr_v6.yaml --host 0.0.0.0 --port 8080"],
+            "Env": ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=True"],
+            "User": "root",
+            "ExposedPorts": {"8080/tcp": {}},
+            "HostConfig": host_config(
+                network_name=network_name,
+                binds=[
+                    bind_path(host_root, "model_cache_ppocrv6", "/home/paddleocr/.paddlex"),
+                    bind_path(host_root, "model_cache_ppocrv6_ocr", "/home/paddleocr/.paddleocr"),
+                    bind_path(host_root, "pipeline_config_ocr_v6.yaml", "/home/paddleocr/pipeline_config_ocr_v6.yaml", readonly=True),
+                ],
+                port_bindings={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": "8082"}]},
+            ),
+            "Healthcheck": healthcheck("curl -f http://localhost:8080/health || exit 1", 300),
+        }
+    if service_name == "unlimited-ocr-api":
+        return {
+            "Image": image,
+            "Cmd": ["uvicorn", "unlimited_ocr_adapter:app", "--host", "0.0.0.0", "--port", "8080"],
+            "Env": [
+                "HF_HOME=/root/.cache/huggingface",
+                f"UNLIMITED_OCR_BACKEND={unlimited_ocr_runtime_backend}",
+                f"UNLIMITED_OCR_PRELOAD={UNLIMITED_OCR_PRELOAD}",
+                "UNLIMITED_OCR_SGLANG_URL=http://unlimited-ocr-sglang:10000",
+                f"UNLIMITED_OCR_MODEL_NAME={UNLIMITED_OCR_MODEL_NAME}",
+                f"UNLIMITED_OCR_SERVED_MODEL_NAME={UNLIMITED_OCR_SERVED_MODEL_NAME}",
+                f"UNLIMITED_OCR_REQUEST_TIMEOUT={UNLIMITED_OCR_REQUEST_TIMEOUT}",
+                f"UNLIMITED_OCR_PDF_DPI={UNLIMITED_OCR_PDF_DPI}",
+                f"UNLIMITED_OCR_MAX_PAGES_PER_REQUEST={UNLIMITED_OCR_MAX_PAGES_PER_REQUEST}",
+                f"UNLIMITED_OCR_SINGLE_IMAGE_MODE={UNLIMITED_OCR_SINGLE_IMAGE_MODE}",
+                f"UNLIMITED_OCR_MULTI_IMAGE_MODE={UNLIMITED_OCR_MULTI_IMAGE_MODE}",
+                f"UNLIMITED_OCR_MAX_TOKENS={UNLIMITED_OCR_MAX_TOKENS}",
+                f"UNLIMITED_OCR_SGLANG_MAX_TOKENS={UNLIMITED_OCR_SGLANG_MAX_TOKENS}",
+                "PANDOCR_RUNTIME_SETTINGS_FILE=/app/data/runtime-settings.json",
+            ],
+            "User": "root",
+            "ExposedPorts": {"8080/tcp": {}},
+            "HostConfig": host_config(
+                network_name=network_name,
+                binds=[
+                    bind_path(host_root, "model_cache_unlimited_ocr", "/root/.cache/huggingface"),
+                    bind_path(host_root, "data", "/app/data"),
+                ],
+                port_bindings={"8080/tcp": [{"HostIp": "127.0.0.1", "HostPort": UNLIMITED_OCR_API_PORT}]},
+            ),
+            "Healthcheck": healthcheck("curl -f http://localhost:8080/health || exit 1", 60),
+        }
+    if service_name == "unlimited-ocr-sglang":
+        return {
+            "Image": image,
+            "Cmd": [
+                "python3",
+                "-m",
+                "sglang.launch_server",
+                "--model",
+                UNLIMITED_OCR_MODEL_NAME,
+                "--served-model-name",
+                UNLIMITED_OCR_SERVED_MODEL_NAME,
+                "--attention-backend",
+                UNLIMITED_OCR_ATTENTION_BACKEND,
+                "--page-size",
+                UNLIMITED_OCR_PAGE_SIZE,
+                "--mem-fraction-static",
+                UNLIMITED_OCR_MEM_FRACTION_STATIC,
+                "--context-length",
+                UNLIMITED_OCR_CONTEXT_LENGTH,
+                "--enable-custom-logit-processor",
+                "--disable-overlap-schedule",
+                "--skip-server-warmup",
+                "--host",
+                "0.0.0.0",
+                "--port",
+                "10000",
+            ],
+            "Env": [
+                "HF_HOME=/root/.cache/huggingface",
+                f"CUDA_VISIBLE_DEVICES={PANDOCR_GPU_DEVICE_ID}",
+            ],
+            "User": "root",
+            "ExposedPorts": {"10000/tcp": {}},
+            "HostConfig": host_config(
+                network_name=network_name,
+                binds=[bind_path(host_root, "model_cache_unlimited_ocr", "/root/.cache/huggingface")],
+                port_bindings={"10000/tcp": [{"HostIp": "127.0.0.1", "HostPort": UNLIMITED_OCR_SGLANG_PORT}]},
+                shm_size=34_359_738_368,
+            ),
+            "Healthcheck": healthcheck("curl -f http://localhost:10000/health || exit 1", 900),
+        }
+    raise ValueError(f"Unknown deploy service: {service_name}")
+
+
+async def ensure_runtime_service_created(service_name: str) -> None:
+    if service_name in {"paddleocr-vlm-server", "paddleocr-vl-api"}:
+        await docker_pull_image(docker_image_name_for(service_name))
+    else:
+        await docker_build_image(service_name)
+    network_name = await docker_network_name()
+    host_root = await docker_host_repo_root()
+    await docker_create_container(
+        service_name,
+        container_payload_for(service_name, host_root=host_root, network_name=network_name),
+    )
+
+
+def services_for_model_deploy(model_id: str, backend: str | None = None) -> list[str]:
+    if model_id == "paddleocr-vl-1.6":
+        return ["paddleocr-vlm-server", "paddleocr-vl-api"]
+    if model_id == "pp-ocrv6":
+        return ["paddleocr-ocr-api"]
+    if model_id == "unlimited-ocr":
+        services = ["unlimited-ocr-api"]
+        if normalize_unlimited_ocr_backend(backend, unlimited_ocr_runtime_backend) == "sglang":
+            services.insert(0, "unlimited-ocr-sglang")
+        return services
+    raise ValueError(f"Unknown model id: {model_id}")
+
+
+async def ensure_model_runtime_created(model_id: str, backend: str | None = None) -> None:
+    for service_name in services_for_model_deploy(model_id, backend):
+        await ensure_runtime_service_created(service_name)
+
+
+async def fetch_http_health(url: str) -> tuple[bool, dict]:
     try:
         async with httpx.AsyncClient(timeout=3.0) as client:
             response = await client.get(url)
-        return 200 <= response.status_code < 300
+        data = {}
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                data = parsed
+        except Exception:
+            data = {}
+        return 200 <= response.status_code < 300, data
     except Exception:
-        return False
+        return False, {}
+
+
+async def check_http_health(url: str) -> bool:
+    ok, _ = await fetch_http_health(url)
+    return ok
+
+
+def model_health_ready_state(model_id: str, health_ok: bool, health_data: dict) -> tuple[bool, str]:
+    if not health_ok:
+        return False, "unknown"
+    if model_id == "unlimited-ocr":
+        if unlimited_ocr_runtime_backend == "sglang":
+            sglang = health_data.get("sglang") if isinstance(health_data.get("sglang"), dict) else {}
+            return (True, "ready") if sglang.get("ready") else (False, "starting")
+
+        transformers = health_data.get("transformers") if isinstance(health_data.get("transformers"), dict) else health_data
+        if transformers.get("modelError"):
+            return False, "error"
+        if transformers.get("preloadEnabled"):
+            if transformers.get("modelLoaded"):
+                return True, "ready"
+            if transformers.get("modelLoading"):
+                return False, "warming"
+            return False, "starting"
+    return True, "ready"
+
+
+async def enrich_unlimited_ocr_runtime_status(model_id: str, status: dict) -> dict:
+    if model_id != "unlimited-ocr":
+        return status
+    status["unlimitedOcrBackend"] = unlimited_ocr_runtime_backend
+    status["unlimitedOcrSupportedBackends"] = sorted(UNLIMITED_OCR_SUPPORTED_BACKENDS)
+    if model_control_available():
+        status["sglangContainer"] = await inspect_container("unlimited-ocr-sglang")
+    return status
 
 
 async def model_runtime_status(model_id: str) -> dict:
@@ -300,38 +851,42 @@ async def model_runtime_status(model_id: str) -> dict:
 
     containers = [await inspect_container(name) for name in config["containers"]]
     if not model_control_available():
-        health_ok = await check_http_health(config["health_url"])
-        return {
+        health_ok, health_data = await fetch_http_health(config["health_url"])
+        ready, health_state = model_health_ready_state(model_id, health_ok, health_data)
+        return await enrich_unlimited_ocr_runtime_status(model_id, {
             "id": model_id,
             "containers": containers,
             "running": health_ok,
-            "ready": health_ok,
-            "state": "ready" if health_ok else "unknown",
+            "ready": ready,
+            "state": health_state if health_ok else "unknown",
             "healthUrl": config["health_url"],
-        }
+            "health": health_data,
+        })
 
     any_running = any(container["running"] for container in containers)
     all_running = all(container["running"] for container in containers)
     any_missing = any(not container["exists"] for container in containers)
-    health_ok = await check_http_health(config["health_url"]) if all_running else False
+    health_ok, health_data = await fetch_http_health(config["health_url"]) if all_running else (False, {})
+    ready, health_state = model_health_ready_state(model_id, health_ok, health_data)
 
     if any_missing:
         state = "missing"
     elif health_ok:
-        state = "ready"
+        state = health_state
     elif any_running:
         state = "starting" if all_running else "partial"
     else:
         state = "stopped"
 
-    return {
+    return await enrich_unlimited_ocr_runtime_status(model_id, {
         "id": model_id,
         "containers": containers,
         "running": any_running,
-        "ready": health_ok,
+        "ready": ready if all_running else False,
         "state": state,
         "healthUrl": config["health_url"],
-    }
+        "health": health_data,
+    })
 
 
 async def build_model_runtime_payload() -> dict:
@@ -349,6 +904,8 @@ async def build_model_runtime_payload() -> dict:
         "controlAvailable": model_control_available(),
         "activeModelId": active_model,
         "defaultModelId": DEFAULT_RUNTIME_MODEL_ID,
+        "unlimitedOcrBackend": unlimited_ocr_runtime_backend,
+        "unlimitedOcrSupportedBackends": sorted(UNLIMITED_OCR_SUPPORTED_BACKENDS),
         "operation": dict(model_runtime_operation),
         "ocrActiveCount": ocr_active_count,
         "maxConcurrentOcr": MAX_CONCURRENT_OCR,
@@ -389,6 +946,60 @@ async def wait_container_runtime_ready(container_name: str, timeout: float) -> N
     raise TimeoutError(f"Timed out waiting for Docker container {container_name} to become healthy")
 
 
+def unlimited_ocr_adapter_base_url() -> str:
+    return UNLIMITED_OCR_SERVICE_URL.rsplit("/", 1)[0]
+
+
+async def call_unlimited_ocr_adapter_control(path: str, *, timeout: float | None = None) -> dict:
+    control_timeout = timeout if timeout is not None else MODEL_SWITCH_TIMEOUT
+    async with httpx.AsyncClient(timeout=control_timeout) as client:
+        response = await client.post(f"{unlimited_ocr_adapter_base_url()}{path}")
+    if response.status_code >= 400:
+        raise RuntimeError(f"Unlimited-OCR adapter control failed ({response.status_code}): {response.text}")
+    try:
+        data = response.json()
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+async def wait_unlimited_ocr_backend_ready(backend: str, timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status = await model_runtime_status("unlimited-ocr")
+        if status.get("ready") and status.get("unlimitedOcrBackend") == backend:
+            return
+        await asyncio.sleep(3)
+    raise TimeoutError(f"Timed out waiting for Unlimited-OCR {backend} backend to become ready")
+
+
+async def wait_unlimited_ocr_adapter_http(timeout: float) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        health_ok, _ = await fetch_http_health(unlimited_ocr_adapter_base_url() + "/health")
+        if health_ok:
+            return
+        await asyncio.sleep(2)
+    raise TimeoutError("Timed out waiting for Unlimited-OCR adapter API")
+
+
+async def ensure_unlimited_ocr_backend_runtime(backend: str, timeout: float) -> None:
+    await wait_unlimited_ocr_adapter_http(timeout)
+    if backend == "sglang":
+        await call_unlimited_ocr_adapter_control("/backend/transformers/unload", timeout=min(180, timeout))
+        if model_control_available():
+            await ensure_runtime_service_created("unlimited-ocr-sglang")
+            await docker_container_action("unlimited-ocr-sglang", "start")
+            await wait_container_runtime_ready("unlimited-ocr-sglang", timeout)
+        await wait_unlimited_ocr_backend_ready("sglang", timeout)
+        return
+
+    if model_control_available():
+        await docker_container_action("unlimited-ocr-sglang", "stop")
+    await call_unlimited_ocr_adapter_control("/backend/transformers/preload", timeout=timeout)
+    await wait_unlimited_ocr_backend_ready("transformers", timeout)
+
+
 async def activate_model_runtime(model_id: str) -> None:
     if model_id not in MODEL_RUNTIME_CONFIG:
         raise ValueError(f"Unknown model id: {model_id}")
@@ -413,6 +1024,10 @@ async def activate_model_runtime(model_id: str) -> None:
                     await docker_container_action(container_name, "start")
                     await wait_container_runtime_ready(container_name, remaining_timeout)
 
+            if model_id == "unlimited-ocr":
+                remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
+                await ensure_unlimited_ocr_backend_runtime(unlimited_ocr_runtime_backend, remaining_timeout)
+
             remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
             await wait_model_ready(model_id, remaining_timeout)
             set_model_runtime_operation("ready", f"{model_id} is ready", model_id)
@@ -435,6 +1050,77 @@ async def schedule_model_runtime_activation(model_id: str) -> None:
             model_runtime_task.cancel()
         set_model_runtime_operation("switching", f"Switching to {model_id}", model_id)
         model_runtime_task = asyncio.create_task(activate_model_runtime(model_id))
+
+
+async def deploy_and_activate_model_runtime(model_id: str, backend: str | None = None) -> None:
+    global unlimited_ocr_runtime_backend
+    try:
+        if model_id == "unlimited-ocr" and backend:
+            unlimited_ocr_runtime_backend = normalize_unlimited_ocr_backend(backend)
+            save_runtime_settings({"unlimitedOcrBackend": unlimited_ocr_runtime_backend})
+        set_model_runtime_operation("switching", f"Deploying {model_id}", model_id)
+        await ensure_model_runtime_created(model_id, backend)
+        await activate_model_runtime(model_id)
+    except Exception as err:
+        logger.exception("Model runtime deployment failed")
+        set_model_runtime_operation("error", str(err), model_id)
+
+
+async def schedule_model_runtime_deploy(model_id: str, backend: str | None = None) -> None:
+    global model_runtime_task
+    if model_id not in MODEL_RUNTIME_CONFIG:
+        raise HTTPException(status_code=400, detail="Unknown model id")
+    if not model_control_available():
+        raise HTTPException(status_code=503, detail="Docker model control is not available")
+    async with model_runtime_lock:
+        if ocr_active_count > 0:
+            raise HTTPException(status_code=409, detail="OCR is running. Wait for the active task before deploying models.")
+        if model_runtime_task and not model_runtime_task.done():
+            raise HTTPException(status_code=409, detail="Model runtime is already busy. Wait for it to finish.")
+        set_model_runtime_operation("switching", f"Deploying {model_id}", model_id)
+        model_runtime_task = asyncio.create_task(deploy_and_activate_model_runtime(model_id, backend))
+
+
+async def activate_unlimited_ocr_backend(backend: str) -> None:
+    global unlimited_ocr_runtime_backend
+    previous_backend = unlimited_ocr_runtime_backend
+    async with model_runtime_lock:
+        set_model_runtime_operation("switching", f"Switching Unlimited-OCR backend to {backend}", "unlimited-ocr")
+        switch_started_at = time.monotonic()
+        unlimited_ocr_runtime_backend = backend
+        try:
+            status = await model_runtime_status("unlimited-ocr")
+            if status.get("running"):
+                remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
+                await ensure_unlimited_ocr_backend_runtime(backend, remaining_timeout)
+            save_runtime_settings({"unlimitedOcrBackend": backend})
+            set_model_runtime_operation("ready", f"Unlimited-OCR {backend} backend is ready", "unlimited-ocr")
+        except Exception as err:
+            logger.exception("Unlimited-OCR backend switch failed")
+            unlimited_ocr_runtime_backend = previous_backend
+            with contextlib.suppress(Exception):
+                remaining_timeout = max(3, MODEL_SWITCH_TIMEOUT - (time.monotonic() - switch_started_at))
+                await ensure_unlimited_ocr_backend_runtime(previous_backend, remaining_timeout)
+            set_model_runtime_operation("error", str(err), "unlimited-ocr")
+
+
+async def schedule_unlimited_ocr_backend_activation(backend: str) -> None:
+    global unlimited_ocr_backend_task
+    if not ENABLE_UNLIMITED_OCR:
+        raise HTTPException(status_code=404, detail="Unlimited-OCR is not enabled")
+    resolved_backend = normalize_unlimited_ocr_backend(backend)
+    async with model_runtime_lock:
+        if ocr_active_count > 0:
+            raise HTTPException(status_code=409, detail="OCR is running. Wait for the active task before switching backends.")
+        if model_runtime_task and not model_runtime_task.done():
+            raise HTTPException(status_code=409, detail="Model runtime is switching. Wait for it to finish before switching backends.")
+        if unlimited_ocr_backend_task and not unlimited_ocr_backend_task.done():
+            raise HTTPException(status_code=409, detail="Unlimited-OCR backend is already switching.")
+        if unlimited_ocr_runtime_backend == resolved_backend:
+            save_runtime_settings({"unlimitedOcrBackend": resolved_backend})
+            return
+        set_model_runtime_operation("switching", f"Switching Unlimited-OCR backend to {resolved_backend}", "unlimited-ocr")
+        unlimited_ocr_backend_task = asyncio.create_task(activate_unlimited_ocr_backend(resolved_backend))
 
 
 @asynccontextmanager
@@ -579,6 +1265,29 @@ async def get_model_runtime():
 @app.post("/api/model-runtime/switch")
 async def switch_model_runtime(request: ModelSwitchRequest):
     await schedule_model_runtime_activation(request.modelId)
+    return await build_model_runtime_payload()
+
+
+@app.post("/api/model-runtime/deploy")
+async def deploy_model_runtime(request: ModelDeployRequest):
+    await schedule_model_runtime_deploy(request.modelId, request.backend)
+    return await build_model_runtime_payload()
+
+
+@app.get("/api/unlimited-ocr/backend")
+async def get_unlimited_ocr_backend():
+    if not ENABLE_UNLIMITED_OCR:
+        raise HTTPException(status_code=404, detail="Unlimited-OCR is not enabled")
+    return {
+        "backend": unlimited_ocr_runtime_backend,
+        "supportedBackends": sorted(UNLIMITED_OCR_SUPPORTED_BACKENDS),
+        "runtime": await model_runtime_status("unlimited-ocr"),
+    }
+
+
+@app.post("/api/unlimited-ocr/backend")
+async def switch_unlimited_ocr_backend(request: UnlimitedOcrBackendRequest):
+    await schedule_unlimited_ocr_backend_activation(request.backend)
     return await build_model_runtime_payload()
 
 
@@ -3036,6 +3745,24 @@ def build_ppocr_payload(request: OCRRequest, base64_data: str, file_type: int) -
     return payload
 
 
+def build_unlimited_ocr_payload(request: OCRRequest, base64_data: str, file_type: int) -> dict:
+    payload = {
+        "file": base64_data,
+        "fileType": file_type,
+        "backend": unlimited_ocr_runtime_backend,
+    }
+    optional_params = [
+        "temperature",
+        "topP",
+        "visualize",
+    ]
+    for param in optional_params:
+        val = getattr(request, param)
+        if val is not None:
+            payload[param] = val
+    return payload
+
+
 def parse_pipeline_response(data: dict, image_prefix: str = "") -> dict:
     if "result" not in data or "layoutParsingResults" not in data["result"]:
         logger.warning("Unexpected pipeline response format: %s", data)
@@ -3143,6 +3870,109 @@ def parse_ppocr_response(data: dict) -> dict:
     }
 
 
+UNLIMITED_OCR_DET_RE = re.compile(r"<\|det\|>\s*([A-Za-z_][\w-]*)\s*(\[[^\]]*\])?\s*<\|/det\|>")
+UNLIMITED_OCR_SKIP_MARKDOWN_LABELS = {"header", "footer", "number", "page_number", "page_num"}
+UNLIMITED_OCR_CAPTION_LABELS = {"image_caption", "figure_caption", "table_caption"}
+UNLIMITED_OCR_TITLE_LABELS = {"title", "section_title"}
+
+
+def compact_markdown_block(text: str) -> str:
+    text = str(text).replace("\r\n", "\n").replace("\r", "\n")
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+def format_unlimited_ocr_block(label: str, content: str, *, seen_title: bool) -> tuple[str, bool]:
+    normalized_label = label.lower().strip()
+    text = compact_markdown_block(content)
+    if not text or normalized_label in UNLIMITED_OCR_SKIP_MARKDOWN_LABELS:
+        return "", seen_title
+
+    if normalized_label in UNLIMITED_OCR_TITLE_LABELS:
+        level = "##" if seen_title else "#"
+        return f"{level} {text}", True
+
+    if normalized_label in UNLIMITED_OCR_CAPTION_LABELS:
+        return f"*{text}*", seen_title
+
+    if normalized_label in {"formula", "display_formula"}:
+        return f"$$\n{text}\n$$", seen_title
+
+    if normalized_label in {"image", "chart"}:
+        return f"**{normalized_label.replace('_', ' ').title()}:** {text}", seen_title
+
+    return text, seen_title
+
+
+def clean_unlimited_ocr_markdown(markdown: str) -> str:
+    text = str(markdown).replace("\r\n", "\n").replace("\r", "\n")
+    if "<|det|>" not in text:
+        return compact_markdown_block(text)
+
+    matches = list(UNLIMITED_OCR_DET_RE.finditer(text))
+    if not matches:
+        return compact_markdown_block(re.sub(r"<\|/?det\|>", "", text))
+
+    blocks = []
+    prefix = compact_markdown_block(text[: matches[0].start()])
+    if prefix:
+        blocks.append(prefix)
+
+    seen_title = False
+    for index, match in enumerate(matches):
+        next_start = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        block, seen_title = format_unlimited_ocr_block(match.group(1), text[match.end() : next_start], seen_title=seen_title)
+        if block:
+            blocks.append(block)
+
+    return compact_markdown_block("\n\n".join(blocks))
+
+
+def parse_unlimited_ocr_response(data: dict) -> dict:
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=500, detail="Unexpected response format from Unlimited-OCR service")
+
+    markdown = data.get("markdown")
+    if markdown is None:
+        markdown = data.get("text") or data.get("result") or ""
+    markdown = clean_unlimited_ocr_markdown(str(markdown))
+
+    images = data.get("images") if isinstance(data.get("images"), dict) else {}
+    results = data.get("layoutParsingResults")
+    if not isinstance(results, list):
+        results = [
+            {
+                "model": UNLIMITED_OCR_MODEL_NAME,
+                "parser": "unlimited-ocr",
+                "markdown": {
+                    "text": str(markdown),
+                    "images": images,
+                },
+            }
+        ]
+    else:
+        normalized_results = []
+        for result in results:
+            if not isinstance(result, dict):
+                normalized_results.append(result)
+                continue
+            normalized_result = dict(result)
+            result_markdown = normalized_result.get("markdown")
+            if isinstance(result_markdown, dict):
+                normalized_markdown = dict(result_markdown)
+                normalized_markdown["text"] = clean_unlimited_ocr_markdown(str(normalized_markdown.get("text", "")))
+                normalized_result["markdown"] = normalized_markdown
+            normalized_results.append(normalized_result)
+        results = normalized_results
+
+    return {
+        "markdown": markdown,
+        "images": images,
+        "layoutParsingResults": results,
+    }
+
+
 async def acquire_ocr_slot(model_id: str, not_ready_message: str) -> None:
     global ocr_active_count
     await ocr_semaphore.acquire()
@@ -3222,6 +4052,64 @@ async def run_ppocrv6_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -
                 raise HTTPException(status_code=resp.status_code, detail=f"Upstream PP-OCR error: {resp.text}")
 
             return parse_ppocr_response(resp.json())
+    finally:
+        await release_ocr_slot()
+
+
+async def run_unlimited_ocr_request(ocr_request: OCRRequest, raw_input: RawOCRInput) -> dict:
+    if not ENABLE_UNLIMITED_OCR:
+        raise HTTPException(status_code=404, detail="Unlimited-OCR is not enabled")
+
+    await acquire_ocr_slot(
+        "unlimited-ocr",
+        "Unlimited-OCR service is not ready. Switch to this model and wait for it to become ready.",
+    )
+    try:
+        base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+        payload = build_unlimited_ocr_payload(ocr_request, base64_data, file_type)
+
+        logger.info("Sending request to Unlimited-OCR adapter at %s", UNLIMITED_OCR_SERVICE_URL)
+        timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.post(
+                UNLIMITED_OCR_SERVICE_URL,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            )
+
+            if resp.status_code != 200:
+                logger.warning("Unlimited-OCR Service Error (HTTP %s): %s", resp.status_code, resp.text)
+                raise HTTPException(status_code=resp.status_code, detail=f"Upstream Unlimited-OCR error: {resp.text}")
+
+            return parse_unlimited_ocr_response(resp.json())
+    finally:
+        await release_ocr_slot()
+
+
+async def stream_unlimited_ocr_events(ocr_request: OCRRequest, raw_input: RawOCRInput):
+    try:
+        base64_data, file_type = prepare_service_input(ocr_request, raw_input)
+        payload = build_unlimited_ocr_payload(ocr_request, base64_data, file_type)
+        stream_url = UNLIMITED_OCR_SERVICE_URL.rsplit("/", 1)[0] + "/ocr/stream"
+        timeout = PADDLE_REQUEST_TIMEOUT if PADDLE_REQUEST_TIMEOUT > 0 else None
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            async with client.stream(
+                "POST",
+                stream_url,
+                json=payload,
+                headers={"Content-Type": "application/json"},
+            ) as resp:
+                if resp.status_code != 200:
+                    body = (await resp.aread()).decode("utf-8", errors="replace")
+                    yield json.dumps({"type": "error", "detail": f"Upstream Unlimited-OCR error: {body}"}, ensure_ascii=False) + "\n"
+                    return
+                async for line in resp.aiter_lines():
+                    if line:
+                        yield line + "\n"
+    except Exception as err:
+        logger.exception("Unlimited-OCR stream proxy failed")
+        yield json.dumps({"type": "error", "detail": str(err)}, ensure_ascii=False) + "\n"
     finally:
         await release_ocr_slot()
 
@@ -3838,6 +4726,44 @@ async def glm_ocr_status():
             return {"online": True, "modelLoaded": has_model, "models": models}
     except Exception:
         return {"online": False, "modelLoaded": False, "models": []}
+
+
+@app.post("/api/unlimited-ocr")
+async def proxy_unlimited_ocr(request: Request):
+    """Proxy request to the optional Unlimited-OCR adapter service."""
+    try:
+        ocr_request, raw_image = await parse_ocr_input(request)
+        base64_size = validate_proxy_input_size(raw_image)
+        logger.info("Received Unlimited-OCR request. Base64 input size: %s bytes", base64_size)
+        return await run_unlimited_ocr_request(ocr_request, raw_image)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unlimited-OCR Proxy Error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/unlimited-ocr/stream")
+async def proxy_unlimited_ocr_stream(request: Request):
+    try:
+        ocr_request, raw_image = await parse_ocr_input(request)
+        base64_size = validate_proxy_input_size(raw_image)
+        logger.info("Received streaming Unlimited-OCR request. Base64 input size: %s bytes", base64_size)
+        if not ENABLE_UNLIMITED_OCR:
+            raise HTTPException(status_code=404, detail="Unlimited-OCR is not enabled")
+        await acquire_ocr_slot(
+            "unlimited-ocr",
+            "Unlimited-OCR service is not ready. Switch to this model and wait for it to become ready.",
+        )
+        return StreamingResponse(
+            stream_unlimited_ocr_events(ocr_request, raw_image),
+            media_type="application/x-ndjson",
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Unlimited-OCR Stream Proxy Error")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

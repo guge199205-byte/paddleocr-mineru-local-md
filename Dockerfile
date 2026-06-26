@@ -18,6 +18,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY server.py .
+COPY unlimited_ocr_adapter.py .
+COPY Dockerfile.ocr Dockerfile.unlimited-ocr Dockerfile.unlimited-ocr-sglang ./
 COPY static/ ./static/
 
 EXPOSE 8000

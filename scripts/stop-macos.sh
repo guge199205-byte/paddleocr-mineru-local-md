@@ -46,6 +46,7 @@ stop_pid_file() {
 }
 
 stop_pid_file run/pandocr-web.pid "PaddleOCR Local Web service" "server.py"
+stop_pid_file run/unlimited-ocr.pid "Unlimited-OCR adapter" "unlimited_ocr_adapter:app"
 stop_pid_file run/paddlex.pid "PaddleX service" "paddlex --serve"
 stop_pid_file run/ppocrv6.pid "PP-OCRv6 service" "paddlex --serve"
 stop_pid_file run/mlx-vlm.pid "MLX-VLM service" "mlx_vlm.server"
