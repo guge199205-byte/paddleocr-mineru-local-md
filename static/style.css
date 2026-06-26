@@ -281,6 +281,120 @@ svg {
     color: inherit;
 }
 
+/* ── Batch queue bar (sidebar) ─────────────────────────────────── */
+
+.batch-queue-bar {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 0 2px;
+    padding: 10px 12px;
+    border: 1px solid var(--line-strong);
+    border-radius: 8px;
+    background: linear-gradient(180deg, var(--brand-soft), #fff);
+    box-shadow: 0 2px 8px rgba(37, 99, 235, .06);
+}
+
+.batch-queue-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.batch-queue-title {
+    color: var(--text);
+    font-size: 13px;
+    font-weight: 700;
+}
+
+.batch-queue-counts {
+    color: var(--brand);
+    font-size: 12px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+}
+
+.batch-queue-progress {
+    height: 5px;
+    border-radius: 999px;
+    overflow: hidden;
+    background: rgba(37, 99, 235, .14);
+}
+
+.batch-queue-progress-fill {
+    height: 100%;
+    width: 0%;
+    background: var(--brand);
+    transition: width .25s ease;
+}
+
+.batch-queue-current {
+    min-height: 16px;
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.35;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.batch-queue-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.batch-queue-btn {
+    flex: 1 1 auto;
+    min-width: 0;
+    height: 28px;
+    padding: 0 8px;
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    background: #fff;
+    color: var(--text);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 600;
+    transition: background .15s, color .15s, border-color .15s;
+}
+
+.batch-queue-btn:hover {
+    border-color: var(--brand);
+    color: var(--brand);
+}
+
+.batch-queue-btn:disabled {
+    opacity: .45;
+    cursor: not-allowed;
+}
+
+.batch-queue-btn-primary {
+    color: #fff;
+    background: var(--brand);
+    border-color: var(--brand);
+}
+
+.batch-queue-btn-primary:hover {
+    background: var(--brand-strong);
+    border-color: var(--brand-strong);
+    color: #fff;
+}
+
+.batch-queue-btn-danger:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
+.batch-queue-bar.is-paused .batch-queue-progress-fill {
+    background: var(--warning);
+}
+
+.batch-queue-bar[data-state="idle"] .batch-queue-current {
+    color: var(--faint);
+}
+
 .new-task-button,
 .primary-button,
 .secondary-button,

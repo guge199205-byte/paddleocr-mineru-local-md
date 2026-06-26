@@ -86,6 +86,15 @@ const els = {
     browseBtn: document.getElementById('browse-btn'),
     newTaskBtn: document.getElementById('new-task-btn'),
     batchFolderBtn: document.getElementById('batch-folder-btn'),
+    batchQueueBar: document.getElementById('batch-queue-bar'),
+    batchQueueTitle: document.getElementById('batch-queue-title'),
+    batchQueueCounts: document.getElementById('batch-queue-counts'),
+    batchQueueProgressFill: document.getElementById('batch-queue-progress-fill'),
+    batchQueueCurrent: document.getElementById('batch-queue-current'),
+    batchPauseBtn: document.getElementById('batch-pause-btn'),
+    batchSkipBtn: document.getElementById('batch-skip-btn'),
+    batchRetryBtn: document.getElementById('batch-retry-btn'),
+    batchStopBtn: document.getElementById('batch-stop-btn'),
     dropZone: document.getElementById('drop-zone'),
     taskList: document.getElementById('task-list'),
     taskSearch: document.getElementById('task-search'),
@@ -195,6 +204,24 @@ function setupEventListeners() {
         const files = event.target.files;
         await handleFolderBatch(files);
         els.folderInput.value = '';
+    });
+
+    // Batch queue controls (paused/skipped/retry/stop).
+    els.batchPauseBtn?.addEventListener('click', () => {
+        if (batchQueue.paused) {
+            resumeBatchQueue();
+        } else {
+            pauseBatchQueue();
+        }
+    });
+    els.batchSkipBtn?.addEventListener('click', () => {
+        skipCurrentBatchJob();
+    });
+    els.batchStopBtn?.addEventListener('click', () => {
+        stopBatchQueue();
+    });
+    els.batchRetryBtn?.addEventListener('click', () => {
+        retryFailedBatchJobs();
     });
 
     ['dragenter', 'dragover'].forEach((name) => {
@@ -1145,9 +1172,12 @@ async function handleFiles(files) {
         console.warn('Some tasks could not be saved before processing', saveFailures.map((result) => result.reason));
     }
 
-    for (const task of newTasks) {
-        await processTask(task, { confirmCompleted: false });
-    }
+    // Hand the freshly-created tasks to the batch queue driver. The
+    // driver enforces strict serialization (one OCR job in flight at a
+    // time) — even for a single task it's a thin wrapper around
+    // processTask(). For >1 task it's the only thing that actually
+    // works, because processTask() returns early for server-side jobs.
+    enqueueTasks(newTasks.map((task) => task.id));
 }
 
 // Extensions accepted by the batch folder picker. Mirrors the
@@ -1222,11 +1252,13 @@ function filesToFakeListWithRelative(files, topDir) {
     });
 }
 
-// Pulled from a directory pick: filter to supported types, auto-create
-// a folder named after the picked directory, then reuse the existing
-// handleFiles() pipeline so every file is queued + parsed serially
-// just like a manual multi-file selection.
-async function handleFolderBatch(fileListLike) {
+// Entry point for batch picks (file picker + folder drag-drop). Strips
+// unsupported extensions, drops the files into an auto-named sidebar
+// folder, then hands them to the queue driver which is what actually
+// keeps the OCR pipeline serial (handleFiles() alone doesn't, because
+// server-side jobs return as soon as SSE is wired up — only the queue
+// driver knows when one job is *really* finished).
+async function handleFolderBatch(fileListLike, { folderNameHint = '' } = {}) {
     if (!fileListLike || fileListLike.length === 0) return;
 
     const all = Array.from(fileListLike);
@@ -1236,26 +1268,26 @@ async function handleFolderBatch(fileListLike) {
     });
 
     if (supported.length === 0) {
-        alert(t('文件夹里没有可解析的文件（支持 PDF、图片、PPT/DOC）。'));
+        alert(t('没有可解析的文件（支持 PDF、图片、PPT/DOC）。'));
         return;
     }
 
-    // Derive the folder name from the first file's webkitRelativePath
-    // (e.g. "MyDocs/sub/a.pdf" → "MyDocs"). Fall back to a timestamped
-    // name if the browser didn't populate the relative path.
+    // Folder name: prefer caller hint (drag-drop top dir), else first
+    // file's webkitRelativePath, else a timestamped fallback.
     const firstRel = supported[0].webkitRelativePath || '';
-    const topDir = firstRel.split('/')[0] || `批量解析-${new Date().toLocaleString('zh-CN').replace(/[/: ]/g, '-')}`;
+    const dirFromRel = firstRel.split('/')[0];
+    const topDir = (folderNameHint || dirFromRel || `批量解析-${formatBatchTimestamp()}`).trim();
 
     const skipped = all.length - supported.length;
-    const proceed = confirm(t('将把文件夹「{name}」中 {count} 个文件加入批量解析队列，跳过 {skipped} 个不支持的文件。确认继续？', {
-        name: topDir,
+    const proceed = confirm(t('将批量解析 {count} 个文件{skip}，归到文件夹「{name}」。确认继续？', {
         count: supported.length,
-        skipped
+        skip: skipped > 0 ? t('（跳过 {n} 个不支持的）', { n: skipped }) : '',
+        name: topDir
     }));
     if (!proceed) return;
 
-    // Make sure a folder with this name exists, then activate it so
-    // handleFiles() drops the new tasks into it automatically.
+    // Make sure the folder exists, then activate it so newly created
+    // tasks land inside it automatically.
     const folder = await ensureFolderByName(topDir);
     if (folder) {
         activeFolderId = folder.id;
@@ -1263,6 +1295,288 @@ async function handleFolderBatch(fileListLike) {
     }
 
     await handleFiles(supported);
+}
+
+function formatBatchTimestamp() {
+    const d = new Date();
+    const pad = (n) => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`;
+}
+
+// ── Batch queue driver ────────────────────────────────────────────
+//
+// The queue keeps OCR strictly serial across an arbitrary number of
+// uploaded tasks. handleFiles() used to await processTask() in a
+// for-loop, but server-side processTask returns the moment SSE is
+// connected — the second iteration would then see isProcessing===true
+// and bail out, leaving every task after the first unparsed. The
+// driver below awaits a completion promise that only resolves when the
+// SSE / polling layer reports the task as completed / error / paused,
+// so the next task only starts when the previous one is actually done.
+//
+// State:
+//   queue        — task ids waiting to be parsed (FIFO)
+//   running      — task id currently being parsed (or null)
+//   results      — {taskId: 'completed'|'error'|'skipped'} for the
+//                  current batch run, used to drive the retry button
+//                  and the progress display
+//   totalThisRun — how many tasks were in this run when it started
+//                  (used to compute the progress bar)
+//   paused       — when true, the driver stops at the next boundary
+//   stopping     — when true, the driver drains immediately
+//   completion   — Promise that resolves when the active task finishes
+//                  (resolved by finishServerProcessing / pollTaskProgress
+//                  / client-side processTask normal+error paths)
+const batchQueue = {
+    queue: [],
+    running: null,
+    results: new Map(),
+    totalThisRun: 0,
+    paused: false,
+    stopping: false,
+    completion: null,
+    completionResolve: null,
+    driverRunning: false,
+};
+
+function enqueueTasks(taskIds, { autoStart = true } = {}) {
+    if (!taskIds || !taskIds.length) return;
+    for (const id of taskIds) {
+        if (id && !batchQueue.queue.includes(id) && batchQueue.running !== id) {
+            batchQueue.queue.push(id);
+        }
+    }
+    batchQueue.totalThisRun = countQueueTotal();
+    renderBatchQueueBar();
+    if (autoStart) startBatchDriver();
+}
+
+function countQueueTotal() {
+    // Total = already done in this run + currently running + still queued.
+    return batchQueue.results.size + (batchQueue.running ? 1 : 0) + batchQueue.queue.length;
+}
+
+function countDoneStatus(status) {
+    let n = 0;
+    for (const value of batchQueue.results.values()) if (value === status) n++;
+    return n;
+}
+
+function resetBatchRunStats() {
+    batchQueue.results.clear();
+    batchQueue.totalThisRun = 0;
+}
+
+async function startBatchDriver() {
+    if (batchQueue.driverRunning) return;
+    batchQueue.driverRunning = true;
+    try {
+        while (!batchQueue.stopping && (batchQueue.queue.length > 0 || batchQueue.running)) {
+            if (batchQueue.paused) {
+                renderBatchQueueBar();
+                await waitWhile(() => batchQueue.paused && !batchQueue.stopping);
+                if (batchQueue.stopping) break;
+            }
+            const nextId = batchQueue.queue.shift();
+            if (!nextId) break;
+            const task = tasks.find((t) => t.id === nextId);
+            if (!task) continue;
+            batchQueue.running = nextId;
+            renderBatchQueueBar();
+
+            // Surface the task that's running so users see progress live.
+            if (activeTaskId !== nextId) {
+                selectTask(nextId).catch(() => {});
+            }
+
+            try {
+                await runOneAndAwait(task);
+                if (!batchQueue.results.has(nextId)) {
+                    const final = (tasks.find((t) => t.id === nextId)?.status) || 'error';
+                    batchQueue.results.set(nextId, final === 'completed' ? 'completed' : 'error');
+                }
+            } catch (err) {
+                console.error('Batch task failed', err);
+                batchQueue.results.set(nextId, 'error');
+            } finally {
+                batchQueue.running = null;
+                batchQueue.completion = null;
+                batchQueue.completionResolve = null;
+                renderBatchQueueBar();
+            }
+        }
+    } finally {
+        batchQueue.driverRunning = false;
+        if (batchQueue.queue.length === 0 && !batchQueue.running) {
+            renderBatchQueueBar({ finished: true });
+        }
+    }
+}
+
+// Wraps processTask so the driver waits until the task hits a terminal
+// state (completed / error / paused / skipped), regardless of whether
+// it was processed client-side or via the server SSE path.
+async function runOneAndAwait(task) {
+    batchQueue.completion = new Promise((resolve) => {
+        batchQueue.completionResolve = resolve;
+    });
+    // processTask resolves immediately for server-side jobs (after SSE
+    // is connected). That's why we don't return its promise — we wait
+    // on our own completion promise instead, which the SSE / polling /
+    // client-side paths all resolve via signalBatchJobDone().
+    processTask(task, { confirmCompleted: false }).catch((err) => {
+        console.error('processTask threw inside batch queue', err);
+        signalBatchJobDone(task.id, 'error');
+    });
+    await batchQueue.completion;
+}
+
+// Called from finishServerProcessing / pollTaskProgress / client-side
+// terminal paths to release the queue driver.
+function signalBatchJobDone(taskId, status) {
+    if (batchQueue.running !== taskId) return;          // not the one we're awaiting
+    if (status && !batchQueue.results.has(taskId)) batchQueue.results.set(taskId, status);
+    if (batchQueue.completionResolve) {
+        const resolve = batchQueue.completionResolve;
+        batchQueue.completionResolve = null;
+        resolve();
+    }
+}
+
+function waitWhile(predicate) {
+    return new Promise((resolve) => {
+        const tick = () => {
+            if (!predicate()) return resolve();
+            setTimeout(tick, 120);
+        };
+        tick();
+    });
+}
+
+function pauseBatchQueue() {
+    if (!isBatchActive()) return;
+    batchQueue.paused = true;
+    renderBatchQueueBar();
+}
+
+function resumeBatchQueue() {
+    batchQueue.paused = false;
+    renderBatchQueueBar();
+    startBatchDriver();
+}
+
+async function skipCurrentBatchJob() {
+    const runningId = batchQueue.running;
+    if (!runningId) return;
+    // Mark as skipped so the retry button doesn't try to re-run it.
+    batchQueue.results.set(runningId, 'skipped');
+    // Use the existing cancel path for server-side jobs; for client-side
+    // there's no in-flight cancellation, so we just let the driver
+    // detect the early resolve and move on.
+    try {
+        await cancelServerProcessing(runningId);
+    } catch (_) { /* ignore — driver will move on regardless */ }
+    signalBatchJobDone(runningId, 'skipped');
+}
+
+async function stopBatchQueue() {
+    if (!confirm(t('停止批量解析？剩余 {n} 个任务将不会被解析。', { n: batchQueue.queue.length }))) return;
+    batchQueue.stopping = true;
+    batchQueue.queue = [];
+    const runningId = batchQueue.running;
+    if (runningId) {
+        batchQueue.results.set(runningId, 'skipped');
+        try { await cancelServerProcessing(runningId); } catch (_) {}
+        signalBatchJobDone(runningId, 'skipped');
+    }
+    // Let the driver loop unwind, then clear stopping for next run.
+    setTimeout(() => {
+        batchQueue.stopping = false;
+        batchQueue.paused = false;
+        renderBatchQueueBar();
+    }, 200);
+}
+
+function retryFailedBatchJobs() {
+    const failed = [];
+    for (const [id, status] of batchQueue.results.entries()) {
+        if (status === 'error' || status === 'skipped') failed.push(id);
+    }
+    if (failed.length === 0) return;
+    // Drop the failed entries from the results map so the progress
+    // counter reflects the new attempt.
+    for (const id of failed) batchQueue.results.delete(id);
+    enqueueTasks(failed);
+}
+
+function isBatchActive() {
+    return Boolean(batchQueue.running) || batchQueue.queue.length > 0;
+}
+
+function renderBatchQueueBar({ finished = false } = {}) {
+    const bar = els.batchQueueBar;
+    if (!bar) return;
+
+    const total = countQueueTotal();
+    const completed = countDoneStatus('completed');
+    const errored = countDoneStatus('error');
+    const skipped = countDoneStatus('skipped');
+    const remaining = batchQueue.queue.length + (batchQueue.running ? 1 : 0);
+    const denominator = Math.max(total, batchQueue.totalThisRun, 1);
+    const percent = Math.round(((total - remaining) / denominator) * 100);
+
+    // Show / hide the whole bar based on whether a batch is active.
+    const shouldShow = total > 1 || isBatchActive() || (finished && batchQueue.totalThisRun > 1);
+    bar.classList.toggle('hidden', !shouldShow);
+    if (!shouldShow) {
+        // Reset run stats when the user has dismissed/finished a batch
+        resetBatchRunStats();
+        return;
+    }
+
+    bar.dataset.state = batchQueue.paused ? 'paused' : (isBatchActive() ? 'running' : 'idle');
+    bar.classList.toggle('is-paused', batchQueue.paused);
+
+    if (els.batchQueueCounts) {
+        els.batchQueueCounts.textContent = `${total - remaining}/${denominator}`;
+    }
+    if (els.batchQueueProgressFill) {
+        els.batchQueueProgressFill.style.width = `${percent}%`;
+    }
+    if (els.batchQueueTitle) {
+        if (batchQueue.paused) {
+            els.batchQueueTitle.textContent = t('批量解析已暂停');
+        } else if (!isBatchActive()) {
+            els.batchQueueTitle.textContent = t('批量解析结束');
+        } else {
+            els.batchQueueTitle.textContent = t('批量解析中');
+        }
+    }
+    if (els.batchQueueCurrent) {
+        const runningTask = batchQueue.running ? tasks.find((t) => t.id === batchQueue.running) : null;
+        const parts = [];
+        if (runningTask) parts.push(t('当前：{name}', { name: runningTask.name || runningTask.id }));
+        if (errored) parts.push(t('失败 {n}', { n: errored }));
+        if (skipped) parts.push(t('跳过 {n}', { n: skipped }));
+        if (!parts.length && !isBatchActive()) parts.push(t('已完成 {n} 个', { n: completed }));
+        els.batchQueueCurrent.textContent = parts.join(' · ');
+    }
+
+    if (els.batchPauseBtn) {
+        els.batchPauseBtn.disabled = !isBatchActive() && !batchQueue.paused;
+        els.batchPauseBtn.textContent = batchQueue.paused ? t('继续') : t('暂停');
+    }
+    if (els.batchSkipBtn) {
+        els.batchSkipBtn.disabled = !batchQueue.running;
+    }
+    if (els.batchStopBtn) {
+        els.batchStopBtn.disabled = !isBatchActive();
+    }
+    if (els.batchRetryBtn) {
+        const canRetry = (errored + skipped) > 0;
+        els.batchRetryBtn.hidden = !canRetry;
+        els.batchRetryBtn.disabled = isBatchActive() && !batchQueue.paused;
+    }
 }
 
 async function ensureFolderByName(name) {
@@ -3057,8 +3371,17 @@ async function processActiveTask() {
 }
 
 async function processTask(task, { confirmCompleted = true } = {}) {
-    if (!task || isProcessing) return;
-    if (confirmCompleted && task.status === 'completed' && !confirm(t('这个任务已经解析完成，要重新解析吗？'))) return;
+    if (!task) return;
+    // If another task is already in flight, release the queue so it can
+    // come back to us later (or, for non-batch callers, just no-op).
+    if (isProcessing) {
+        signalBatchJobDone(task.id, 'error');
+        return;
+    }
+    if (confirmCompleted && task.status === 'completed' && !confirm(t('这个任务已经解析完成，要重新解析吗？'))) {
+        signalBatchJobDone(task.id, 'skipped');
+        return;
+    }
 
     let resumeExistingResults = shouldResumeTask(task);
     let targetModel = resumeExistingResults ? getTaskModel(task) : getSelectedModel();
@@ -3090,7 +3413,10 @@ async function processTask(task, { confirmCompleted = true } = {}) {
     }
 
     const modelReady = await ensureModelRuntimeReadyForTask(task, targetModel);
-    if (!modelReady) return;
+    if (!modelReady) {
+        signalBatchJobDone(task.id, 'error');
+        return;
+    }
 
     // Decide processing mode: server-side (background) for tasks with sourceUrl,
     // client-side for small tasks without server source
@@ -3183,6 +3509,11 @@ async function processTask(task, { confirmCompleted = true } = {}) {
             task.updatedAt = Date.now();
             await saveTask(task, { includeResults: false });
             refreshTaskUi(task);
+            // Notify the batch driver — client-side jobs don't hit SSE.
+            signalBatchJobDone(task.id, 'completed');
+        } else {
+            // Error path: still need to release the queue.
+            signalBatchJobDone(task.id, 'error');
         }
     }
 }
@@ -3448,6 +3779,10 @@ async function finishServerProcessing(taskId, status, error = null) {
         }
     }
     updateActionState(tasks.find((t) => t.id === taskId));
+    // Release the batch queue driver — this is the signal it's been
+    // waiting for to start the next file.
+    const batchStatus = status === 'completed' ? 'completed' : (status === 'paused' ? 'skipped' : 'error');
+    signalBatchJobDone(taskId, batchStatus);
 }
 
 function pollTaskProgress(taskId) {
@@ -3482,6 +3817,10 @@ function pollTaskProgress(taskId) {
                 }
                 renderTaskList();
                 updateActionState(serverTask);
+                const batchStatus = serverTask.status === 'completed'
+                    ? 'completed'
+                    : (serverTask.status === 'paused' ? 'skipped' : 'error');
+                signalBatchJobDone(taskId, batchStatus);
             } else if (activeTaskId === taskId) {
                 // Update progress display
                 const completedBatches = (serverTask.batches || []).filter((b) => b.status === 'completed').length;
