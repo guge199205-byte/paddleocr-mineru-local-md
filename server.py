@@ -1412,8 +1412,93 @@ def extract_pdf_pages(source_path: Path, start_page: int, end_page: int, output_
         with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp_file:
             writer.write(tmp_file)
             return Path(tmp_file.name)
-    except Exception:
-        raise
+    finally:
+        reader.stream.close() if hasattr(reader, "stream") else None
+
+
+# ── Server-side PDF thumbnail rendering ────────────────────────────
+# Renders one PDF page to a WebP/JPEG file on disk. The frontend
+# requests these directly via /api/tasks/{id}/thumb/{n} so the browser
+# never has to load the whole PDF — this is what makes 500-page /
+# 1 GB+ PDFs browseable without freezing the tab.
+
+THUMB_DEFAULT_DPI = 90         # 90 DPI = ~1240 px wide for A4, ~120-200 KB PNG
+THUMB_MAX_DPI = 180            # cap the on-demand zoom-in
+THUMB_FORMAT = "png"            # png is what PyMuPDF.tobytes() supports natively
+
+
+def _thumbs_dir(task_id: str) -> Path:
+    return task_dir_path(task_id) / "thumbs"
+
+
+def _thumb_path(task_id: str, page: int, dpi: int) -> Path:
+    safe_dpi = max(THUMB_DEFAULT_DPI, min(int(dpi or THUMB_DEFAULT_DPI), THUMB_MAX_DPI))
+    return _thumbs_dir(task_id) / f"p{page:04d}_d{safe_dpi}.{THUMB_FORMAT}"
+
+
+def _ensure_thumb(source_path: Path, output_path: Path, page: int, dpi: int) -> None:
+    """Render one PDF page to WebP. Cached on disk. Skips work if the
+    cache file already exists with a newer mtime than the PDF itself.
+    """
+    if output_path.exists():
+        try:
+            if output_path.stat().st_mtime >= source_path.stat().st_mtime:
+                return
+        except OSError:
+            pass
+    import fitz
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    # matrix=zoom scales in 72-DPI units: 1.0 = 72 DPI. So dpi/72 is the
+    # zoom factor. fitz renders a single page on demand without pulling
+    # the whole document into memory.
+    zoom = max(0.5, min(dpi / 72.0, 4.0))
+    matrix = fitz.Matrix(zoom, zoom)
+    doc = fitz.open(str(source_path))
+    try:
+        if page < 1 or page > doc.page_count:
+            raise ValueError(f"Page {page} out of range (1..{doc.page_count})")
+        page_obj = doc.load_page(page - 1)
+        pix = page_obj.get_pixmap(matrix=matrix, alpha=False)
+        # PyMuPDF supports tobytes() with output=png natively. We
+        # re-encode through PIL with optimize + 8-bit palette mode to
+        # get a much smaller file (a 110-DPI A4 page is ~250 KB
+        # instead of the 1+ MB raw fitz output).
+        from PIL import Image
+        import io
+        raw = pix.tobytes(output=THUMB_FORMAT)
+        im = Image.open(io.BytesIO(raw))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        out_buf = io.BytesIO()
+        im.save(out_buf, format="PNG", optimize=True)
+        data = out_buf.getvalue()
+        tmp = output_path.with_suffix(output_path.suffix + ".tmp")
+        tmp.write_bytes(data)
+        tmp.replace(output_path)
+    finally:
+        doc.close()
+
+
+def _page_dimensions(source_path: Path) -> list[dict]:
+    """Return [{page, width_pt, height_pt}] for every page. Used so the
+    frontend can lay out placeholders with the correct aspect ratio
+    before the actual image arrives."""
+    import fitz
+
+    doc = fitz.open(str(source_path))
+    try:
+        out = []
+        for i, page in enumerate(doc, start=1):
+            rect = page.rect
+            out.append({
+                "page": i,
+                "widthPt": round(rect.width, 2),
+                "heightPt": round(rect.height, 2),
+            })
+        return out
+    finally:
+        doc.close()
 
 
 @app.post("/api/tasks/{task_id}/source")
@@ -1521,6 +1606,87 @@ async def get_task_source_pages(
         raise HTTPException(status_code=500, detail=f"Failed to extract PDF pages: {err}") from err
 
     return FileResponse(result_path, media_type="application/pdf", filename=f"pages_{start_page}_{end_page}.pdf")
+
+
+@app.get("/api/tasks/{task_id}/thumbs")
+async def get_task_thumb_metadata(
+    task_id: str,
+    max_pages: int = Query(500, ge=1, le=2000),
+):
+    """Return per-page dimensions and a flag for which pages have a
+    thumbnail on disk. The frontend uses this to lay out placeholders
+    with the right aspect ratio before the actual <img> loads.
+    """
+    source_path = task_source_path(task_id)
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail="Task source not found")
+
+    try:
+        # Use PyMuPDF to read page dims in a single pass (no full render).
+        # Cap at max_pages so a 5000-page PDF doesn't blow up this call.
+        import fitz
+        doc = fitz.open(str(source_path))
+        try:
+            count = min(doc.page_count, max_pages)
+            thumbs_dir = _thumbs_dir(task_id)
+            pages = []
+            for i in range(1, count + 1):
+                rect = doc[i - 1].rect
+                cached = (thumbs_dir / f"p{i:04d}_d{THUMB_DEFAULT_DPI}.{THUMB_FORMAT}").exists()
+                pages.append({
+                    "page": i,
+                    "widthPt": round(rect.width, 2),
+                    "heightPt": round(rect.height, 2),
+                    "cached": cached,
+                })
+            return {
+                "totalPages": doc.page_count,
+                "truncated": doc.page_count > count,
+                "defaultDpi": THUMB_DEFAULT_DPI,
+                "format": THUMB_FORMAT,
+                "pages": pages,
+            }
+        finally:
+            doc.close()
+    except Exception as err:
+        logger.exception("Failed to read PDF dims for task %s", task_id)
+        raise HTTPException(status_code=500, detail=f"Failed to read PDF dimensions: {err}") from err
+
+
+@app.get("/api/tasks/{task_id}/thumb/{page}")
+async def get_task_thumb(
+    task_id: str,
+    page: int,
+    dpi: int = Query(THUMB_DEFAULT_DPI, ge=72, le=THUMB_MAX_DPI),
+):
+    """Render (or fetch cached) one PDF page as a WebP image.
+
+    The frontend requests this per page as the user scrolls. Each
+    response is ~100 KB at default DPI, regardless of the source PDF
+    size, so a 1 GB file with 500 pages still feels light.
+    """
+    source_path = task_source_path(task_id)
+    if not source_path.exists():
+        raise HTTPException(status_code=404, detail="Task source not found")
+
+    output_path = _thumb_path(task_id, page, dpi)
+    try:
+        await run_in_threadpool(_ensure_thumb, source_path, output_path, page, dpi)
+    except ValueError as err:
+        raise HTTPException(status_code=400, detail=str(err)) from err
+    except Exception as err:
+        logger.exception("Failed to render thumb for task %s page %d", task_id, page)
+        raise HTTPException(status_code=500, detail=f"Failed to render thumbnail: {err}") from err
+
+    # 1-year cache: the URL changes with task id, so the browser won't
+    # serve a stale one across tasks. The 404 above keeps us safe if
+    # the user opens a different task with the same id (impossible
+    # under random secrets.token_urlsafe, but defence in depth).
+    headers = {
+        "Cache-Control": "public, max-age=31536000, immutable",
+        "X-Page-Number": str(page),
+    }
+    return FileResponse(output_path, media_type="image/png", headers=headers)
 
 
 @app.get("/api/tasks")

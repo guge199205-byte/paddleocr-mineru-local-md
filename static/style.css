@@ -2401,3 +2401,14 @@ body.task-select-mode .task-item.checked {
     width: 100%;
     justify-content: center;
 }
+
+/* ── Server-rendered PDF thumbs (no PDF.js) ─────────────────────── */
+
+.thumb-image {
+    display: block;
+    width: auto;
+    max-width: 100%;
+    height: auto;
+    background: #fff;
+    box-shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+}

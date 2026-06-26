@@ -2622,6 +2622,112 @@ async function renderSource(task) {
 
     currentPage = Math.min(Math.max(currentPage, 1), task.pageCount || 1);
     els.pdfControls.classList.add('hidden');
+
+    // Two paths:
+    //  1. Server-rendered thumbs (default for large / normal PDFs):
+    //     the backend pre-renders every page to a small PNG. The
+    //     browser never sees the whole PDF — no PDF.js, no decode
+    //     storm, no main-thread freeze.
+    //  2. PDF.js (fallback for dataUrl tasks where we already have
+    //     the bytes client-side, or for environments where the
+    //     server doesn't expose /thumbs).
+    let thumbsMeta = null;
+    if (!task.sourceDataUrl) {
+        try {
+            const metaResp = await apiFetch(`${API_BASE}/tasks/${encodeURIComponent(task.id)}/thumbs`);
+            if (metaResp.ok) {
+                thumbsMeta = await metaResp.json();
+            }
+        } catch (_) { thumbsMeta = null; }
+    }
+    if (thumbsMeta && thumbsMeta.pages && thumbsMeta.pages.length > 0) {
+        await renderThumbsDocument(task, thumbsMeta, renderToken);
+        return;
+    }
+    // Fallback: PDF.js (kept for sourceDataUrl uploads).
+    await renderPdfJsSource(task, renderToken);
+}
+
+// Render every page of a PDF as a list of <img> tags. Each image is
+// lazy-loaded by IntersectionObserver so the browser only fetches the
+// page the user is actually looking at. The source PDF never enters
+// browser memory — only the small PNGs do.
+async function renderThumbsDocument(task, meta, renderToken) {
+    if (renderToken !== sourceRenderToken) return;
+    currentPdf = null;
+    els.pdfControls.classList.remove('hidden');
+    els.sourceViewer.innerHTML = '';
+    els.sourceViewer.scrollTop = 0;
+    els.sourceViewer.scrollLeft = 0;
+    els.markdownView.scrollLeft = 0;
+
+    const flow = document.createElement('div');
+    flow.className = 'pdf-document-flow';
+    els.sourceViewer.appendChild(flow);
+
+    const pages = meta.pages;
+    const A4_HEIGHT_PX = 1240;        // matches the default 90-DPI thumb
+    const pageWrappers = [];
+    for (const page of pages) {
+        const wrap = document.createElement('div');
+        wrap.className = 'pdf-page-wrap pdf-page-placeholder';
+        wrap.dataset.page = String(page.page);
+        // Use the page's actual aspect ratio so the placeholder is the
+        // right height before the image arrives — no jumpy layout.
+        const aspect = page.heightPt / Math.max(1, page.widthPt);
+        wrap.style.minHeight = `${Math.round(A4_HEIGHT_PX * aspect)}px`;
+        const canvasBox = document.createElement('div');
+        canvasBox.className = 'pdf-canvas-box';
+        const placeholderText = document.createElement('div');
+        placeholderText.className = 'pdf-page-placeholder-text';
+        placeholderText.textContent = `${page.page}`;
+        canvasBox.appendChild(placeholderText);
+        const highlightLayer = document.createElement('div');
+        highlightLayer.className = 'pdf-highlight-layer';
+        canvasBox.appendChild(highlightLayer);
+        wrap.appendChild(canvasBox);
+        flow.appendChild(wrap);
+        pageWrappers[page.page] = wrap;
+    }
+    observeThumbPages(task, pageWrappers);
+    scrollPdfPageIntoView(currentPage, 'auto');
+    resetSplitHorizontalScroll();
+    updateCurrentPageFromScroll();
+}
+
+// Lazy-load thumbs as they enter the viewport. ~3-page buffer either
+// side keeps scrolling smooth without preloading the whole book.
+function observeThumbPages(task, pageWrappers) {
+    if (thumbObserver) thumbObserver.disconnect();
+    thumbObserver = new IntersectionObserver((entries) => {
+        for (const entry of entries) {
+            if (entry.isIntersecting) {
+                const wrap = entry.target;
+                if (wrap.dataset.thumbLoaded === '1') continue;
+                wrap.dataset.thumbLoaded = '1';
+                const pageNumber = Number(wrap.dataset.page);
+                const img = document.createElement('img');
+                img.className = 'thumb-image';
+                img.alt = `${task.name} - page ${pageNumber}`;
+                img.loading = 'lazy';
+                img.src = `${API_BASE}/tasks/${encodeURIComponent(task.id)}/thumb/${pageNumber}`;
+                img.onload = () => {
+                    wrap.classList.remove('pdf-page-placeholder');
+                    const text = wrap.querySelector('.pdf-page-placeholder-text');
+                    if (text) text.remove();
+                };
+                const box = wrap.querySelector('.pdf-canvas-box');
+                if (box) box.appendChild(img);
+            }
+        }
+    }, { root: els.sourceViewer, rootMargin: '300px 0px', threshold: 0.01 });
+    Object.values(pageWrappers).forEach((wrap) => thumbObserver.observe(wrap));
+}
+
+let thumbObserver = null;
+
+// Keep renderSource for the dataUrl / PDF.js fallback path.
+async function renderPdfJsSource(task, renderToken) {
     // Show a progress bar with a Cancel button so a slow render
     // doesn't look like a frozen page.
     const showProgress = (label) => {
@@ -2643,13 +2749,8 @@ async function renderSource(task) {
     let pdf;
     try {
         if (task.sourceDataUrl) {
-            // dataUrl path: buffer is already in memory, no progress.
             pdf = await loadPdf(dataUrlToUint8Array(task.sourceDataUrl));
         } else {
-            // url path: use PDF.js streaming with a progress callback.
-            // onProgress fires repeatedly with {loaded, total} as bytes
-            // arrive. We bail out of the await loop if the user clicked
-            // cancel by checking `cancelled` after each chunk.
             pdf = await loadPdfWithProgress(task.sourceUrl, ({ loaded, total }) => {
                 if (cancelled) throw new Error('cancelled');
                 if (total > 0) {
@@ -2669,8 +2770,6 @@ async function renderSource(task) {
         }
     } catch (err) {
         if (cancelled) {
-            // User clicked cancel; fall back to the lightweight placeholder
-            // so the workbench still has a friendly state.
             if (renderToken === sourceRenderToken) showSourcePreviewPlaceholder(task);
             return;
         }
