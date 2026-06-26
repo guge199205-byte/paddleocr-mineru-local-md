@@ -32,6 +32,12 @@ let activeTaskId = null;
 let activeFilter = 'all';
 let taskSelectionMode = false;
 const selectedTaskIds = new Set();
+let lastActiveTaskId = localStorage.getItem(ACTIVE_TASK_STORAGE_KEY) || null;
+
+// Persist the last selected task id so the workbench can come back to
+// the same place after a refresh, without auto-rendering the source.
+const ACTIVE_TASK_STORAGE_KEY = 'pandocr.lastActiveTaskId';
+const BATCH_QUEUE_STORAGE_KEY = 'pandocr.batchQueue';
 let activeResultView = 'markdown';
 let isProcessing = false;
 let currentPdf = null;
@@ -161,8 +167,20 @@ document.addEventListener('DOMContentLoaded', async () => {
     await loadFolders();
     await loadTasks();
     renderTaskList();
-    if (tasks.length > 0) {
-        await selectTask(tasks[0].id);
+    // Don't auto-select a task on launch — picking one would force a
+    // PDF render (or huge image load) before the user asked for it.
+    // Big PDFs easily freeze the page for several seconds.
+    restoreBatchQueueFromStorage();
+    if (tasks.length > 0 && lastActiveTaskId && tasks.some((task) => task.id === lastActiveTaskId)) {
+        // Restore the previously selected task so the workbench isn't
+        // empty on a soft refresh, but skip the source-pane render
+        // (selectTaskWithDefer is non-PDF eager) and let the user open
+        // the file when they actually want to look at it.
+        await selectTaskLight(lastActiveTaskId);
+    } else {
+        // No previous selection — just show the empty state. Task list
+        // is visible, the workbench prompts the user to upload.
+        showEmptyWorkbench();
     }
     applyLanguage(document.body);
 });
@@ -1400,6 +1418,7 @@ function enqueueTasks(taskIds, { autoStart = true } = {}) {
     }
     batchQueue.totalThisRun = countQueueTotal();
     renderBatchQueueBar();
+    persistBatchQueue();
     if (autoStart) startBatchDriver();
 }
 
@@ -1470,6 +1489,7 @@ async function startBatchDriver() {
                     batchQueue.completedPages += pagesDone;
                 }
                 batchQueue.running = null;
+                persistBatchQueue();
                 batchQueue.running = null;
                 batchQueue.completion = null;
                 batchQueue.completionResolve = null;
@@ -1528,11 +1548,13 @@ function pauseBatchQueue() {
     if (!isBatchActive()) return;
     batchQueue.paused = true;
     renderBatchQueueBar();
+    persistBatchQueue();
 }
 
 function resumeBatchQueue() {
     batchQueue.paused = false;
     renderBatchQueueBar();
+    persistBatchQueue();
     startBatchDriver();
 }
 
@@ -1548,6 +1570,7 @@ async function skipCurrentBatchJob() {
         await cancelServerProcessing(runningId);
     } catch (_) { /* ignore — driver will move on regardless */ }
     signalBatchJobDone(runningId, 'skipped');
+    persistBatchQueue();
 }
 
 async function stopBatchQueue() {
@@ -1565,6 +1588,7 @@ async function stopBatchQueue() {
         batchQueue.stopping = false;
         batchQueue.paused = false;
         renderBatchQueueBar();
+        clearPersistedBatchQueue();
     }, 200);
 }
 
@@ -1578,10 +1602,74 @@ function retryFailedBatchJobs() {
     // counter reflects the new attempt.
     for (const id of failed) batchQueue.results.delete(id);
     enqueueTasks(failed);
+    persistBatchQueue();
 }
 
 function isBatchActive() {
     return Boolean(batchQueue.running) || batchQueue.queue.length > 0;
+}
+
+// ── Batch queue persistence ───────────────────────────────────────
+//
+// Queue + pause state is saved to localStorage on every meaningful
+// change so a browser refresh (or a service-worker-style restart)
+// comes back to the same place. We don't try to "resume" an active
+// run — server-side jobs are gone anyway. Instead we restore the
+// pending queue in paused mode and let the user press Continue.
+
+function persistBatchQueue() {
+    if (!batchQueue.queue.length && !batchQueue.running) {
+        try { localStorage.removeItem(BATCH_QUEUE_STORAGE_KEY); } catch (_) {}
+        return;
+    }
+    const payload = {
+        v: 1,
+        queue: batchQueue.queue,
+        running: batchQueue.running,
+        results: Array.from(batchQueue.results.entries()),
+        totalThisRun: batchQueue.totalThisRun,
+        startedAt: batchQueue.startedAt,
+        totalPages: batchQueue.totalPages,
+        completedPages: batchQueue.completedPages,
+        // Always persist as paused on save; the user can hit 继续
+        // after restart. Auto-resume would be confusing: the user
+        // didn't ask for the run to continue.
+        paused: true,
+    };
+    try { localStorage.setItem(BATCH_QUEUE_STORAGE_KEY, JSON.stringify(payload)); } catch (_) {}
+}
+
+function clearPersistedBatchQueue() {
+    try { localStorage.removeItem(BATCH_QUEUE_STORAGE_KEY); } catch (_) {}
+}
+
+function restoreBatchQueueFromStorage() {
+    let raw;
+    try { raw = localStorage.getItem(BATCH_QUEUE_STORAGE_KEY); } catch (_) { return; }
+    if (!raw) return;
+    let payload;
+    try { payload = JSON.parse(raw); } catch (_) { return; }
+    if (!payload || payload.v !== 1) { clearPersistedBatchQueue(); return; }
+    // Drop entries that no longer correspond to a real task (user may
+    // have deleted them in the meantime).
+    const knownIds = new Set(tasks.map((t) => t.id));
+    const survivingQueue = Array.isArray(payload.queue) ? payload.queue.filter((id) => knownIds.has(id)) : [];
+    const survivingRunning = payload.running && knownIds.has(payload.running) ? payload.running : null;
+    if (survivingQueue.length === 0 && !survivingRunning) {
+        clearPersistedBatchQueue();
+        return;
+    }
+    batchQueue.queue = survivingQueue;
+    batchQueue.running = null;            // never auto-resume an in-flight task
+    batchQueue.results = new Map(Array.isArray(payload.results) ? payload.results : []);
+    batchQueue.totalThisRun = Number(payload.totalThisRun) || (survivingQueue.length + (survivingRunning ? 1 : 0));
+    batchQueue.startedAt = 0;             // don't carry over the elapsed clock
+    batchQueue.totalPages = Number(payload.totalPages) || 0;
+    batchQueue.completedPages = Number(payload.completedPages) || 0;
+    batchQueue.paused = true;             // always come back paused
+    batchQueue.stopping = false;
+    renderBatchQueueBar();
+    startBatchStatsTicker();
 }
 
 // 1-Hz ticker to keep the elapsed/ETA numbers honest even when the
@@ -2304,8 +2392,100 @@ async function deleteTask(taskId) {
     }
 }
 
+// Lightweight selection: populate the right pane and metadata without
+// eagerly rendering the source PDF. Used on initial load so a large
+// PDF doesn't freeze the page before the user has a chance to look at
+// the task list. The full renderSource() still runs once the user
+// clicks anywhere on the task again.
+async function selectTaskLight(taskId) {
+    activeTaskId = taskId;
+    lastActiveTaskId = taskId;
+    try { localStorage.setItem(ACTIVE_TASK_STORAGE_KEY, taskId); } catch (_) {}
+    closeMobileSidebar();
+    renderTaskList();
+    let task;
+    try {
+        task = await ensureTaskLoaded(taskId);
+    } catch (error) {
+        console.error(error);
+        return;
+    }
+    if (activeTaskId !== taskId || !task) return;
+    updateActiveModelDisplay(task);
+    els.sourceTitle.textContent = task.name;
+    els.sourceMeta.textContent = taskSourceMeta(task);
+    els.resultTitle.textContent = resultPaneTitle(task);
+    renderResultPane(task);
+    updateActionState(task);
+    // Show a soft "click to load" placeholder in the source pane so
+    // the user knows the file is there but unrendered.
+    showSourcePreviewPlaceholder(task);
+}
+
+function showSourcePreviewPlaceholder(task) {
+    const viewer = els.sourceViewer;
+    if (!viewer) return;
+    currentPdf = null;
+    els.pdfControls.classList.add('hidden');
+    viewer.innerHTML = '';
+    const pageCount = task.pageCount || 1;
+    const sizeLabel = formatSize(task.size || 0);
+    const placeholder = document.createElement('div');
+    placeholder.className = 'source-preview-placeholder';
+    placeholder.innerHTML = `
+        <div class="source-preview-card">
+            <svg viewBox="0 0 24 24" width="44" height="44">
+                <path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/>
+                <path d="M14 3v6h6"/>
+            </svg>
+            <div class="source-preview-meta">
+                <strong>${escapeHtml(task.name)}</strong>
+                <span>${pageCount} 页 · ${sizeLabel}</span>
+            </div>
+            <button type="button" class="primary-button" id="source-preview-load">加载源文件</button>
+        </div>
+    `;
+    viewer.appendChild(placeholder);
+    placeholder.querySelector('#source-preview-load')?.addEventListener('click', () => {
+        // Re-issue a full selectTask which will actually render the PDF.
+        selectTask(taskId);
+    });
+    viewer.scrollTop = 0;
+    viewer.scrollLeft = 0;
+    els.markdownView.scrollLeft = 0;
+}
+
+function showEmptyWorkbench() {
+    activeTaskId = null;
+    lastActiveTaskId = null;
+    try { localStorage.removeItem(ACTIVE_TASK_STORAGE_KEY); } catch (_) {}
+    const viewer = els.sourceViewer;
+    if (viewer) {
+        currentPdf = null;
+        els.pdfControls.classList.add('hidden');
+        viewer.innerHTML = `<div class="drop-zone" id="drop-zone">
+            <svg viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5M4 15v4a2 2 0 0 0 2 2h12a2 2 0 0 0 2 2v-4"/></svg>
+            <h3>拖拽文件到这里</h3>
+            <p>支持 PDF、图片、PPT/PPTX、DOC/DOCX；PDF 会逐页解析。</p>
+            <button class="primary-button" id="browse-btn">选择文件</button>
+        </div>`;
+        // Re-wire browse button (innerHTML wipes listeners).
+        document.getElementById('browse-btn')?.addEventListener('click', () => els.fileInput.click());
+    }
+    if (els.sourceTitle) els.sourceTitle.textContent = t('等待上传文件');
+    if (els.sourceMeta) els.sourceMeta.textContent = t('PDF、图片、Office 文档');
+    if (els.resultTitle) els.resultTitle.textContent = t('解析结果');
+    if (els.markdownView) {
+        els.markdownView.innerHTML = `<div class="empty-result">${escapeHtml(t('选择左侧任务，或上传一个新文件开始解析。'))}</div>`;
+    }
+    if (els.jsonView) els.jsonView.textContent = '';
+    updateActionState(null);
+}
+
 async function selectTask(taskId) {
     activeTaskId = taskId;
+    lastActiveTaskId = taskId;
+    try { localStorage.setItem(ACTIVE_TASK_STORAGE_KEY, taskId); } catch (_) {}
     closeMobileSidebar();
     renderTaskList();
     let task;
